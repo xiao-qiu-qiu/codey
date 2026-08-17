@@ -78,6 +78,16 @@
     "[data-testid=conversation-turn]",
     "[data-message-id]",
   ].join(", ");
+  // Rich conversation tooltips (notably Hooks details) can be taller than the
+  // collision-limited tooltip box. Clip the overflowing children inside that
+  // box so they cannot cover their trigger and create a pointer enter/leave
+  // loop. aria-describedby is present only while the native tooltip is open.
+  const conversationRichTooltipSelector = conversationTurnSelector
+    .split(", ")
+    .map((turnSelector) => (
+      `body:has(${turnSelector} span[tabindex="0"][aria-describedby]) [role="tooltip"]`
+    ))
+    .join(", ");
   const sidebarScanRootSelector = [
     "header",
     "nav",
@@ -283,6 +293,7 @@
       [data-turn-key]:hover > [data-codey-message-select], [data-codey-message-select]:focus-visible, [data-codey-message-select][aria-pressed="true"] { opacity: 1; }
       [data-codey-message-select]:hover { transform: scale(1.06); }
       [data-codey-message-select][aria-pressed="true"] { background: #5968de; border-color: #a5aeff; color: white; }
+      ${conversationRichTooltipSelector} { overflow-x: hidden !important; overflow-y: auto !important; overscroll-behavior: contain; }
       @media (max-width: 760px) { [data-codey-message-select] { left: 4px; top: -34px; } }
       #${toastId} { -webkit-app-region: no-drag !important; position: fixed; right: 20px; bottom: 22px; z-index: 2147483645; max-width: 360px; border: 1px solid rgba(124, 140, 255, .4); border-radius: 11px; padding: 10px 13px; background: rgba(20, 24, 36, .97); color: #eef2ff; box-shadow: 0 12px 36px rgba(0,0,0,.4); font: 12px/1.45 system-ui, sans-serif; }
       #${toastId}[data-tone="error"] { border-color: rgba(248, 113, 113, .6); color: #fecaca; }
@@ -2365,7 +2376,15 @@
       return;
     }
     if (!window.confirm(`删除 ${messageIds.length} 轮对话？\n无法撤销。`)) return;
-    const result = await callBridge("/session/delete-messages", { sessionId, messageIds });
+    showRuntimeToast(`正在永久删除 ${messageIds.length} 轮对话…`);
+    let result;
+    try {
+      result = await callBridge("/session/delete-messages", { sessionId, messageIds });
+    } catch (error) {
+      const message = typeof error?.message === "string" ? error.message : String(error);
+      window.alert(`删除失败：${message}`);
+      return;
+    }
     if (result?.status === "failed") {
       window.alert(`删除失败：${result.message || "未知错误"}`);
       return;
@@ -2379,19 +2398,25 @@
       );
       return;
     }
-    rememberHardDeletedMessages(sessionId, messageIds);
+    const resolvedMessageIds = Array.isArray(result?.resolvedMessageIds)
+      && result.resolvedMessageIds.length === messageIds.length
+      ? result.resolvedMessageIds.map(normalizeMessageId).filter(Boolean)
+      : messageIds;
+    rememberHardDeletedMessages(sessionId, [...messageIds, ...resolvedMessageIds]);
     rows.forEach((row) => row.remove());
     lastSelectedRow = null;
     syncSelectionGroups();
     updateToolbar();
     try {
-      await reloadConversationAfterHardDelete(sessionId, messageIds);
+      await reloadConversationAfterHardDelete(sessionId, resolvedMessageIds);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       window.alert(`消息已从会话文件永久删除，但 Codex 内存会话卸载失败。\n请重启 Codex 后再继续对话。\n\n${message}`);
       return;
     }
-    window.dispatchEvent(new CustomEvent("codey-session-refresh", { detail: { sessionId, messageIds } }));
+    window.dispatchEvent(new CustomEvent("codey-session-refresh", {
+      detail: { sessionId, messageIds: resolvedMessageIds },
+    }));
     showRuntimeToast(`已永久删除 ${deleted} 轮对话`);
   };
 
