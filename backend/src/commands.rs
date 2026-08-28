@@ -1314,6 +1314,10 @@ async fn save_codey_config_locked(
         &fast_context_tools_status,
     );
     config.subagent_optimization = config_input.subagent_optimization;
+    if subagent_guidance_present {
+        crate::config::validate_subagent_guidance(&config_input.subagent_guidance)?;
+        config.subagent_guidance = config_input.subagent_guidance;
+    }
     let mut explicitly_configured_subagent_models = Vec::new();
     let default_role_supplied = subagent_roles_present
         && !config_input.subagent_roles.is_empty()

@@ -130,6 +130,12 @@ impl ModelSelectionState {
                     && model.slug.eq_ignore_ascii_case(requested)
             })
             .map(|model| model.slug.as_str())
+            .or_else(|| {
+                self.third_party_models
+                    .iter()
+                    .find(|model| model.eq_ignore_ascii_case(requested))
+                    .map(String::as_str)
+            })
     }
 
     pub fn first_available_subagent_model(&self) -> Option<&str> {
@@ -137,6 +143,7 @@ impl ModelSelectionState {
             .iter()
             .find(|model| model.supported && model.supports_subagent)
             .map(|model| model.slug.as_str())
+            .or_else(|| self.third_party_models.first().map(String::as_str))
     }
 }
 

@@ -308,7 +308,7 @@ mod tests {
                 saved_effort: "high",
                 expected_model: "provider-custom-model",
                 expected_effort: "high",
-                optimization_enabled: false,
+                optimization_enabled: true,
             },
         ];
 
@@ -397,7 +397,7 @@ mod tests {
 
         reconcile_for_current_provider(&mut config, home.path(), false);
 
-        assert!(!config.subagent_optimization);
+        assert!(config.subagent_optimization);
         assert_eq!(config.subagent_model, "provider-custom-model");
         assert_eq!(config.subagent_reasoning_effort, "high");
     }
@@ -509,7 +509,7 @@ mod tests {
 
         reconcile_for_current_provider(&mut unavailable, unavailable_home.path(), false);
 
-        assert!(!unavailable.subagent_optimization);
+        assert!(unavailable.subagent_optimization);
         assert_eq!(unavailable.subagent_model, DEFAULT_SUBAGENT_MODEL);
         assert_eq!(unavailable.subagent_reasoning_effort, "high");
     }
