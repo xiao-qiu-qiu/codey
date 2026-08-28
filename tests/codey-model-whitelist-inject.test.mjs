@@ -2232,6 +2232,48 @@ test("model picker menu groups models under route headings without changing mode
   runtime.patch.dispose();
 });
 
+test("model picker uses a native model value when route labels are ambiguous", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const menu = body.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  }));
+  const relayItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio", "data-value": "relay/gpt-5.6-sol" },
+  }));
+  relayItem.textContent = "gpt-5.6-sol";
+
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "relay/gpt-5.6-sol"],
+    default_model: "relay/gpt-5.6-sol",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        display_name: "官方线路 / gpt-5.6-sol",
+        route_name: "官方线路",
+        provider_id: "openai",
+        route_provider_id: "openai",
+        source_model: "gpt-5.6-sol",
+        official_account: true,
+      },
+      {
+        model: "relay/gpt-5.6-sol",
+        display_name: "中转线路 / gpt-5.6-sol",
+        route_name: "中转线路",
+        provider_id: "codey_router",
+        route_provider_id: "relay",
+        source_model: "gpt-5.6-sol",
+      },
+    ],
+  }, [statsigClient()], { documentBody: body });
+
+  runtime.patch.enhanceModelMenus();
+
+  assert.equal(relayItem.dataset.codeyRouteModel, "relay/gpt-5.6-sol");
+  assert.equal(relayItem.getAttribute("aria-label"), "中转线路 / gpt-5.6-sol");
+  runtime.patch.dispose();
+});
+
 test("an open model picker hides a route row removed by a hot catalog update", async () => {
   const body = new FakeElementCore("body", { connected: true });
   const menu = body.appendChild(new FakeElementCore("div", {
@@ -2505,7 +2547,7 @@ test("official account route models keep raw ids and dispatch to the OpenAI prov
 
   assert.equal(
     queryClient.model("gpt-5.6-sol").displayName,
-    "[官] gpt-5.6-sol",
+    "gpt-5.6-sol",
   );
   assert.equal(queryClient.model("gpt-5.6-sol").routeName, "OpenAI 官方直登");
 
@@ -2525,6 +2567,31 @@ test("official account route models keep raw ids and dispatch to the OpenAI prov
     model: "gpt-5.6-sol",
     responsesapiClientMetadata: { codey_route: "openai" },
   });
+  runtime.patch.dispose();
+});
+
+test("a custom route named like an official route keeps its route display", async () => {
+  const queryClient = activeModelQueryClient(["stale-model"]);
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["relay/gpt-5.6-sol"],
+    default_model: "relay/gpt-5.6-sol",
+    model_metadata: [{
+      model: "relay/gpt-5.6-sol",
+      display_name: "[Co] gpt-5.6-sol",
+      route_name: "OpenAI 官方直登",
+      route_prefix: "Co",
+      provider_id: "codey_router",
+      route_provider_id: "relay",
+      source_model: "gpt-5.6-sol",
+      official_account: false,
+    }],
+  }, [statsigClient()], { queryClient });
+
+  assert.equal(
+    queryClient.model("relay/gpt-5.6-sol").displayName,
+    "OpenAI 官方直登 / gpt-5.6-sol",
+  );
   runtime.patch.dispose();
 });
 

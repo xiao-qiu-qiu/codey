@@ -1323,7 +1323,14 @@ pub(super) fn renderer_model_catalog_value(
         .map(|entry| {
             let mut metadata = json!({
                 "model": entry.alias,
-                "display_name": format!("[{}] {}", entry.route_prefix, entry.model),
+                // `display_name` is consumed by Codex's native model picker.
+                // Official models keep their native label; custom routes keep
+                // the route name so same-id models remain distinguishable.
+                "display_name": if entry.official_account {
+                    entry.model.clone()
+                } else {
+                    format!("{} / {}", entry.route_name, entry.model)
+                },
                 "route_name": entry.route_name,
                 "route_prefix": entry.route_prefix,
                 "provider_id": entry.request_provider_id,
@@ -2254,7 +2261,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             official_metadata["display_name"].as_str(),
-            Some("[官] gpt-5.6-sol")
+            Some("gpt-5.6-sol")
         );
         assert_eq!(official_metadata["route_name"].as_str(), Some("官方线路"));
         assert_eq!(official_metadata["route_prefix"].as_str(), Some("官"));
