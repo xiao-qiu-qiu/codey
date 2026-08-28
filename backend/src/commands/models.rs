@@ -1031,9 +1031,22 @@ pub async fn save_official_route_models(
     route_id: String,
     requested_models: Vec<String>,
 ) -> Result<Value, String> {
+    save_official_route_models_with_options(state, route_id, requested_models, None, None).await
+}
+
+pub async fn save_official_route_models_with_options(
+    state: &Arc<AppState>,
+    route_id: String,
+    requested_models: Vec<String>,
+    expected_revision: Option<u64>,
+    show_account_usage_in_header: Option<bool>,
+) -> Result<Value, String> {
     validate_requested_model_list_bounds("官方模型", &requested_models)?;
     let _config_write_guard = state.config_write_lock.lock().await;
     let mut config = state.config.read().await.clone();
+    if let Some(expected_revision) = expected_revision {
+        ensure_route_revision(&config, expected_revision)?;
+    }
     let route_id = route_id.trim();
     let profile = config
         .profiles
@@ -1073,6 +1086,7 @@ pub async fn save_official_route_models(
     let (catalog_refresh, model_state) = refreshed_model_state_async(&config, false).await?;
     subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     config = config.normalize();
+    config.settings_revision = config.settings_revision.saturating_add(1);
     if let Err(error) = save_config_to_store(state, &config).await {
         return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
     }

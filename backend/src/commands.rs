@@ -964,9 +964,23 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "save_official_route_models" => match (
             string_argument(&args, "routeId"),
             argument::<Vec<String>>(&args, "models"),
+            optional_argument::<u64>(&args, "expectedRevision"),
+            optional_argument::<bool>(&args, "showAccountUsageInHeader"),
         ) {
-            (Ok(route_id), Ok(models)) => save_official_route_models(state, route_id, models).await,
-            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Ok(route_id), Ok(models), Ok(expected_revision), Ok(show_account_usage_in_header)) => {
+                save_official_route_models_with_options(
+                    state,
+                    route_id,
+                    models,
+                    expected_revision,
+                    show_account_usage_in_header,
+                )
+                .await
+            }
+            (Err(error), _, _, _)
+            | (_, Err(error), _, _)
+            | (_, _, Err(error), _)
+            | (_, _, _, Err(error)) => Err(error),
         },
         "runtime_status" => {
             let refresh_injection_status = args
