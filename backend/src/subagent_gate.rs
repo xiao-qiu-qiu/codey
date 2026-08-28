@@ -1553,16 +1553,6 @@ fn subagent_identity_missing_denial() -> Value {
     })
 }
 
-fn subagent_identity_missing_denial() -> Value {
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": "Codey 子代理门禁：当前调用已确认来自子代理，但 Hook 载荷缺少 agent_id，无法校验 ownership。为避免越界写入，只允许明确只读工具；请停止本次写入或命令调用，并把兼容性诊断返回主代理。",
-        }
-    })
-}
-
 fn post_wait_continuation(
     active: usize,
     tool_response: Option<&Value>,
