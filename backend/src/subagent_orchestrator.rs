@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 
 use crate::subagent::api::{InvocationMode, TokenUsage, TraceContext};
 use crate::subagent::lifecycle::{ExecutionOutcome, ExecutionPhase as ReservationState};
-use crate::subagent::protocol::{AgentState, InterruptAcknowledgement, TerminalOutcome};
+use crate::subagent::protocol::{InterruptAcknowledgement, TerminalOutcome};
 use crate::subagent::rules::{self, RoleAccess, RuleActor, RuleContext, RuleEffect, ToolClass};
 use crate::subagent::telemetry::{
     self, ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder,
@@ -49,10 +49,8 @@ const MAX_BATCH_DECISION_ID_CHARS: usize = 128;
 const MAX_BATCH_DECISION_IDS: usize = 32;
 const BATCH_DECISION_CONTROL_FAILURE_ERROR_CODE: &str = "CODEY_SUBAGENT_CONTROL_PLANE_FAILED";
 const MAX_BATCH_DECISION_CONTROL_FAILURES: u16 = 3;
-const BATCH_DECISION_CONTROL_FAILURE_GRACE_MILLIS: u64 = 10 * 60 * 1000;
 const MAX_ACCEPTANCE_FAILURES: u16 = 3;
 const MAX_UNCHANGED_ACCEPTANCE_STOPS: u16 = 3;
-const ACCEPTANCE_STALL_GRACE_MILLIS: u64 = 10 * 60 * 1000;
 const LEDGER_LOCK_TIMEOUT_MILLIS: u64 = 250;
 const LEDGER_LOCK_RETRY_MILLIS: u64 = 5;
 const SETTLEMENT_RECEIPT_PREFIX: &str = "orchestrator-settlement-v1";
@@ -271,8 +269,6 @@ struct Reservation {
     spawn_failed: bool,
     #[serde(default)]
     side_effect_authorized: bool,
-    #[serde(default)]
-    pending_init_observed_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -473,7 +469,6 @@ impl LedgerStore {
                             .to_string()
                     });
                 }
-                reservation.pending_init_observed_at_ms = None;
             }
             ledger
                 .retired_runtime_id_hashes
@@ -930,15 +925,6 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
         ledger.batch_decision_control_failure_started_at_ms = None;
         changed = true;
     }
-    if source_schema_version < 9 {
-        // Older ledgers did not track provider PendingInit observations per
-        // reservation. Do not infer a timestamp from created/updated time: an
-        // upgrade must never make an in-flight attempt immediately stale.
-        for reservation in ledger.reservations.values_mut() {
-            reservation.pending_init_observed_at_ms = None;
-        }
-        changed = true;
-    }
     if source_schema_version < 10 {
         // v1-v9 had only the current runtime hash. Treat every existing
         // reservation as originating in generation 1; do not invent retired
@@ -1089,10 +1075,6 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
             reservation.state.is_settled() || reservation.outcome == ExecutionOutcome::Unknown,
             "Codey 子代理编排账本的活动 phase 带有终态 outcome"
         );
-        anyhow::ensure!(
-            reservation.state.is_active() || reservation.pending_init_observed_at_ms.is_none(),
-            "Codey 子代理编排账本的终态 reservation 带有 PendingInit 观察时间"
-        );
     }
     if ledger.schema_version != LEDGER_SCHEMA_VERSION {
         ledger.schema_version = LEDGER_SCHEMA_VERSION;
@@ -1123,7 +1105,6 @@ fn expire_reservations(ledger: &mut SessionLedger, now_ms: u64) -> bool {
             reservation.state = ReservationState::Terminal;
             reservation.outcome = ExecutionOutcome::TimedOut;
             reservation.agent_id_hash = None;
-            reservation.pending_init_observed_at_ms = None;
             reservation.updated_at_ms = now_ms;
             reservation.completed_at_ms = Some(now_ms);
             reservation.fenced_at_ms = Some(now_ms);
@@ -1198,15 +1179,14 @@ fn observe_batch_decision_control_failure(
     failure_kind: BatchDecisionControlFailureKind,
     now_ms: u64,
 ) -> bool {
-    let started_at_ms = *ledger
+    ledger
         .batch_decision_control_failure_started_at_ms
         .get_or_insert(now_ms);
     ledger.batch_decision_control_failure_count = ledger
         .batch_decision_control_failure_count
         .saturating_add(1);
     let failure_count = ledger.batch_decision_control_failure_count;
-    let exhausted = failure_count >= MAX_BATCH_DECISION_CONTROL_FAILURES
-        || now_ms.saturating_sub(started_at_ms) >= BATCH_DECISION_CONTROL_FAILURE_GRACE_MILLIS;
+    let exhausted = failure_count >= MAX_BATCH_DECISION_CONTROL_FAILURES;
     if exhausted {
         ledger.batch_decision = BatchDecisionState::ControlPlaneFailed {
             batch_number: ledger.batch_number,
@@ -1738,7 +1718,6 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
             fenced_at_ms: None,
             spawn_failed: false,
             side_effect_authorized: false,
-            pending_init_observed_at_ms: None,
         },
     );
     store.save(&mut ledger, now_ms)?;
@@ -1845,7 +1824,6 @@ pub(crate) fn post_spawn(
         reservation.state = ReservationState::Terminal;
         reservation.outcome = ExecutionOutcome::Failed;
         reservation.spawn_failed = true;
-        reservation.pending_init_observed_at_ms = None;
         reservation.fenced_at_ms = Some(now_ms);
         reservation.updated_at_ms = now_ms;
         reservation.completed_at_ms = Some(now_ms);
@@ -1870,7 +1848,6 @@ pub(crate) fn post_spawn(
     } else if let Some(agent_id) = returned_agent_id.as_deref() {
         reservation.state = ReservationState::Running;
         reservation.outcome = ExecutionOutcome::Unknown;
-        reservation.pending_init_observed_at_ms = None;
         reservation.updated_at_ms = now_ms;
         reservation.started_at_ms = Some(now_ms);
         reservation.agent_id_hash = Some(hash_component(agent_id));
@@ -2101,7 +2078,6 @@ pub(crate) fn settle_unique_anonymous_stop(
     let agent_id_hash = reservation.agent_id_hash.clone();
     reservation.state = ReservationState::Terminal;
     reservation.outcome = ExecutionOutcome::Unknown;
-    reservation.pending_init_observed_at_ms = None;
     reservation.updated_at_ms = now_ms;
     reservation.completed_at_ms = Some(now_ms);
     reservation.fenced_at_ms = Some(now_ms);
@@ -2206,9 +2182,6 @@ fn update_reservation_lifecycle(
                 }
                 changed = true;
             }
-            if reservation.pending_init_observed_at_ms.take().is_some() {
-                changed = true;
-            }
             if changed {
                 reservation.updated_at_ms = now_ms;
                 store.save(&mut ledger, now_ms)?;
@@ -2220,7 +2193,6 @@ fn update_reservation_lifecycle(
         }
         reservation.state = state;
         reservation.agent_id_hash = Some(agent_hash);
-        reservation.pending_init_observed_at_ms = None;
         reservation.updated_at_ms = now_ms;
         let trace_status = match state {
             ReservationState::Running => {
@@ -2331,7 +2303,6 @@ pub(crate) fn observe_status_response(
             reservation.outcome = outcome;
             reservation.fenced_at_ms.get_or_insert(now_ms);
             reservation.agent_id_hash = None;
-            reservation.pending_init_observed_at_ms = None;
             reservation.updated_at_ms = now_ms;
             reservation.completed_at_ms.get_or_insert(now_ms);
             reservation.error_message = match outcome {
@@ -2401,200 +2372,6 @@ pub(crate) fn observe_status_response(
         }
     }
     Ok(())
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PendingInitRecovery {
-    pub(crate) agent_id_hashes: Vec<String>,
-    pub(crate) task_ids: Vec<String>,
-}
-
-/// Reconciles a full provider list snapshot into reservation-local PendingInit
-/// observations and recovers only the attempts whose own grace period elapsed.
-/// A live sibling never clears or restarts another reservation's timer.
-pub(crate) fn reconcile_pending_init_status_response(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    tool_response: Option<&Value>,
-    now_ms: u64,
-    grace_ms: u64,
-) -> Result<Option<PendingInitRecovery>> {
-    let mut observations = Vec::new();
-    if let Some(response) = tool_response {
-        crate::subagent::protocol::collect_agent_status_observations(response, &mut observations);
-    }
-    reconcile_pending_init_observations(
-        state_root,
-        runtime_id,
-        session_id,
-        &observations,
-        now_ms,
-        grace_ms,
-    )
-}
-
-/// Sweeps persisted reservation-local PendingInit timers without requiring a
-/// fresh provider response. Stop uses this so a timer cannot be extended merely
-/// because another child remains live or the provider stops returning updates.
-pub(crate) fn recover_expired_pending_init_reservations(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    now_ms: u64,
-    grace_ms: u64,
-) -> Result<Option<PendingInitRecovery>> {
-    reconcile_pending_init_observations(state_root, runtime_id, session_id, &[], now_ms, grace_ms)
-}
-
-fn reconcile_pending_init_observations(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    observations: &[crate::subagent::protocol::AgentStatusObservation],
-    now_ms: u64,
-    grace_ms: u64,
-) -> Result<Option<PendingInitRecovery>> {
-    let store = LedgerStore::open(state_root, session_id)?;
-    let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
-        return Ok(None);
-    };
-
-    let mut task_states = BTreeMap::<String, AgentState>::new();
-    let mut conflicting_states = BTreeSet::new();
-    for observation in observations {
-        let mut resolved_tasks = BTreeSet::new();
-        for identifier in &observation.identifiers {
-            let candidates = identity_task_candidates(&ledger, identifier);
-            if candidates.len() > 1 {
-                let reason = format!(
-                    "PendingInit 状态标识 `{identifier}` 同时指向多个 attempt（{}）",
-                    candidates.iter().cloned().collect::<Vec<_>>().join(", ")
-                );
-                fence_identity_conflict(&mut ledger, &candidates, now_ms, &reason);
-                store.save(&mut ledger, now_ms)?;
-                anyhow::bail!("{AGENT_ID_COLLISION_ERROR_CODE}: {reason}");
-            }
-            resolved_tasks.extend(candidates);
-        }
-        if resolved_tasks.len() > 1 {
-            let reason = format!(
-                "同一 PendingInit 状态条目的身份指向不同 attempt（{}）",
-                resolved_tasks
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            fence_identity_conflict(&mut ledger, &resolved_tasks, now_ms, &reason);
-            store.save(&mut ledger, now_ms)?;
-            anyhow::bail!("{AGENT_ID_COLLISION_ERROR_CODE}: {reason}");
-        }
-        let Some(task_id) = resolved_tasks.into_iter().next() else {
-            continue;
-        };
-        if task_states
-            .get(&task_id)
-            .is_some_and(|current| *current != observation.state)
-        {
-            task_states.remove(&task_id);
-            conflicting_states.insert(task_id);
-            continue;
-        }
-        if !conflicting_states.contains(&task_id) {
-            task_states.insert(task_id, observation.state);
-        }
-    }
-
-    let mut changed = false;
-    for (task_id, state) in task_states {
-        let Some(reservation) = ledger.reservations.get_mut(&task_id) else {
-            continue;
-        };
-        let next_observed_at = if reservation.state.is_active()
-            && reservation.fenced_at_ms.is_none()
-            && state == AgentState::PendingInit
-        {
-            Some(reservation.pending_init_observed_at_ms.unwrap_or(now_ms))
-        } else {
-            None
-        };
-        if reservation.pending_init_observed_at_ms != next_observed_at {
-            reservation.pending_init_observed_at_ms = next_observed_at;
-            reservation.updated_at_ms = now_ms;
-            changed = true;
-        }
-    }
-
-    let mut recovery = PendingInitRecovery::default();
-    let mut trace_events = Vec::new();
-    for (task_id, reservation) in &mut ledger.reservations {
-        if !reservation.state.is_active() {
-            if reservation.pending_init_observed_at_ms.take().is_some() {
-                changed = true;
-            }
-            continue;
-        }
-        let Some(observed_at_ms) = reservation.pending_init_observed_at_ms else {
-            continue;
-        };
-        if now_ms.saturating_sub(observed_at_ms) < grace_ms {
-            continue;
-        }
-
-        let trace = reservation_trace(reservation);
-        let role = reservation.role.clone();
-        if let Some(agent_id_hash) = reservation.agent_id_hash.take() {
-            recovery.agent_id_hashes.push(agent_id_hash);
-        }
-        recovery.task_ids.push(task_id.clone());
-        reservation.state = ReservationState::Recovered;
-        reservation.outcome = ExecutionOutcome::Lost;
-        reservation.pending_init_observed_at_ms = None;
-        reservation.updated_at_ms = now_ms;
-        reservation.completed_at_ms = Some(now_ms);
-        reservation.fenced_at_ms = Some(now_ms);
-        reservation.error_message = Some(format!(
-            "provider kept this attempt in pending_init for at least {grace_ms} ms"
-        ));
-
-        let mut event = SubagentTraceEvent::new(
-            now_ms,
-            &trace,
-            TraceEventKind::Recovered,
-            ExecutionStatus::Recovered,
-            runtime_id,
-            session_id,
-            task_id,
-            None,
-            Some(&role),
-        );
-        event.latency_ms = Some(now_ms.saturating_sub(reservation.created_at_ms));
-        event.error_code = Some("pending_init_grace_elapsed".into());
-        event.error_message = reservation.error_message.clone();
-        event
-            .attributes
-            .insert("execution.outcome".into(), Value::String("lost".into()));
-        event.attributes.insert(
-            "pending_init.observed_at_ms".into(),
-            Value::Number(observed_at_ms.into()),
-        );
-        event.attributes.insert(
-            "pending_init.elapsed_ms".into(),
-            Value::Number(now_ms.saturating_sub(observed_at_ms).into()),
-        );
-        trace_events.push(event);
-        changed = true;
-    }
-
-    if changed {
-        store.save(&mut ledger, now_ms)?;
-        let recorder = TraceRecorder::new(state_root);
-        for event in &trace_events {
-            recorder.record_best_effort(event);
-        }
-    }
-    Ok(Some(recovery))
 }
 
 /// Returns the lifecycle ledger projection when a session ledger exists.
@@ -2684,41 +2461,6 @@ pub(crate) fn verified_local_read_only_active_count(
     Ok(Some(active.len()))
 }
 
-/// Atomically fences every still-active reservation before the gate discards
-/// legacy marker files. This keeps the ledger as the authoritative source of
-/// truth and prevents a Stop recovery loop from resurrecting stale work.
-pub(crate) fn recover_active_reservations(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    reason: &str,
-    now_ms: u64,
-) -> Result<usize> {
-    let store = LedgerStore::open(state_root, session_id)?;
-    let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
-        return Ok(0);
-    };
-    let mut recovered = 0_usize;
-    for reservation in ledger.reservations.values_mut() {
-        if !reservation.state.is_active() {
-            continue;
-        }
-        reservation.state = ReservationState::Recovered;
-        reservation.outcome = ExecutionOutcome::Lost;
-        reservation.agent_id_hash = None;
-        reservation.pending_init_observed_at_ms = None;
-        reservation.updated_at_ms = now_ms;
-        reservation.completed_at_ms = Some(now_ms);
-        reservation.fenced_at_ms = Some(now_ms);
-        reservation.error_message = Some(reason.to_string());
-        recovered = recovered.saturating_add(1);
-    }
-    if recovered > 0 {
-        store.save(&mut ledger, now_ms)?;
-    }
-    Ok(recovered)
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InterruptSettlement {
     /// Hash used by the legacy active-marker filename. The ledger remains the
@@ -2795,7 +2537,6 @@ pub(crate) fn settle_interrupt_acknowledgement(
     };
     reservation.outcome = outcome;
     reservation.agent_id_hash = None;
-    reservation.pending_init_observed_at_ms = None;
     reservation.updated_at_ms = now_ms;
     reservation.completed_at_ms = Some(now_ms);
     reservation.fenced_at_ms = Some(now_ms);
@@ -3711,7 +3452,6 @@ pub(crate) fn authorize_child_tool_with_context(
                 reservation.state = ReservationState::Running;
             }
             reservation.agent_id_hash = Some(agent_hash.clone());
-            reservation.pending_init_observed_at_ms = None;
             reservation.started_at_ms.get_or_insert(now_ms);
             reservation.updated_at_ms = now_ms;
             store.save(current, now_ms)?;
@@ -4053,7 +3793,6 @@ pub(crate) fn pending_acceptance_reason(
                 reservation.state = ReservationState::Terminal;
                 reservation.outcome = ExecutionOutcome::Lost;
                 reservation.agent_id_hash = None;
-                reservation.pending_init_observed_at_ms = None;
                 reservation.updated_at_ms = now_ms;
                 reservation.completed_at_ms = Some(now_ms);
                 reservation.fenced_at_ms = Some(now_ms);
@@ -4083,21 +3822,13 @@ pub(crate) fn pending_acceptance_reason(
                     continue;
                 }
 
-                let blocked_since_ms = *check.blocked_since_ms.get_or_insert(now_ms);
+                check.blocked_since_ms.get_or_insert(now_ms);
                 check.blocked_stop_count = check.blocked_stop_count.saturating_add(1);
-                let stalled = check.blocked_stop_count >= MAX_UNCHANGED_ACCEPTANCE_STOPS
-                    || now_ms.saturating_sub(blocked_since_ms) >= ACCEPTANCE_STALL_GRACE_MILLIS;
+                let stalled = check.blocked_stop_count >= MAX_UNCHANGED_ACCEPTANCE_STOPS;
                 if stalled {
                     check.status = AcceptanceStatus::Unverifiable;
                     check.release_reason = Some(
-                        if check.blocked_stop_count >= MAX_UNCHANGED_ACCEPTANCE_STOPS {
-                            format!(
-                                "验收债连续 {} 次 Stop 未取得新证据",
-                                check.blocked_stop_count
-                            )
-                        } else {
-                            "验收债持续 10 分钟未取得新证据".to_string()
-                        },
+                        format!("验收债连续 {} 次 Stop 未取得新证据", check.blocked_stop_count),
                     );
                     check.release_notice_delivered_at_ms = Some(now_ms);
                     release_notices.push(format!(
@@ -6903,160 +6634,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_init_recovery_is_scoped_to_each_reservation() {
-        let temp = tempfile::tempdir().unwrap();
-        let session_id = "per-reservation-pending-session";
-        for (index, task_id) in ["reader_a", "reader_b"].into_iter().enumerate() {
-            let spawn = contract_input(task_id, "codey_deep_research", research_contract(task_id));
-            pre_spawn(
-                temp.path(),
-                "runtime-a",
-                session_id,
-                Some(&spawn),
-                index,
-                10 + index as u64,
-            )
-            .unwrap();
-            post_spawn(
-                temp.path(),
-                "runtime-a",
-                session_id,
-                Some(&spawn),
-                Some(&json!({ "agent_id": format!("agent-{task_id}") })),
-                20 + index as u64,
-            )
-            .unwrap();
-        }
-
-        let mixed = json!({
-            "agents": [
-                { "agent_name": "/root", "status": "running" },
-                {
-                    "agent_name": "/root/reader_a",
-                    "agent_id": "agent-reader_a",
-                    "status": "pending_init"
-                },
-                { "agent_name": "/root/reader_b", "status": "running" },
-                { "agent_name": "/root/untracked", "status": "pending_init" }
-            ]
-        });
-        let first = reconcile_pending_init_status_response(
-            temp.path(),
-            "runtime-a",
-            session_id,
-            Some(&mixed),
-            1_000,
-            100,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(first, PendingInitRecovery::default());
-
-        let store = LedgerStore::open(temp.path(), session_id).unwrap();
-        let ledger = store.load("runtime-a", session_id, 1_001).unwrap().unwrap();
-        assert_eq!(
-            ledger.reservations["reader_a"].pending_init_observed_at_ms,
-            Some(1_000)
-        );
-        assert_eq!(
-            ledger.reservations["reader_b"].pending_init_observed_at_ms,
-            None
-        );
-        drop(ledger);
-        drop(store);
-
-        reconcile_pending_init_status_response(
-            temp.path(),
-            "runtime-a",
-            session_id,
-            Some(&mixed),
-            1_050,
-            100,
-        )
-        .unwrap();
-        let recovery = recover_expired_pending_init_reservations(
-            temp.path(),
-            "runtime-a",
-            session_id,
-            1_100,
-            100,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(recovery.task_ids, ["reader_a"]);
-        assert_eq!(recovery.agent_id_hashes, [hash_component("agent-reader_a")]);
-
-        let store = LedgerStore::open(temp.path(), session_id).unwrap();
-        let ledger = store.load("runtime-a", session_id, 1_101).unwrap().unwrap();
-        assert_eq!(
-            ledger.reservations["reader_a"].state,
-            ReservationState::Recovered
-        );
-        assert_eq!(
-            ledger.reservations["reader_a"].outcome,
-            ExecutionOutcome::Lost
-        );
-        assert_eq!(
-            ledger.reservations["reader_b"].state,
-            ReservationState::Running
-        );
-        assert_eq!(ledger.reservations["reader_b"].fenced_at_ms, None);
-    }
-
-    #[test]
-    fn conflicting_pending_init_identities_fence_every_candidate() {
-        let temp = tempfile::tempdir().unwrap();
-        let session_id = "conflicting-pending-identities";
-        for (index, task_id) in ["reader_a", "reader_b"].into_iter().enumerate() {
-            let spawn = contract_input(task_id, "codey_deep_research", research_contract(task_id));
-            pre_spawn(
-                temp.path(),
-                "runtime-a",
-                session_id,
-                Some(&spawn),
-                index,
-                10 + index as u64,
-            )
-            .unwrap();
-            post_spawn(
-                temp.path(),
-                "runtime-a",
-                session_id,
-                Some(&spawn),
-                Some(&json!({ "agent_id": format!("agent-{task_id}") })),
-                20 + index as u64,
-            )
-            .unwrap();
-        }
-
-        let conflicting = json!({
-            "agents": [{
-                "task_name": "/root/reader_a",
-                "agent_id": "agent-reader_b",
-                "status": "pending_init"
-            }]
-        });
-        let error = reconcile_pending_init_status_response(
-            temp.path(),
-            "runtime-a",
-            session_id,
-            Some(&conflicting),
-            30,
-            100,
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains(AGENT_ID_COLLISION_ERROR_CODE));
-
-        let store = LedgerStore::open(temp.path(), session_id).unwrap();
-        let ledger = store.load("runtime-a", session_id, 31).unwrap().unwrap();
-        assert!(ledger.reservations.values().all(|reservation| {
-            reservation.state == ReservationState::Recovered
-                && reservation.outcome == ExecutionOutcome::Lost
-                && reservation.pending_init_observed_at_ms.is_none()
-        }));
-    }
-
-    #[test]
     fn interrupt_acknowledgement_must_match_the_requested_target_and_preserves_terminal_outcome() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "interrupt-identity-session";
@@ -9013,43 +8590,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_recovery_fences_the_ledger_before_markers_are_removed() {
-        let temp = tempfile::tempdir().unwrap();
-        let input = contract_input(
-            "research_stale",
-            "codey_deep_research",
-            research_contract("research_stale"),
-        );
-        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
-        assert_eq!(
-            active_reservation_count(temp.path(), "runtime-a", "session-a", 20).unwrap(),
-            Some(1)
-        );
-        assert_eq!(
-            recover_active_reservations(
-                temp.path(),
-                "runtime-a",
-                "session-a",
-                "test recovery",
-                30,
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            active_reservation_count(temp.path(), "runtime-a", "session-a", 40).unwrap(),
-            Some(0)
-        );
-        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
-        let ledger = store.load("runtime-a", "session-a", 50).unwrap().unwrap();
-        let reservation = &ledger.reservations["research_stale"];
-        assert_eq!(reservation.state, ReservationState::Recovered);
-        assert_eq!(reservation.outcome, ExecutionOutcome::Lost);
-        assert!(reservation.agent_id_hash.is_none());
-        assert_eq!(reservation.fenced_at_ms, Some(30));
-    }
-
-    #[test]
     fn child_rule_changes_take_effect_without_process_restart() {
         let temp = tempfile::tempdir().unwrap();
         let input = contract_input(
@@ -9172,7 +8712,7 @@ mod tests {
     }
 
     #[test]
-    fn denied_side_effect_then_terminal_stop_does_not_leave_pending_init_or_acceptance_debt() {
+    fn denied_side_effect_then_terminal_stop_does_not_leave_acceptance_debt() {
         let temp = tempfile::tempdir().unwrap();
         let mut contract = worker_contract("worker_denied", "backend/src");
         contract["capabilities"] = json!(["files.read", "workspace.write"]);
@@ -9209,29 +8749,12 @@ mod tests {
         )
         .unwrap();
 
-        let stale_pending = json!({
-            "agents": [
-                { "agent_name": "/root", "status": "running" },
-                { "agent_name": "/root/worker_denied", "status": "pending_init" }
-            ]
-        });
-        reconcile_pending_init_status_response(
-            temp.path(),
-            "runtime-a",
-            "session-a",
-            Some(&stale_pending),
-            50,
-            10 * 60 * 1_000,
-        )
-        .unwrap();
-
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 60).unwrap().unwrap();
         let reservation = &ledger.reservations["worker_denied"];
         assert_eq!(reservation.state, ReservationState::Terminal);
         assert_eq!(reservation.outcome, ExecutionOutcome::Unknown);
         assert!(!reservation.side_effect_authorized);
-        assert_eq!(reservation.pending_init_observed_at_ms, None);
         drop(ledger);
         drop(store);
 
@@ -9603,7 +9126,7 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_debt_releases_after_the_stall_grace_even_before_three_stops() {
+    fn acceptance_debt_releases_only_after_three_blocked_stops() {
         let temp = tempfile::tempdir().unwrap();
         let input = contract_input(
             "worker_a",
@@ -9628,21 +9151,30 @@ mod tests {
                 .unwrap()
                 .contains("codey-accept:worker_a:tests")
         );
+        let still_pending = pending_acceptance_reason(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            24 * 60 * 60 * 1000,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(still_pending.contains("codey-accept:worker_a:tests"));
         let notice = pending_acceptance_reason(
             temp.path(),
             "runtime-a",
             "session-a",
-            20 + ACCEPTANCE_STALL_GRACE_MILLIS,
+            7 * 24 * 60 * 60 * 1000,
         )
         .unwrap()
         .unwrap();
-        assert!(notice.contains("持续 10 分钟未取得新证据"));
+        assert!(notice.contains("连续 3 次 Stop 未取得新证据"));
         assert_eq!(
             pending_acceptance_reason(
                 temp.path(),
                 "runtime-a",
                 "session-a",
-                21 + ACCEPTANCE_STALL_GRACE_MILLIS,
+                8 * 24 * 60 * 60 * 1000,
             )
             .unwrap(),
             None
@@ -9824,7 +9356,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v8_migration_does_not_invent_pending_init_age() {
+    fn schema_v8_migration_preserves_runtime_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let input = contract_input(
             "research_a",
@@ -9857,7 +9389,6 @@ mod tests {
         let legacy_reservation = legacy["reservations"]["research_a"]
             .as_object_mut()
             .unwrap();
-        legacy_reservation.remove("pending_init_observed_at_ms");
         legacy_reservation.remove("runtime_generation");
         legacy_reservation.remove("origin_runtime_id_hash");
         crate::fs_util::atomic_write(&ledger_path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
@@ -9879,20 +9410,12 @@ mod tests {
             ledger.reservations["research_a"].origin_runtime_id_hash,
             hash_component("runtime-a")
         );
-        assert_eq!(
-            ledger.reservations["research_a"].pending_init_observed_at_ms,
-            None
-        );
         drop(ledger);
         drop(store);
 
         let migrated: Value =
             serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
         assert_eq!(migrated["schema_version"], json!(LEDGER_SCHEMA_VERSION));
-        assert_eq!(
-            migrated["reservations"]["research_a"]["pending_init_observed_at_ms"],
-            Value::Null
-        );
     }
 
     #[test]

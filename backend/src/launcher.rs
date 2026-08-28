@@ -33,6 +33,7 @@ use crate::message_delete;
 use crate::model_catalog;
 use crate::model_id;
 use crate::pet_slim_patch;
+use crate::session_delete_tombstone::{self, ReplaySummary as SessionDeleteReplaySummary};
 use crate::session_index_cleanup::{self, SessionIndexCleanupReport};
 use crate::startup_maintenance::{self, ProviderSyncPlan};
 use crate::subagent_policy;
@@ -232,6 +233,9 @@ async fn run_startup_session_maintenance(
     let maintenance_provider = provider.map(ToString::to_string);
     let maintenance_result = tokio::task::spawn_blocking(move || {
         let stale_lock_recovery = maintenance_lock::recover_stale_locks(&maintenance_home);
+        // Remove externally recreated sessions before provider synchronization
+        // can copy stale metadata into another Codex database.
+        let session_delete_replay = session_delete_tombstone::replay(&maintenance_home);
         let provider_sync = maintenance_provider.map(|maintenance_provider| {
             match startup_maintenance::provider_sync_plan(&maintenance_home, &maintenance_provider)
             {

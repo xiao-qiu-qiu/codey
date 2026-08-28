@@ -563,7 +563,7 @@ pub struct CodeyConfig {
     /// preserves whether the preflight was authoritative or inconclusive.
     #[serde(skip)]
     pub official_account_status_this_launch: LaunchOfficialAccountStatus,
-    /// Public HTTPS endpoint for the version manifest published to Cloudflare R2.
+    /// Public HTTPS endpoint for the version manifest published to the project's GitHub Release.
     /// This is build-time configuration, not a user setting.
     #[serde(
         default = "default_update_manifest_url",
@@ -1705,7 +1705,8 @@ fn default_subagent_reasoning_effort() -> String {
     DEFAULT_SUBAGENT_REASONING_EFFORT.to_string()
 }
 
-const DEFAULT_UPDATE_BASE_URL: &str = "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev";
+const DEFAULT_UPDATE_BASE_URL: &str =
+    "https://github.com/xiao-qiu-qiu/codey/releases/latest/download";
 
 /// Local builds do not accept executable replacements unless the release
 /// environment explicitly opts in. This keeps a customized installation from

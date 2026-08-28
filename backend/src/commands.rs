@@ -45,7 +45,7 @@ use models::{
 };
 pub use models::{
     delete_route, fetch_route_models, save_default_model, save_official_route_models,
-    save_selected_models, sync_current_provider_command,
+    save_official_route_models_with_options, save_selected_models, sync_current_provider_command,
 };
 use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
 use prompt_optimization::{
@@ -89,7 +89,8 @@ use crate::codex_provider;
 use crate::codex_provider::OfficialAccountProfileStatus;
 use crate::config::{
     CodeyConfig, ConfigStore, LaunchOfficialAccountStatus, PromptOptimizationConfig,
-    SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SubagentRoleConfig, validate_provider_profiles,
+    SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SubagentRoleConfig, default_subagent_guidance,
+    validate_provider_profiles,
 };
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,

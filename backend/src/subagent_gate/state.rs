@@ -36,8 +36,6 @@ pub(super) struct ProtocolHealth {
     pub(super) missing_agent_id_events: u16,
     #[serde(default)]
     pub(super) unknown_status_responses: u16,
-    #[serde(default)]
-    pub(super) absolute_stop_timeouts: u16,
     pub(super) last_issue: String,
 }
 
@@ -53,7 +51,6 @@ pub(super) struct RootTurnBinding {
 pub(super) enum ProtocolIssueKind {
     MissingAgentId,
     UnknownStatusResponse,
-    AbsoluteStopTimeout,
 }
 
 pub(super) fn current_timestamp_millis() -> u64 {
@@ -88,44 +85,7 @@ pub(super) fn missing_agent_id_has_classified_subagent_context(
     };
     validate_protocol_health(&health, runtime_id)?;
     Ok(health.missing_agent_id_events > 0
-        && health.unknown_status_responses == 0
-        && health.absolute_stop_timeouts == 0)
-}
-
-pub(super) fn observe_and_check_elapsed(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    file_name: &str,
-    now_ms: u64,
-    grace_ms: u64,
-) -> Result<bool> {
-    let session_dir = session_state_dir(state_root, session_id);
-    let path = session_auxiliary_path(&session_dir, runtime_id, file_name);
-    match read_observation_timestamp(&path)? {
-        Some(observed_at_ms) => Ok(now_ms.saturating_sub(observed_at_ms) >= grace_ms),
-        None => {
-            write_observation_timestamp(&session_dir, &path, now_ms)?;
-            Ok(false)
-        }
-    }
-}
-
-pub(super) fn observation_elapsed_if_present(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    file_name: &str,
-    now_ms: u64,
-    grace_ms: u64,
-) -> Result<bool> {
-    let path = session_auxiliary_path(
-        &session_state_dir(state_root, session_id),
-        runtime_id,
-        file_name,
-    );
-    Ok(read_observation_timestamp(&path)?
-        .is_some_and(|observed_at_ms| now_ms.saturating_sub(observed_at_ms) >= grace_ms))
+        && health.unknown_status_responses == 0)
 }
 
 pub(super) fn read_observation_timestamp(path: &Path) -> Result<Option<u64>> {
@@ -174,7 +134,6 @@ pub(super) fn record_protocol_issue(
         last_issue_at_ms: now_ms,
         missing_agent_id_events: 0,
         unknown_status_responses: 0,
-        absolute_stop_timeouts: 0,
         last_issue: detail.to_string(),
     });
     validate_protocol_health(&health, runtime_id)?;
@@ -184,9 +143,6 @@ pub(super) fn record_protocol_issue(
         }
         ProtocolIssueKind::UnknownStatusResponse => {
             health.unknown_status_responses = health.unknown_status_responses.saturating_add(1);
-        }
-        ProtocolIssueKind::AbsoluteStopTimeout => {
-            health.absolute_stop_timeouts = health.absolute_stop_timeouts.saturating_add(1);
         }
     }
     health.last_issue_at_ms = now_ms;
@@ -211,7 +167,7 @@ pub(super) fn clear_unknown_status_protocol_issue(
     }
     health.unknown_status_responses = 0;
     health.last_issue_at_ms = now_ms;
-    if health.missing_agent_id_events == 0 && health.absolute_stop_timeouts == 0 {
+    if health.missing_agent_id_events == 0 {
         return remove_session_auxiliary_file(
             state_root,
             runtime_id,
@@ -250,12 +206,6 @@ pub(super) fn protocol_issue_reason(
         issues.push(format!(
             "有 {} 个 wait/list 响应结构无法识别",
             health.unknown_status_responses
-        ));
-    }
-    if health.absolute_stop_timeouts > 0 {
-        issues.push(format!(
-            "有 {} 次根代理 Stop 按 60 分钟绝对上限放行",
-            health.absolute_stop_timeouts
         ));
     }
     if issues.is_empty() {

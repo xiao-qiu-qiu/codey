@@ -386,6 +386,12 @@ pub fn selection_state_with_manual_models(
                 let supported_reasoning_efforts = reasoning_efforts_from_value(model);
                 let default_reasoning_effort =
                     default_reasoning_effort_from_value(model, &supported_reasoning_efforts);
+                let supports_subagent = model
+                    .get("multi_agent_version")
+                    .and_then(Value::as_str)
+                    .is_some_and(|version| {
+                        matches!(version.trim().to_ascii_lowercase().as_str(), "v1" | "v2")
+                    });
                 let model = official_model_from_value(model)?;
                 let supported = !filter_official_selection
                     || selected_official_keys.contains(&model_id::key(&model.slug));
@@ -393,6 +399,7 @@ pub fn selection_state_with_manual_models(
                     slug: model.slug,
                     display_name: model.display_name,
                     supported,
+                    supports_subagent,
                     supported_reasoning_efforts,
                     default_reasoning_effort,
                 })

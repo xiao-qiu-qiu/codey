@@ -442,7 +442,7 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 默认由主代理直接处理短而明确、步骤互相依赖或即将修改关键代码/文档的任务；不要为了形式分工而派生。以下情况才积极考虑子代理：`multi_lookup` 表示至少 2 次彼此独立的定位或事实检索，`parallel` 表示至少 2 个互不依赖的分支、每支预计至少 2 次实质调用且合计至少 5 次，`breadth` 表示至少 2 个目录或 4 个候选文件，`context` 表示大量日志或文档会污染主线程，`independent_work` 表示不在主代理关键路径上的独立实现，`high_risk` 表示高风险结论缺少确定性检查，`user_requested` 仅在用户明确要求子代理或大规模并行时使用。不超过 2 个小文件和 3 次本地工具调用的精确任务通常由主代理完成。这些数量只是软路由参考。
 
-纯只读批次最多同时运行 3 个子代理；存在写入型或身份未确认的代理时最多同时运行 2 个。Codey 不再按角色成本点设置预算上限，也不限制后续批次或累计派发次数，但并发、生命周期和验收门禁始终有效。
+纯只读批次最多同时运行 3 个子代理；存在写入型或身份未确认的代理时最多同时运行 2 个。Codey 不再按角色成本点设置预算上限，也不限制后续批次或累计派发次数；并发限制只约束同时运行数量。生命周期与验收状态只在权威终态或根代理明确中断后收敛，不按运行时长自动释放、阻塞或重派。
 
 ### 派发契约
 
@@ -458,13 +458,13 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 ### 返回与验收
 
 - 每个子代理只执行一轮且不得继续派生。返回首行必须是 `status: completed | partial | blocked`，正文只保留影响决策的结论、最多 5 条带 `file:line`/符号/链接的证据和明确 gaps；多代理证据冲突时比较出处。
-- 写入结果由主代理按 Stop 给出的 `# codey-accept:<task>:<check>` 原样重跑。只有可信的退出状态 `0` 才清偿验收债；连续 3 次失败、连续 3 次无新证据或持续 10 分钟仍无法验证时，该批次只能以 `blocked` 结算并如实报告。
+- 写入结果由主代理按 Stop 给出的 `# codey-accept:<task>:<check>` 原样重跑。只有可信的退出状态 `0` 才清偿验收债；连续 3 次失败或连续 3 次无新证据时，该批次只能以 `blocked` 结算并如实报告。验收不会因运行时长自动阻塞主代理。
 
 ### 批次生命周期
 
-- 同一批独立任务先全部派发，再进入等待。Hook 用本批首个根派生调用的可信 `turn_id` 绑定编排主体；child 或不匹配的 turn 只能使用 `agents.wait_agent` 和无筛选的 `agents.list_agents` 对账。活动代理全部结算前不得恢复普通本地工作。
+- 同一批独立任务先全部派发，再进入等待。Hook 用本批首个根派生调用的可信 `turn_id` 绑定编排主体；child 或不匹配的 turn 只能使用 `agents.wait_agent` 和无筛选的 `agents.list_agents` 对账。主代理可在等待期间继续独立推进本地工作，需要结果时再用 wait/list 对账。
 - `MESSAGE` 只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`pending_init`、`running`、`interrupted` 仍按非终态处理，除非根代理成功中断并永久放弃该 attempt。
-- 成功的 `agents.interrupt_agent` 表示根代理永久放弃并 fence 该 attempt；不要再等待或追派该 target，直接接管。`pending_init` 或运行 10 分钟仍无终态时先 list 对账，仍卡住且根绑定有效时只中断一次。
+- 成功的 `agents.interrupt_agent` 表示根代理永久放弃并 fence 该 attempt；不要再等待或追派该 target，直接接管。运行时长不会自动触发中断；只有用户明确取消、上游返回失败终态或状态对账确认丢失时才处理对应 attempt。
 - 重复 task ID 时只 list 对账一次：原代理存在则等待/消费结果，不存在则主代理接管。失败后默认接管；只有缩小或改变范围后仍值得独立委派，才用全新 task ID 最多重派一次。follow-up 被拒绝表示旧 attempt 未唤醒，不得循环重试。
 - 用户新输入使旧批次失效时先对账；仅在可信根绑定有效时中断活动代理。协作工具不可用时不循环调用不存在的工具。
 "#;
@@ -625,15 +625,9 @@ pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
     PREVIOUS_SUBAGENT_GUIDANCE,
 ];
 
-pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
-    SUBAGENT_GUIDANCE,
-    PREVIOUS_SUBAGENT_GUIDANCE_V6,
-    PREVIOUS_SUBAGENT_GUIDANCE_V5,
-    PREVIOUS_SUBAGENT_GUIDANCE_V4,
-    PREVIOUS_SUBAGENT_GUIDANCE_V3,
-    PREVIOUS_SUBAGENT_GUIDANCE_V2,
-    PREVIOUS_SUBAGENT_GUIDANCE,
-];
+// Legacy templates stay byte-for-byte so existing config blocks can be removed;
+// only SUBAGENT_GUIDANCE is written into a fresh or migrated configuration.
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_VERSIONS: &[&str] = SUBAGENT_GUIDANCE_VERSIONS;
 
 pub(crate) const SUBAGENT_GUIDANCE_BLOCK_START: &str = "<!-- CODEY:SUBAGENT_GUIDANCE:BEGIN -->";
 pub(crate) const SUBAGENT_GUIDANCE_BLOCK_END: &str = "<!-- CODEY:SUBAGENT_GUIDANCE:END -->";
@@ -1716,6 +1710,9 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("可信的退出状态 `0`"));
         assert!(SUBAGENT_GUIDANCE.contains("连续 3 次失败"));
         assert!(SUBAGENT_GUIDANCE.contains("`completed`、`errored`、`error`、`failed`"));
+        assert!(!SUBAGENT_GUIDANCE.contains("10 分钟"));
+        assert!(!SUBAGENT_GUIDANCE.contains("十分钟"));
+        assert!(SUBAGENT_GUIDANCE.contains("不按运行时长自动释放、阻塞或重派"));
         assert!(SUBAGENT_GUIDANCE.len() < PREVIOUS_SUBAGENT_GUIDANCE_V13.len());
     }
 

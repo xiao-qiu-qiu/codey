@@ -246,7 +246,7 @@ function main() {
   if (options.push) {
     run("git", ["push", options.remote, branch]);
     run("git", ["push", options.remote, options.tag]);
-    console.log(`Published ${options.tag}. GitHub Actions will build and upload the R2 manifest.`);
+    console.log(`Published ${options.tag}. GitHub Actions will build and publish the GitHub Release update manifest.`);
   } else {
     console.log(`Created local tag ${options.tag}. Push with: git push ${options.remote} ${branch} && git push ${options.remote} ${options.tag}`);
   }

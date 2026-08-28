@@ -20,13 +20,14 @@ use crate::codex_config_guidance::PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT;
 use crate::codex_config_guidance::{
     CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, ROOT_AGENT_COLLABORATION_USAGE_HINT,
     ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, ROOT_AGENT_MULTI_AGENT_MODE_HINT,
-    SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS, append_root_agent_collaboration_usage_hint,
+    SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_BLOCK_START, PREVIOUS_SUBAGENT_GUIDANCE_VERSIONS,
+    append_root_agent_collaboration_usage_hint,
     previous_default_agent_config_without_sandbox, remove_codey_fastctx_guidance,
     remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
-    CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
-    SubagentRoleConfig, default_config_path,
+    CodeyConfig, SUBAGENT_FIXED_ROLE_IDS, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT,
+    SUBAGENT_ROLE_IDS, SubagentRoleConfig, default_config_path, fixed_subagent_role_config,
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
@@ -488,6 +489,7 @@ fn apply_isolated_runtime_router_config_with_guidance(
         } = build_runtime_hooks_file(
             raw_original_hooks.as_deref(),
             &hooks_path,
+            subagent_hook_commands.as_ref(),
             fastctx_hook_commands.as_ref(),
             combined_hook_commands.as_ref(),
         )?;
@@ -2199,6 +2201,7 @@ const SUBAGENT_GATE_HOOK_EVENTS: [(&str, &str); 6] = [
 fn build_runtime_hooks_file(
     existing: Option<&[u8]>,
     hooks_path: &Path,
+    subagent_commands: Option<&crate::subagent_gate::HookCommands>,
     fastctx_commands: Option<&crate::subagent_gate::HookCommands>,
     combined_commands: Option<&crate::subagent_gate::HookCommands>,
 ) -> Result<RuntimeHooksFile> {
@@ -2350,6 +2353,109 @@ fn remove_subagent_gate_hooks_from_json(root: &mut serde_json::Value) -> bool {
     }
     hooks.retain(|_, groups| !groups.as_array().is_some_and(Vec::is_empty));
     changed
+}
+
+fn remove_subagent_gate_hooks(doc: &mut DocumentMut, config_path: &Path) {
+    let Some(hooks) = doc.get_mut("hooks").and_then(Item::as_table_mut) else {
+        return;
+    };
+    let config_path_prefix = format!("{}:", config_path.display());
+    let mut removed_state_suffixes = Vec::new();
+    let mut removed_events = Vec::new();
+    for (event, event_key) in SUBAGENT_GATE_HOOK_EVENTS {
+        let Some(item) = hooks.get_mut(event) else {
+            continue;
+        };
+        let mut removed_indices = Vec::new();
+        match item {
+            Item::ArrayOfTables(groups) => {
+                for index in (0..groups.len()).rev() {
+                    if groups
+                        .get(index)
+                        .is_some_and(table_is_subagent_gate_hook_group)
+                    {
+                        groups.remove(index);
+                        removed_indices.push(index);
+                    }
+                }
+                if groups.is_empty() {
+                    hooks.remove(event);
+                    removed_events.push(event_key);
+                }
+            }
+            Item::Value(Value::Array(groups)) => {
+                for index in (0..groups.len()).rev() {
+                    if groups
+                        .get(index)
+                        .is_some_and(value_is_subagent_gate_hook_group)
+                    {
+                        groups.remove(index);
+                        removed_indices.push(index);
+                    }
+                }
+                if groups.is_empty() {
+                    hooks.remove(event);
+                    removed_events.push(event_key);
+                }
+            }
+            _ => {}
+        }
+        removed_state_suffixes.extend(removed_indices.into_iter().map(|index| (event_key, index)));
+    }
+    if let Some(state) = hooks.get_mut("state").and_then(Item::as_table_mut) {
+        state.retain(|key, entry| {
+            let remove_for_removed_group = removed_state_suffixes.iter().any(|(event_key, index)| {
+                (key.starts_with(&config_path_prefix)
+                    && key.ends_with(&format!(":{event_key}:{index}:0")))
+                    || key.ends_with(&format!(":{event_key}:{index}:0"))
+            });
+            let remove_for_removed_event = removed_events
+                .iter()
+                .any(|event_key| key.contains(&format!(":{event_key}:")));
+            let remove_stale_disabled_entry = entry.as_table().is_some_and(|entry| {
+                entry.get("enabled").and_then(Item::as_bool) == Some(false)
+                    && entry.get("trusted_hash").is_none()
+            });
+            !(remove_for_removed_group || remove_for_removed_event || remove_stale_disabled_entry)
+        });
+        if state.is_empty() {
+            hooks.remove("state");
+        }
+    }
+    if hooks.is_empty() {
+        doc.as_table_mut().remove("hooks");
+    }
+}
+
+fn table_is_subagent_gate_hook_group(group: &Table) -> bool {
+    group
+        .get("hooks")
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|handlers| {
+            handlers.iter().any(|handler| {
+                ["command", "commandWindows", "command_windows"]
+                    .into_iter()
+                    .filter_map(|field| handler.get(field).and_then(Item::as_str))
+                    .any(|command| command.contains(crate::subagent_gate::HOOK_ARGUMENT))
+            })
+        })
+}
+
+fn value_is_subagent_gate_hook_group(group: &Value) -> bool {
+    group
+        .as_inline_table()
+        .and_then(|group| group.get("hooks"))
+        .and_then(Value::as_array)
+        .is_some_and(|handlers| {
+            handlers.iter().any(|handler| {
+                handler.as_inline_table().is_some_and(|handler| {
+                    ["command", "commandWindows", "command_windows"]
+                        .into_iter()
+                        .filter_map(|field| handler.get(field).and_then(Value::as_str))
+                        .any(|command| command.contains(crate::subagent_gate::HOOK_ARGUMENT))
+                })
+            })
+        })
 }
 
 fn json_hook_group_is_subagent_gate_owned(group: &serde_json::Value) -> bool {

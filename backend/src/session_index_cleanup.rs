@@ -9,7 +9,9 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::fs_util::{atomic_write_preserving_permissions as atomic_write, timestamp_millis};
+use crate::fs_util::{
+    atomic_write_preserving_permissions as atomic_write, sha256_hex, timestamp_millis,
+};
 use crate::sqlite_util::table_columns;
 
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];

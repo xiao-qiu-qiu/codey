@@ -67,7 +67,8 @@ jobs:
       - name: Build unsigned macOS app
         env:
           CODEY_SKIP_CODESIGN: "1"
-          CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+          CODEY_ENABLE_SELF_UPDATE: "1"
+          CODEY_UPDATE_BASE_URL: https://github.com/xiao-qiu-qiu/codey/releases/latest/download
         run: pnpm run build
 
       - name: Verify and archive macOS app
@@ -191,7 +192,8 @@ jobs:
 
       - name: Build Windows executable
         env:
-          CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+          CODEY_ENABLE_SELF_UPDATE: "1"
+          CODEY_UPDATE_BASE_URL: https://github.com/xiao-qiu-qiu/codey/releases/latest/download
         run: pnpm run build
 
       - name: Build Windows packages
@@ -285,6 +287,20 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match package.json version $PACKAGE_VERSION." >&2
             exit 1
           }
+
+      - name: Generate GitHub Release update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          VERSION="${VERSION#V}"
+          node scripts/generate-update-manifest.mjs \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --download-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}" \
+            --output release-assets/latest.json \
+            release-assets/*
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
