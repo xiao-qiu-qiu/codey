@@ -8,6 +8,10 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::codex_config_guidance::{
+    PREVIOUS_SUBAGENT_GUIDANCE_VERSIONS, SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_BLOCK_END,
+    SUBAGENT_GUIDANCE_BLOCK_START,
+};
 pub use crate::notifications::WebhookConfig;
 use crate::{local_router, model_catalog, model_id};
 
@@ -671,6 +675,15 @@ impl CodeyConfig {
             &mut self.subagent_reasoning_effort,
             &mut self.subagent_roles,
         );
+        self.subagent_guidance = self.subagent_guidance.trim().to_string();
+        if self.subagent_guidance.is_empty()
+            || self.subagent_guidance == SUBAGENT_GUIDANCE.trim()
+            || PREVIOUS_SUBAGENT_GUIDANCE_VERSIONS
+                .iter()
+                .any(|guidance| guidance.trim() == self.subagent_guidance)
+        {
+            self.subagent_guidance = default_subagent_guidance();
+        }
         self.normalize_subagent_model_references();
         if !self.initial_route_import_completed && !self.looks_like_empty_default_route() {
             self.initial_route_import_completed = true;
@@ -1504,6 +1517,7 @@ fn default_true() -> bool {
 
 pub const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5.6-terra";
 pub const DEFAULT_SUBAGENT_REASONING_EFFORT: &str = "low";
+pub const MAX_SUBAGENT_GUIDANCE_BYTES: usize = 32 * 1024;
 pub const UPSTREAM_PROTOCOL_OFFICIAL: &str = "official";
 pub const UPSTREAM_PROTOCOL_OPENAI_RESPONSES: &str = "openaiResponses";
 pub const UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS: &str = "openaiChatCompletions";

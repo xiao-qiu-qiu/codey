@@ -231,7 +231,6 @@ struct RouterApplyOptions<'a> {
     default_model: Option<&'a str>,
     fastctx_command: Option<&'a Path>,
     subagent_optimization: bool,
-    subagent_guidance: &'a str,
     subagent_model: &'a str,
     subagent_reasoning_effort: &'a str,
     subagent_roles: Option<&'a BTreeMap<String, SubagentRoleConfig>>,
@@ -271,7 +270,7 @@ pub(crate) fn apply_runtime_router_config(
     // Most runtime values stay command-local `-c` overlays. Codex Desktop still
     // looks up a thread's saved `model_provider` from disk, so persist only the
     // live loopback `codey_router` table after the isolated overlay is ready.
-    let applied = apply_isolated_runtime_router_config(
+    let applied = apply_isolated_runtime_router_config_with_guidance(
         home,
         RouterApplyOptions {
             local_router: options.local_router,
@@ -279,13 +278,13 @@ pub(crate) fn apply_runtime_router_config(
             default_model,
             fastctx_command: fastctx_command.as_deref(),
             subagent_optimization: options.subagent_optimization,
-            subagent_guidance: options.subagent_guidance,
             subagent_model: options.subagent_model,
             subagent_reasoning_effort: options.subagent_reasoning_effort,
             subagent_roles: options.subagent_roles,
             marker: &marker,
             backup_root: &backup_root,
         },
+        options.subagent_guidance,
     )?;
     persist_runtime_router_disk_provider_or_rollback(home, &marker, options.local_router)?;
     Ok(applied)
@@ -350,6 +349,14 @@ fn fastctx_server_command() -> Result<PathBuf> {
 fn apply_isolated_runtime_router_config(
     home: &Path,
     options: RouterApplyOptions<'_>,
+) -> Result<AppliedRuntimeRouterConfig> {
+    apply_isolated_runtime_router_config_with_guidance(home, options, SUBAGENT_GUIDANCE)
+}
+
+fn apply_isolated_runtime_router_config_with_guidance(
+    home: &Path,
+    options: RouterApplyOptions<'_>,
+    subagent_guidance: &str,
 ) -> Result<AppliedRuntimeRouterConfig> {
     let RouterApplyOptions {
         local_router,
@@ -424,11 +431,7 @@ fn apply_isolated_runtime_router_config(
         runtime_subagent_roles(subagent_roles, subagent_model, subagent_reasoning_effort);
     let (root_instructions, collaboration_hint, runtime_agents) = if subagent_optimization {
         let root_path = constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE);
-        let root_instructions = read_or_create_constraint_file_with_exact_migration(
-            &root_path,
-            SUBAGENT_GUIDANCE,
-            &SUBAGENT_GUIDANCE_VERSIONS[1..],
-        )?;
+        let root_instructions = write_managed_constraint_file(&root_path, subagent_guidance)?;
         let collaboration_hint = read_or_create_constraint_file_with_exact_migration(
             &constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),
             ROOT_AGENT_COLLABORATION_USAGE_HINT,

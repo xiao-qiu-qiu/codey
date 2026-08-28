@@ -683,6 +683,7 @@ async fn prepare_codex_startup_state(
         &route_model_aliases,
     );
     let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort.clone();
+    let subagent_guidance = runtime_subagent_config.subagent_guidance.clone();
     let mut subagent_roles = runtime_subagent_config.subagent_roles.clone();
     for selection in subagent_roles.values_mut() {
         selection.model = route_subagent_model(
