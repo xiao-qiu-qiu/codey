@@ -1,14 +1,28 @@
 import { memo, type CSSProperties } from "react";
-import { IconInfoCircle, IconRestore } from "@tabler/icons-react";
+import { IconAdjustmentsHorizontal, IconInfoCircle, IconUsersGroup } from "@tabler/icons-react";
 
 import type {
   Config,
   FastContextToolsStatus,
   SubagentRoleId,
 } from "./App.types";
-import { Badge, Button, Card, Select, Switch, Tooltip } from "./components/semi";
+import {
+  ActionIcon,
+  Badge,
+  Card,
+  Select,
+  Switch,
+  Table,
+  Tooltip,
+} from "./components/mantine";
+import { ModelCombobox } from "./components/ModelCombobox";
+import { routeProviderId } from "./modelRoutes";
+import {
+  resolveSubagentModelOption,
+  type SubagentModelOption,
+} from "./subagentModels";
+import { compactSelectInputClass, surfaceCardPaddingClass } from "./uiClasses";
 import { SETTINGS_OVERLAY_Z_INDEX } from "./overlay.constants";
-import type { SubagentModelOption } from "./useModelSelection";
 
 const GPU_LAUNCH_MODES = [
   { value: "off", label: "关闭" },
@@ -30,36 +44,37 @@ const SUBAGENT_TASK_TYPES = [
   {
     id: "codey_quick_scan",
     name: "快速定位",
+    access: "readOnly",
     description: "默认只读；用于精确位置、重复性检查、低风险事实查找和小范围快速检索。",
   },
   {
     id: "codey_deep_research",
     name: "深度检索",
+    access: "readOnly",
     description: "默认只读；用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。",
   },
   {
     id: "codey_visual_analysis",
     name: "视觉分析",
-    description: "默认只读；用于截图、页面、GUI、PDF 等视觉证据分析，以及复杂探索和独立核验。",
+    access: "readOnly",
+    description: "默认只读；仅用于必须读取截图、页面、GUI、PDF 或渲染结果的视觉证据分析。",
   },
   {
     id: "codey_worker",
     name: "代码实施",
+    access: "write",
     description: "默认可写；用于边界清晰、可回滚、可测试的低到中等复杂度非视觉实现。",
   },
   {
     id: "codey_visual_worker",
     name: "视觉实施",
+    access: "write",
     description: "默认可写；用于页面、GUI、PDF 或其他依赖视觉证据和渲染验证的实现。",
-  },
-  {
-    id: "default",
-    name: "通用兜底",
-    description: "默认只读；任务不符合专用类型时使用，负责一般探索、检索和核验，不承担实施。",
   },
 ] as const satisfies ReadonlyArray<{
   id: SubagentRoleId;
   name: string;
+  access: "readOnly" | "write";
   description: string;
 }>;
 const SUBAGENT_FIXED_ROLE_TYPES = [
@@ -86,10 +101,13 @@ const SUBAGENT_FIXED_ROLE_TYPES = [
   },
 ] as const;
 
-type FeaturePolicyCardProps = {
+const WRITABLE_SUBAGENT_ROLE_IDS = [
+  "codey_worker",
+  "codey_visual_worker",
+] as const satisfies ReadonlyArray<SubagentRoleId>;
+
+export type SubagentPolicyCardProps = {
   config: Config;
-  fastContextToolsStatus: FastContextToolsStatus;
-  isMacClient: boolean;
   popupContainer: HTMLElement | null;
   tooltipContainer: HTMLElement | null;
   isBusy: boolean;
@@ -99,10 +117,8 @@ type FeaturePolicyCardProps = {
   onSubagentOptimizationChange: (checked: boolean) => void;
 };
 
-function FeaturePolicyCardComponent({
+export function SubagentPolicyCardComponent({
   config,
-  fastContextToolsStatus,
-  isMacClient,
   popupContainer,
   tooltipContainer,
   isBusy,
@@ -110,25 +126,276 @@ function FeaturePolicyCardComponent({
   defaultSubagentGuidance,
   onConfigChange,
   onSubagentOptimizationChange,
+}: SubagentPolicyCardProps) {
+  const subagentPolicyControlsDisabled = isBusy;
+  const preferredProfile =
+    config.profiles.find((profile) => profile.id === config.activeProfileId) ??
+    config.profiles[0];
+  const preferredProviderId = preferredProfile
+    ? routeProviderId(preferredProfile)
+    : undefined;
+  const enabledRoleCount = SUBAGENT_TASK_TYPES.filter(
+    ({ id }) => config.subagentRoles[id]?.enabled !== false,
+  ).length;
+  const writableRolesDisabled = WRITABLE_SUBAGENT_ROLE_IDS.every(
+    (role) => config.subagentRoles[role]?.enabled === false,
+  );
+  const enabledReadOnlyRoleNames = SUBAGENT_TASK_TYPES.filter(
+    ({ id, access }) =>
+      access === "readOnly" && config.subagentRoles[id]?.enabled !== false,
+  ).map(({ name }) => name);
+  const writableRolesDisabledMessage =
+    enabledReadOnlyRoleNames.length > 0
+      ? `可写子代理已全部关闭；${enabledReadOnlyRoleNames.join("、")}仍可使用。`
+      : "可写子代理已全部关闭；请先启用至少一个只读角色。";
+
+  return (
+    <section className="secondary-section subagent-section" aria-labelledby="subagent-title">
+      <div className="section-title compact">
+        <div className="section-heading">
+          <span className="section-icon" aria-hidden="true">
+            <IconUsersGroup size={15} />
+          </span>
+          <div>
+            <h2 id="subagent-title">Codey 子代理角色与调度增强</h2>
+            <p>基于 Codex 原生子代理的多角色调度与模型配置。</p>
+          </div>
+        </div>
+        <Switch
+          checked={config.subagentOptimization}
+          disabled={isBusy}
+          onCheckedChange={(checked) =>
+            onSubagentOptimizationChange(checked)
+          }
+          aria-label="启用 Codey 子代理角色与调度增强"
+        />
+      </div>
+      <Card className={`secondary-card subagent-card ${surfaceCardPaddingClass}`}>
+        <div className="subagent-policy-body">
+          {config.subagentOptimization ? (
+            <>
+              <div className="subagent-table-container">
+                <Table
+                  withRowBorders
+                  className="subagent-table"
+                >
+                  <Table.Thead>
+                    <Table.Tr>
+                      <Table.Th style={{ width: "44px" }}>启用</Table.Th>
+                      <Table.Th style={{ width: "135px" }}>任务角色</Table.Th>
+                      <Table.Th>指定模型</Table.Th>
+                      <Table.Th style={{ width: "115px" }}>思考深度</Table.Th>
+                    </Table.Tr>
+                  </Table.Thead>
+                  <Table.Tbody>
+                    {SUBAGENT_TASK_TYPES.map((task) => {
+                      const selection = config.subagentRoles[task.id] ?? {
+                        enabled: true,
+                        model: config.subagentModel,
+                        reasoningEffort: config.subagentReasoningEffort,
+                      };
+                      const selectedModel = resolveSubagentModelOption(
+                        subagentModelOptions,
+                        selection.model,
+                        preferredProviderId,
+                      );
+                      const reasoningEfforts =
+                        selectedModel?.supportedReasoningEfforts ?? [];
+                      const reasoningOptions = reasoningEfforts.map((effort) => ({
+                        label: REASONING_EFFORT_LABELS[effort] ?? effort,
+                        value: effort,
+                      }));
+                      const updateRole = (
+                        next: Partial<typeof selection>,
+                      ) => {
+                        onConfigChange({
+                          ...config,
+                          subagentRoles: {
+                            ...config.subagentRoles,
+                            [task.id]: { ...selection, ...next },
+                          },
+                        });
+                      };
+                      const roleDisabled = !selection.enabled;
+
+                      return (
+                        <Table.Tr
+                          key={task.id}
+                          className={roleDisabled ? "subagent-role-disabled" : undefined}
+                        >
+                          <Table.Td>
+                            <Switch
+                              checked={selection.enabled}
+                              disabled={
+                                subagentPolicyControlsDisabled ||
+                                (selection.enabled && enabledRoleCount <= 1)
+                              }
+                              onCheckedChange={(enabled) => updateRole({ enabled })}
+                              aria-label={`${selection.enabled ? "关闭" : "启用"}${task.name}角色`}
+                            />
+                          </Table.Td>
+                          <Table.Td>
+                            <div className="subagent-role-name">
+                              <span>{task.name}</span>
+                              <Badge
+                                variant={task.access === "write" ? "warning" : "secondary"}
+                                size="xs"
+                              >
+                                {task.access === "write" ? "可写" : "只读"}
+                              </Badge>
+                              <Tooltip
+                                content={task.description}
+                                getPopupContainer={() =>
+                                  popupContainer ?? tooltipContainer ?? document.body
+                                }
+                                position="top"
+                                zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                              >
+                                <ActionIcon
+                                  variant="subtle"
+                                  color="gray"
+                                  size="xs"
+                                  radius="sm"
+                                  className="subagent-role-info-btn"
+                                  aria-label={`${task.name}：${task.description}`}
+                                >
+                                  <IconInfoCircle size={13} aria-hidden="true" />
+                                </ActionIcon>
+                              </Tooltip>
+                            </div>
+                          </Table.Td>
+                          <Table.Td>
+                            <ModelCombobox
+                              aria-label={`${task.name}模型`}
+                              value={selection.model}
+                              placeholder={
+                                subagentModelOptions.length === 0
+                                  ? "所有线路均暂无模型"
+                                  : "请选择模型"
+                              }
+                              disabled={
+                                subagentPolicyControlsDisabled ||
+                                roleDisabled ||
+                                subagentModelOptions.length === 0
+                              }
+                              options={subagentModelOptions}
+                              preferredProviderId={preferredProviderId}
+                              getPopupContainer={() => popupContainer ?? document.body}
+                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                              onChange={(value) => {
+                                const option = subagentModelOptions.find(
+                                  (candidate) => candidate.value === value,
+                                );
+                                if (!option) return;
+                                const reasoningEffort =
+                                  option.supportedReasoningEfforts.includes(
+                                    selection.reasoningEffort,
+                                  )
+                                    ? selection.reasoningEffort
+                                    : option.defaultReasoningEffort;
+                                updateRole({
+                                  model: option.value,
+                                  reasoningEffort,
+                                });
+                              }}
+                            />
+                          </Table.Td>
+                          <Table.Td>
+                            <Select
+                              className="w-full min-w-0"
+                              inputClassName={compactSelectInputClass}
+                              sectionClassName="text-[#6e6e73]"
+                              aria-label={`${task.name}思考深度`}
+                              value={
+                                reasoningEfforts.includes(selection.reasoningEffort)
+                                  ? selection.reasoningEffort
+                                  : undefined
+                              }
+                              placeholder="暂无可选深度"
+                              disabled={
+                                subagentPolicyControlsDisabled ||
+                                roleDisabled ||
+                                reasoningEfforts.length === 0
+                              }
+                              optionList={reasoningOptions}
+                              dropdownClassName="rounded-[10px]"
+                              showClear={false}
+                              filter={false}
+                              getPopupContainer={() => popupContainer ?? document.body}
+                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                              onChange={(value) =>
+                                updateRole({
+                                  model: selectedModel?.value ?? selection.model,
+                                  reasoningEffort: String(value ?? ""),
+                                })
+                              }
+                            />
+                          </Table.Td>
+                        </Table.Tr>
+                      );
+                    })}
+                  </Table.Tbody>
+                </Table>
+              </div>
+              <div className="subagent-policy-callout">
+                <IconInfoCircle size={14} className="subagent-callout-icon" aria-hidden="true" />
+                <div className="subagent-callout-text">
+                  {subagentModelOptions.length === 0
+                    ? "请先在模型管理中为任一可用线路启用模型。"
+                    : writableRolesDisabled
+                      ? `${writableRolesDisabledMessage}角色启用状态变更需重启 Codex，模型和思考深度保存后对下次派生生效。`
+                      : "可搜索并选择任意可用线路模型；角色启用状态变更需重启 Codex，模型和思考深度保存后对下次派生生效。角色权限仍受父任务权限模式约束。"}
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="feature-disabled-placeholder">
+              <div className="feature-disabled-icon">
+                <IconUsersGroup size={22} aria-hidden="true" />
+              </div>
+              <div className="feature-disabled-text">
+                <strong>子代理角色与调度增强已关闭</strong>
+                <p>开启后仅在宽范围、可并行或需要专门证据时选择性委派，并提供五类专用角色与汇合门禁。</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </Card>
+    </section>
+  );
+}
+
+export const SubagentPolicyCard = memo(SubagentPolicyCardComponent);
+
+type FeaturePolicyCardProps = {
+  config: Config;
+  fastContextToolsStatus: FastContextToolsStatus;
+  isMacClient: boolean;
+  isWindowsClient: boolean;
+  popupContainer: HTMLElement | null;
+  tooltipContainer: HTMLElement | null;
+  isBusy: boolean;
+  onConfigChange: (config: Config) => void;
+};
+
+function FeaturePolicyCardComponent({
+  config,
+  fastContextToolsStatus,
+  isMacClient,
+  isWindowsClient,
+  popupContainer,
+  tooltipContainer,
+  isBusy,
+  onConfigChange,
 }: FeaturePolicyCardProps) {
   const configuredGpuLaunchModeIndex = GPU_LAUNCH_MODES.findIndex(
     ({ value }) => value === config.gpuLaunchMode,
   );
-  const gpuLaunchModeIndex = isMacClient
-    ? 0
-    : Math.max(configuredGpuLaunchModeIndex, 0);
+  const gpuLaunchModeIndex = Math.max(configuredGpuLaunchModeIndex, 0);
   const gpuLaunchMode = GPU_LAUNCH_MODES[gpuLaunchModeIndex];
   const gpuLaunchModeStyle = {
     "--gpu-mode-offset": `${gpuLaunchModeIndex * 100}%`,
   } as CSSProperties;
-  const subagentPolicyControlsDisabled = isBusy;
-  const subagentModelSelectOptions = subagentModelOptions.map((option) => ({
-    label: option.label,
-    value: option.value,
-  }));
-  const subagentGuidanceBytes = new TextEncoder().encode(
-    config.subagentGuidance,
-  ).byteLength;
   const fastctxStatusBlocksEmbedded =
     fastContextToolsStatus.userConfigured ||
     fastContextToolsStatus.detectionFailed;
@@ -157,314 +424,70 @@ function FeaturePolicyCardComponent({
   return (
     <section className="secondary-section" aria-labelledby="runtime-title">
       <div className="section-title compact">
-        <div>
-          <h2 id="runtime-title">Codex 功能策略</h2>
-          <p>按需精简客户端模块和界面行为。</p>
+        <div className="section-heading">
+          <span className="section-icon" aria-hidden="true">
+            <IconAdjustmentsHorizontal size={15} />
+          </span>
+          <div>
+            <h2 id="runtime-title">Codex 功能策略</h2>
+            <p>按需精简客户端模块和界面行为。</p>
+          </div>
         </div>
       </div>
-      <Card className="secondary-card runtime-card">
+      <Card className={`secondary-card runtime-card ${surfaceCardPaddingClass}`}>
         <div className="feature-grid">
-          <div
-            className={`feature-card gpu-mode-card ${!isMacClient && gpuLaunchMode.value !== "off" ? "active" : ""}`}
-          >
-            <div className="feature-card-header">
-              <div className="feature-card-title">
-                <strong>GPU 渲染模式</strong>
-                <Badge variant={isMacClient ? "secondary" : "warning"}>
-                  {isMacClient ? "macOS 不可用" : "实验性"}
-                </Badge>
-              </div>
-            </div>
-            <div className="feature-card-body gpu-mode-card-body">
-              <fieldset
-                className="gpu-mode-fieldset"
-                disabled={isMacClient || isBusy}
-                aria-describedby="gpu-launch-mode-description"
-              >
-                <legend className="sr-only">Codex GPU 启动模式</legend>
-                <div className="gpu-mode-slider" style={gpuLaunchModeStyle}>
-                  <span className="gpu-mode-slider-thumb" aria-hidden="true" />
-                  {GPU_LAUNCH_MODES.map((mode) => (
-                    <label
-                      key={mode.value}
-                      className={`gpu-mode-option ${gpuLaunchMode.value === mode.value ? "selected" : ""}`}
-                    >
-                      <input
-                        type="radio"
-                        name="codey-gpu-launch-mode"
-                        value={mode.value}
-                        checked={gpuLaunchMode.value === mode.value}
-                        onChange={() =>
-                          onConfigChange({
-                            ...config,
-                            gpuLaunchMode: mode.value,
-                          })
-                        }
-                      />
-                      <span>{mode.label}</span>
-                    </label>
-                  ))}
+          {/* GPU 渲染模式：占满整行全宽，仅 Windows 客户端展示 */}
+          {isWindowsClient && (
+            <div
+              className={`feature-card gpu-mode-card full-width-card ${gpuLaunchMode.value !== "off" ? "active" : ""}`}
+            >
+              <div className="feature-card-header">
+                <div className="feature-card-title">
+                  <strong>GPU 渲染模式</strong>
+                  <Badge variant="warning">实验性</Badge>
                 </div>
-              </fieldset>
-              <small id="gpu-launch-mode-description" aria-live="polite">
-                {isMacClient
-                  ? "macOS 下已禁用，不会向 Codex 传递 GPU 诊断参数"
-                  : gpuLaunchMode.value === "disableGpu"
+              </div>
+              <div className="feature-card-body gpu-mode-card-body">
+                <fieldset
+                  className="gpu-mode-fieldset"
+                  disabled={isBusy}
+                  aria-describedby="gpu-launch-mode-description"
+                >
+                  <legend className="sr-only">Codex GPU 启动模式</legend>
+                  <div className="gpu-mode-slider" style={gpuLaunchModeStyle}>
+                    <span className="gpu-mode-slider-thumb" aria-hidden="true" />
+                    {GPU_LAUNCH_MODES.map((mode) => (
+                      <label
+                        key={mode.value}
+                        className={`gpu-mode-option ${gpuLaunchMode.value === mode.value ? "selected" : ""}`}
+                      >
+                        <input
+                          type="radio"
+                          name="codey-gpu-launch-mode"
+                          value={mode.value}
+                          checked={gpuLaunchMode.value === mode.value}
+                          onChange={() =>
+                            onConfigChange({
+                              ...config,
+                              gpuLaunchMode: mode.value,
+                            })
+                          }
+                        />
+                        <span>{mode.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+                <small id="gpu-launch-mode-description" aria-live="polite">
+                  {gpuLaunchMode.value === "disableGpu"
                     ? "启动 Codex 时附加 --disable-gpu；可能增加 CPU 占用"
                     : gpuLaunchMode.value === "disableGpuRasterization"
                       ? "启动 Codex 时附加 --disable-gpu-rasterization；仅将栅格化移到 CPU"
                       : "保持 Codex 默认 GPU 渲染，不附加诊断参数"}
-              </small>
-            </div>
-          </div>
-
-          <div
-            className={`feature-card subagent-policy-card ${config.subagentOptimization ? "active" : ""}`}
-          >
-            <div className="feature-card-header">
-              <div className="feature-card-title">
-                <strong>Codey 子代理角色与调度增强</strong>
-                <Badge variant="warning">基于 Codex 原生子代理</Badge>
+                </small>
               </div>
-              <Switch
-                checked={config.subagentOptimization}
-                disabled={isBusy}
-                onCheckedChange={(checked) =>
-                  onSubagentOptimizationChange(checked)
-                }
-                aria-label="启用 Codey 子代理角色与调度增强"
-              />
             </div>
-            <div className="feature-card-body subagent-policy-body">
-              {config.subagentOptimization ? (
-                <>
-                  <div className="subagent-policy-columns" aria-hidden="true">
-                    <span>任务类型</span>
-                    <span>模型</span>
-                    <span>思考深度</span>
-                  </div>
-                  <div className="subagent-policy-rows">
-                    {SUBAGENT_TASK_TYPES.map((task) => {
-                      const selection = config.subagentRoles[task.id] ?? {
-                        model: config.subagentModel,
-                        reasoningEffort: config.subagentReasoningEffort,
-                      };
-                      const selectedModel = subagentModelOptions.find(
-                        (option) =>
-                          option.value.trim().toLowerCase() ===
-                          selection.model.trim().toLowerCase(),
-                      );
-                      const reasoningEfforts =
-                        selectedModel?.supportedReasoningEfforts ?? [];
-                      const reasoningOptions = reasoningEfforts.map((effort) => ({
-                        label: REASONING_EFFORT_LABELS[effort] ?? effort,
-                        value: effort,
-                      }));
-                      const updateRole = (
-                        model: string,
-                        reasoningEffort: string,
-                      ) => {
-                        const legacyFallback =
-                          task.id === "default"
-                            ? {
-                                subagentModel: model,
-                                subagentReasoningEffort: reasoningEffort,
-                              }
-                            : {};
-                        onConfigChange({
-                          ...config,
-                          ...legacyFallback,
-                          subagentRoles: {
-                            ...config.subagentRoles,
-                            [task.id]: { model, reasoningEffort },
-                          },
-                        });
-                      };
-
-                      return (
-                        <div className="subagent-policy-row" key={task.id}>
-                          <div className="subagent-task-name">
-                            <span>{task.name}</span>
-                            <Tooltip
-                              content={task.description}
-                              getPopupContainer={() =>
-                                popupContainer ?? tooltipContainer ?? document.body
-                              }
-                              position="top"
-                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                            >
-                              <button
-                                type="button"
-                                className="subagent-task-help"
-                                aria-label={`${task.name}：${task.description}`}
-                              >
-                                <IconInfoCircle size={15} aria-hidden="true" />
-                              </button>
-                            </Tooltip>
-                          </div>
-                          <label>
-                            <span id={`${task.id}-model-label`} className="sr-only">
-                              {task.name}模型
-                            </span>
-                            <span className="subagent-mobile-field-label">模型</span>
-                            <Select
-                              className="subagent-policy-select"
-                              aria-labelledby={`${task.id}-model-label`}
-                              value={selectedModel?.value}
-                              placeholder={
-                                subagentModelOptions.length === 0
-                                  ? "当前线路暂无模型"
-                                  : "请选择模型"
-                              }
-                              disabled={
-                                subagentPolicyControlsDisabled ||
-                                subagentModelOptions.length === 0
-                              }
-                              optionList={subagentModelSelectOptions}
-                              dropdownClassName="subagent-policy-dropdown"
-                              showClear={false}
-                              filter={false}
-                              getPopupContainer={() => popupContainer ?? document.body}
-                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                              onChange={(value) => {
-                                const option = subagentModelOptions.find(
-                                  (candidate) =>
-                                    candidate.value === String(value ?? ""),
-                                );
-                                if (!option) return;
-                                const reasoningEffort =
-                                  option.supportedReasoningEfforts.includes(
-                                    selection.reasoningEffort,
-                                  )
-                                    ? selection.reasoningEffort
-                                    : option.defaultReasoningEffort;
-                                updateRole(option.value, reasoningEffort);
-                              }}
-                            />
-                          </label>
-                          <label>
-                            <span id={`${task.id}-effort-label`} className="sr-only">
-                              {task.name}思考深度
-                            </span>
-                            <span className="subagent-mobile-field-label">思考深度</span>
-                            <Select
-                              className="subagent-policy-select"
-                              aria-labelledby={`${task.id}-effort-label`}
-                              value={
-                                reasoningEfforts.includes(selection.reasoningEffort)
-                                  ? selection.reasoningEffort
-                                  : undefined
-                              }
-                              placeholder="暂无可选深度"
-                              disabled={
-                                subagentPolicyControlsDisabled ||
-                                reasoningEfforts.length === 0
-                              }
-                              optionList={reasoningOptions}
-                              dropdownClassName="subagent-policy-dropdown"
-                              showClear={false}
-                              filter={false}
-                              getPopupContainer={() => popupContainer ?? document.body}
-                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                              onChange={(value) =>
-                                updateRole(
-                                  selection.model,
-                                  String(value ?? ""),
-                                )
-                              }
-                            />
-                          </label>
-                        </div>
-                      );
-                    })}
-                    {SUBAGENT_FIXED_ROLE_TYPES.map((task) => (
-                      <div className="subagent-policy-row subagent-fixed-policy-row" key={task.id}>
-                        <div className="subagent-task-name">
-                          <span>{task.name}</span>
-                          <Badge variant="secondary">固定</Badge>
-                          <Tooltip
-                            content={task.description}
-                            getPopupContainer={() =>
-                              popupContainer ?? tooltipContainer ?? document.body
-                            }
-                            position="top"
-                            zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                          >
-                            <button
-                              type="button"
-                              className="subagent-task-help"
-                              aria-label={`${task.name}：${task.description}`}
-                            >
-                              <IconInfoCircle size={15} aria-hidden="true" />
-                            </button>
-                          </Tooltip>
-                        </div>
-                        <div className="subagent-fixed-value" aria-label={`${task.name}模型`}>
-                          <span className="subagent-mobile-field-label">模型</span>
-                          {task.model}
-                        </div>
-                        <div
-                          className="subagent-fixed-value"
-                          aria-label={`${task.name}思考深度`}
-                        >
-                          <span className="subagent-mobile-field-label">思考深度</span>
-                          {REASONING_EFFORT_LABELS[task.reasoningEffort]}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="subagent-guidance-editor">
-                    <div className="subagent-guidance-toolbar">
-                      <label htmlFor="subagent-guidance">主代理委派策略</label>
-                      <Button
-                        variant="ghost"
-                        size="xs"
-                        disabled={
-                          isBusy ||
-                          !defaultSubagentGuidance ||
-                          config.subagentGuidance === defaultSubagentGuidance
-                        }
-                        onClick={() =>
-                          onConfigChange({
-                            ...config,
-                            subagentGuidance: defaultSubagentGuidance,
-                          })
-                        }
-                      >
-                        <IconRestore size={14} aria-hidden="true" />
-                        恢复默认
-                      </Button>
-                    </div>
-                    <textarea
-                      id="subagent-guidance"
-                      className="subagent-guidance-textarea"
-                      value={config.subagentGuidance}
-                      disabled={isBusy}
-                      maxLength={32768}
-                      spellCheck={false}
-                      onChange={(event) =>
-                        onConfigChange({
-                          ...config,
-                          subagentGuidance: event.currentTarget.value,
-                        })
-                      }
-                    />
-                    <div className="subagent-guidance-meta">
-                      <small>保存后需重启 Codex 生效</small>
-                      <small>{subagentGuidanceBytes.toLocaleString()} / 32,768 字节</small>
-                    </div>
-                  </div>
-                  <small>
-                    {subagentModelOptions.length === 0
-                      ? "请先在模型管理中添加当前线路可用模型"
-                      : "首次开启需重启；模型或思考深度保存后对下一次派生生效。角色权限是默认值，实际受父任务权限模式约束"}
-                  </small>
-                </>
-              ) : (
-                <small>开启后为 Codex 原生子代理增加主动委派、六类角色和汇合门禁；不会扩大父任务权限</small>
-              )}
-            </div>
-          </div>
+          )}
 
           <div
             className={`feature-card ${config.slimCodexPet ? "active" : ""}`}
@@ -490,38 +513,12 @@ function FeaturePolicyCardComponent({
           </div>
 
           <div
-            className={`feature-card ${config.fastCodexStartup ? "active" : ""}`}
-          >
-            <div className="feature-card-header">
-              <strong>Codex 慢启动保护</strong>
-              <Switch
-                checked={config.fastCodexStartup}
-                disabled={isBusy}
-                onCheckedChange={(checked) =>
-                  onConfigChange({
-                    ...config,
-                    fastCodexStartup: checked,
-                  })
-                }
-                aria-label="启用 Codex 慢启动保护"
-              />
-            </div>
-            <div className="feature-card-body">
-              <small>
-                {config.fastCodexStartup
-                  ? "远程启动配置超过 1.5 秒时快速降级；正常响应保持原流程"
-                  : "完全使用 Codex 原生远程启动等待策略"}
-              </small>
-            </div>
-          </div>
-
-          <div
             className={`feature-card ${fastContextToolsEnabled ? "active" : ""}`}
           >
             <div className="feature-card-header">
               <div className="feature-card-title">
                 <strong>FastCtx 上下文工具</strong>
-                <Badge variant="secondary">v0.2.5</Badge>
+                <Badge variant="secondary">v0.2.6</Badge>
               </div>
               {fastctxStatusBlocksEmbedded ? (
                 <Tooltip

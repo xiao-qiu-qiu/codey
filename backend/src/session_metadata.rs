@@ -59,50 +59,114 @@ impl SessionMetadataCache {
         let preferred_title = preferred_title
             .map(clean_session_name)
             .filter(|title| !title.is_empty());
-        let mut found_metadata = false;
+        let mut thread_names = Vec::new();
+        let mut catalog_titles = Vec::new();
+        let mut legacy_titles = Vec::new();
+        let mut placeholder_titles = HashSet::new();
         for path in self.active_database_paths(home) {
             if !self.ensure_connection(&path) {
                 continue;
             }
-            let row = {
+            let metadata = {
                 let connection = &self
                     .connections
                     .get(&path)
                     .expect("connection was inserted above")
                     .connection;
-                session_name_row(connection, session_id)
+                session_name_metadata(connection, session_id)
             };
-            let (title, first_user_message, preview) = match row {
-                Ok(Some(row)) => row,
-                Ok(None) => continue,
+            let metadata = match metadata {
+                Ok(metadata) => metadata,
                 Err(_) => {
                     self.connections.remove(&path);
                     continue;
                 }
             };
-            found_metadata = true;
-            let first_user_message = first_user_message
-                .as_deref()
-                .map(clean_session_name)
-                .unwrap_or_default();
-            let preview = preview
-                .as_deref()
-                .map(clean_session_name)
-                .unwrap_or_default();
-            if let Some(preferred_title) = preferred_title.as_ref()
-                && !is_placeholder_title(preferred_title, &first_user_message, &preview)
-            {
-                return preferred_title.clone();
+
+            if let Some((name, title, first_user_message, preview)) = metadata.thread {
+                for placeholder in [first_user_message, preview]
+                    .into_iter()
+                    .filter_map(clean_optional_session_name)
+                {
+                    placeholder_titles.insert(placeholder);
+                }
+                if let Some(name) = clean_optional_session_name(name) {
+                    thread_names.push(name);
+                }
+                if let Some(title) = clean_optional_session_name(title) {
+                    legacy_titles.push(title);
+                }
             }
-            let title = title.as_deref().map(clean_session_name).unwrap_or_default();
-            if !title.is_empty() && !is_placeholder_title(&title, &first_user_message, &preview) {
-                return title;
-            }
+            catalog_titles.extend(
+                metadata
+                    .catalog_titles
+                    .into_iter()
+                    .filter_map(clean_session_name_candidate),
+            );
         }
-        if !found_metadata && let Some(preferred_title) = preferred_title {
+
+        if let Some(preferred_title) = preferred_title
+            && !placeholder_titles.contains(&preferred_title)
+        {
             return preferred_title;
         }
-        FALLBACK_SESSION_NAME.to_string()
+        if placeholder_titles.is_empty() {
+            // The catalog display title can temporarily mirror the first prompt.
+            // Only trust it when a thread row supplied the values needed to
+            // reject that placeholder form.
+            catalog_titles.clear();
+        }
+        thread_names
+            .into_iter()
+            .chain(catalog_titles)
+            .chain(legacy_titles)
+            .find(|title| !placeholder_titles.contains(title))
+            .unwrap_or_else(|| FALLBACK_SESSION_NAME.to_string())
+    }
+
+    pub(crate) fn resolve_session_timestamps(
+        &mut self,
+        home: &Path,
+        session_ids: &[String],
+    ) -> HashMap<String, u64> {
+        let session_ids = session_ids
+            .iter()
+            .map(|session_id| normalize_session_id(session_id).to_string())
+            .filter(|session_id| !session_id.is_empty())
+            .collect::<HashSet<_>>();
+        if session_ids.is_empty() {
+            return HashMap::new();
+        }
+
+        let mut timestamps = HashMap::new();
+        for path in self.active_database_paths(home) {
+            if !self.ensure_connection(&path) {
+                continue;
+            }
+            let unresolved = session_ids
+                .iter()
+                .filter(|session_id| !timestamps.contains_key(*session_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if unresolved.is_empty() {
+                break;
+            }
+            let rows = {
+                let connection = &self
+                    .connections
+                    .get(&path)
+                    .expect("connection was inserted above")
+                    .connection;
+                session_timestamp_rows(connection, &unresolved)
+            };
+            match rows {
+                Ok(rows) => timestamps.extend(rows),
+                Err(_) => {
+                    self.connections.remove(&path);
+                }
+            }
+        }
+        timestamps
     }
 
     fn active_database_paths(&mut self, home: &Path) -> Vec<PathBuf> {
@@ -196,34 +260,160 @@ pub fn resolve_session_name_with_preferred(
     )
 }
 
-type SessionNameRow = (Option<String>, Option<String>, Option<String>);
+type SessionNameRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+#[derive(Debug, Default)]
+struct SessionNameMetadata {
+    thread: Option<SessionNameRow>,
+    catalog_titles: Vec<String>,
+}
+
+fn session_name_metadata(connection: &Connection, session_id: &str) -> Result<SessionNameMetadata> {
+    Ok(SessionNameMetadata {
+        thread: session_name_row(connection, session_id)?,
+        catalog_titles: catalog_session_titles(connection, session_id)?,
+    })
+}
 
 fn session_name_row(connection: &Connection, session_id: &str) -> Result<Option<SessionNameRow>> {
     let columns = table_columns(connection, "threads")?;
-    if !["id", "title", "first_user_message", "preview"]
-        .iter()
-        .all(|column| columns.contains(*column))
-    {
+    if !columns.contains("id") {
         return Ok(None);
     }
+    let name = if columns.contains("name") {
+        "name"
+    } else {
+        "NULL"
+    };
+    let title = if columns.contains("title") {
+        "title"
+    } else {
+        "NULL"
+    };
+    let first_user_message = if columns.contains("first_user_message") {
+        "first_user_message"
+    } else {
+        "NULL"
+    };
+    let preview = if columns.contains("preview") {
+        "preview"
+    } else {
+        "NULL"
+    };
     Ok(connection
         .query_row(
-            "SELECT title, first_user_message, preview FROM threads WHERE id=?1 LIMIT 1",
+            &format!(
+                "SELECT {name}, {title}, {first_user_message}, {preview} \
+                 FROM threads WHERE id=?1 LIMIT 1"
+            ),
             params![session_id],
             |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             },
         )
         .optional()?)
 }
 
-fn is_placeholder_title(title: &str, first_user_message: &str, preview: &str) -> bool {
-    (!first_user_message.is_empty() && title == first_user_message)
-        || (!preview.is_empty() && title == preview)
+fn catalog_session_titles(connection: &Connection, session_id: &str) -> Result<Vec<String>> {
+    let columns = table_columns(connection, "local_thread_catalog")?;
+    if !["thread_id", "display_title"]
+        .iter()
+        .all(|column| columns.contains(*column))
+    {
+        return Ok(Vec::new());
+    }
+
+    let host_filter = if columns.contains("host_id") {
+        " AND host_id = 'local'"
+    } else {
+        ""
+    };
+    let mut ordering = Vec::new();
+    if columns.contains("source_updated_at") {
+        ordering.push("source_updated_at DESC");
+    }
+    if columns.contains("observation_sequence") {
+        ordering.push("observation_sequence DESC");
+    }
+    let order_by = if ordering.is_empty() {
+        String::new()
+    } else {
+        format!(" ORDER BY {}", ordering.join(", "))
+    };
+    let mut statement = connection.prepare(&format!(
+        "SELECT display_title FROM local_thread_catalog \
+         WHERE thread_id=?1{host_filter}{order_by}"
+    ))?;
+    let titles = statement
+        .query_map(params![session_id], |row| row.get::<_, Option<String>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(titles.into_iter().flatten().collect())
+}
+
+fn session_timestamp_rows(
+    connection: &Connection,
+    session_ids: &[String],
+) -> Result<HashMap<String, u64>> {
+    let columns = table_columns(connection, "threads")?;
+    if !columns.contains("id") {
+        return Ok(HashMap::new());
+    }
+    let mut timestamp_candidates = Vec::new();
+    for (column, multiplier) in [
+        ("recency_at_ms", 1),
+        ("recency_at", 1_000),
+        ("updated_at_ms", 1),
+        ("updated_at", 1_000),
+        ("created_at_ms", 1),
+        ("created_at", 1_000),
+    ] {
+        if columns.contains(column) {
+            timestamp_candidates.push(format!(
+                "NULLIF(CAST({column} AS INTEGER) * {multiplier}, 0)"
+            ));
+        }
+    }
+    if timestamp_candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let sql = format!(
+        "SELECT COALESCE({}) FROM threads WHERE id=?1 LIMIT 1",
+        timestamp_candidates.join(", ")
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut timestamps = HashMap::new();
+    for session_id in session_ids {
+        let timestamp = statement
+            .query_row(params![session_id], |row| row.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten()
+            .and_then(|timestamp| u64::try_from(timestamp).ok())
+            .filter(|timestamp| *timestamp > 0);
+        if let Some(timestamp) = timestamp {
+            timestamps.insert(session_id.clone(), timestamp);
+        }
+    }
+    Ok(timestamps)
+}
+
+fn clean_optional_session_name(value: Option<String>) -> Option<String> {
+    value.and_then(clean_session_name_candidate)
+}
+
+fn clean_session_name_candidate(value: String) -> Option<String> {
+    let value = clean_session_name(&value);
+    (!value.is_empty()).then_some(value)
 }
 
 fn clean_session_name(value: &str) -> String {
@@ -279,6 +469,153 @@ mod tests {
         assert_eq!(
             resolve_session_name_with_preferred(home.path(), "local:thread-1", None),
             "发布版本计划"
+        );
+    }
+
+    #[test]
+    fn resolves_the_new_codex_thread_name() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("state_5.sqlite");
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    title TEXT,
+                    first_user_message TEXT,
+                    preview TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, name, title, first_user_message, preview)
+                 VALUES (?1, ?2, ?3, ?3, ?3)",
+                params![
+                    "thread-new-name",
+                    "  修复推送会话名称  ",
+                    "为什么推送都是未命名会话"
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            resolve_session_name_with_preferred(home.path(), "thread-new-name", None),
+            "修复推送会话名称"
+        );
+    }
+
+    #[test]
+    fn resolves_the_local_catalog_display_title_before_the_legacy_title() {
+        let home = tempdir().unwrap();
+        let state_path = home.path().join("state_5.sqlite");
+        let state = Connection::open(state_path).unwrap();
+        state
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    first_user_message TEXT,
+                    preview TEXT
+                );
+                INSERT INTO threads (id, title, first_user_message, preview)
+                VALUES ('thread-catalog', '检查通知', '检查通知', '检查通知');",
+            )
+            .unwrap();
+        drop(state);
+
+        let sqlite_dir = home.path().join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        let catalog = Connection::open(sqlite_dir.join("codex-dev.db")).unwrap();
+        catalog
+            .execute_batch(
+                "CREATE TABLE local_thread_catalog (
+                    host_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    display_title TEXT NOT NULL,
+                    source_updated_at REAL,
+                    observation_sequence INTEGER
+                );
+                INSERT INTO local_thread_catalog VALUES
+                    ('remote', 'thread-catalog', '远端旧名称', 20, 2),
+                    ('local', 'thread-catalog', '修复通知标题', 10, 1);",
+            )
+            .unwrap();
+        drop(catalog);
+
+        assert_eq!(
+            resolve_session_name_with_preferred(home.path(), "thread-catalog", None),
+            "修复通知标题"
+        );
+    }
+
+    #[test]
+    fn ignores_a_catalog_title_without_thread_placeholder_metadata() {
+        let home = tempdir().unwrap();
+        let sqlite_dir = home.path().join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        let catalog = Connection::open(sqlite_dir.join("codex-dev.db")).unwrap();
+        catalog
+            .execute_batch(
+                "CREATE TABLE local_thread_catalog (
+                    host_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    display_title TEXT NOT NULL
+                );
+                INSERT INTO local_thread_catalog VALUES
+                    ('local', 'thread-catalog-only', '可能仍是首条消息');",
+            )
+            .unwrap();
+        drop(catalog);
+
+        assert_eq!(
+            resolve_session_name_with_preferred(home.path(), "thread-catalog-only", None),
+            FALLBACK_SESSION_NAME
+        );
+    }
+
+    #[test]
+    fn rejects_new_name_sources_that_still_contain_the_first_message() {
+        let home = tempdir().unwrap();
+        let state_path = home.path().join("state_5.sqlite");
+        let state = Connection::open(state_path).unwrap();
+        state
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    title TEXT,
+                    first_user_message TEXT,
+                    preview TEXT
+                );
+                INSERT INTO threads (id, name, title, first_user_message, preview)
+                VALUES ('thread-placeholder', '帮我处理这个问题', '帮我处理这个问题',
+                        '帮我处理这个问题', '帮我处理这个问题');",
+            )
+            .unwrap();
+        drop(state);
+
+        let sqlite_dir = home.path().join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        let catalog = Connection::open(sqlite_dir.join("codex-dev.db")).unwrap();
+        catalog
+            .execute_batch(
+                "CREATE TABLE local_thread_catalog (
+                    thread_id TEXT NOT NULL,
+                    display_title TEXT NOT NULL
+                );
+                INSERT INTO local_thread_catalog VALUES
+                    ('thread-placeholder', '帮我处理这个问题');",
+            )
+            .unwrap();
+        drop(catalog);
+
+        assert_eq!(
+            resolve_session_name_with_preferred(home.path(), "thread-placeholder", None),
+            FALLBACK_SESSION_NAME
         );
     }
 
@@ -385,5 +722,71 @@ mod tests {
             resolve_session_name_with_preferred(home.path(), "thread-4", Some("帮我处理这个问题")),
             FALLBACK_SESSION_NAME
         );
+    }
+
+    #[test]
+    fn resolves_visible_thread_timestamps_in_one_cached_read() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("state_5.sqlite");
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    updated_at_ms INTEGER,
+                    recency_at INTEGER NOT NULL DEFAULT 0,
+                    recency_at_ms INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO threads VALUES
+                    ('thread-recency-ms', 10, 20, 20000, 30, 30001),
+                    ('thread-recency', 11, 21, 21000, 31, 0),
+                    ('thread-updated-ms', 12, 22, 22001, 0, 0),
+                    ('thread-updated', 13, 23, NULL, 0, 0);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut cache = SessionMetadataCache::default();
+        let timestamps = cache.resolve_session_timestamps(
+            home.path(),
+            &[
+                "local:thread-recency-ms".to_string(),
+                "thread-recency".to_string(),
+                "thread-updated-ms".to_string(),
+                "thread-updated".to_string(),
+                "missing".to_string(),
+            ],
+        );
+
+        assert_eq!(timestamps["thread-recency-ms"], 30_001);
+        assert_eq!(timestamps["thread-recency"], 31_000);
+        assert_eq!(timestamps["thread-updated-ms"], 22_001);
+        assert_eq!(timestamps["thread-updated"], 23_000);
+        assert!(!timestamps.contains_key("missing"));
+    }
+
+    #[test]
+    fn supports_legacy_thread_timestamp_columns() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("state_5.sqlite");
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO threads VALUES ('legacy-thread', 14, 24);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let timestamps = SessionMetadataCache::default()
+            .resolve_session_timestamps(home.path(), &["legacy-thread".to_string()]);
+
+        assert_eq!(timestamps["legacy-thread"], 24_000);
     }
 }

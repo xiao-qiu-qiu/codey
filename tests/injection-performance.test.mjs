@@ -4,20 +4,28 @@ import test from "node:test";
 import vm from "node:vm";
 
 const root = new URL("../", import.meta.url);
+const readSource = async (path) =>
+  (await readFile(new URL(path, root), "utf8")).replace(/\r\n/g, "\n");
 
 test("renderer core waits for sidebar interaction before loading session tools", async () => {
-  const [inject, sessionTools, bridge, petShield, securityShield] = await Promise.all([
-    readFile(new URL("public/renderer-inject.js", root), "utf8"),
-    readFile(new URL("public/codey-inject.js", root), "utf8"),
-    readFile(new URL("public/codey-bridge.js", root), "utf8"),
-    readFile(new URL("public/pet-control-shield.js", root), "utf8"),
-    readFile(new URL("public/security-warning-shield.js", root), "utf8"),
+  const [inject, sessionTools, bridge, petShield, securityShield, promptOptimize] = await Promise.all([
+    readSource("public/renderer-inject.js"),
+    readSource("public/codey-inject.js"),
+    readSource("public/codey-bridge.js"),
+    readSource("public/pet-control-shield.js"),
+    readSource("public/security-warning-shield.js"),
+    readSource("public/prompt-optimize.js"),
   ]);
 
   assert.match(inject, /const queryWithin = \(root, selector\)/);
   assert.match(inject, /const sessionToolsLoadPath = "\/internal\/codey\/session-tools\/load"/);
   assert.match(inject, /const sidebarSelector = \[/);
   assert.match(inject, /const loadSessionTools = \(\) =>/);
+  assert.ok(
+    inject.lastIndexOf("window.__codeyRendererCoreLoaded = true")
+      > inject.indexOf("bootstrapObserver.observe"),
+    "renderer loaded state must be committed only after bootstrap succeeds",
+  );
   assert.doesNotMatch(inject, /const sidebarDetected =/);
   assert.match(
     inject,
@@ -28,7 +36,8 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(inject, /document\.addEventListener\("pointerover", loadSessionToolsFromInteraction/);
   assert.match(inject, /document\.addEventListener\("focusin", loadSessionToolsFromInteraction/);
   assert.match(inject, /bootstrapObserver\?\.disconnect\(\)/);
-  assert.match(inject, /new MutationObserver\(\(mutations\) =>/);
+  assert.match(inject, /mutationDispatcher\.subscribe\(\s*handleBootstrapMutations/);
+  assert.match(inject, /new MutationObserver\(handleBootstrapMutations\)/);
   assert.match(inject, /scheduleScan\(element\)/);
   assert.match(inject, /const mountedButtonIsUsable = \(button\) =>/);
   assert.match(inject, /if \(mountedButtonIsUsable\(existingButton\)\) return;/);
@@ -61,30 +70,80 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(sessionTools, /fallbackSessionExportMaxBytes = 64 \* 1024 \* 1024/);
   assert.match(sessionTools, /exportSize > fallbackSessionExportMaxBytes/);
   assert.match(sessionTools, /watcherWakeTimer = window\.setTimeout\(\(\) => \{[\s\S]*\}, 30_000\)/);
+  assert.match(sessionTools, /const stuckCompletionGraceMs = 30_000/);
+  assert.match(sessionTools, /const stuckCompletionProbeIntervalMs = 15_000/);
+  assert.match(sessionTools, /const stuckCompletionProbeTimeoutMs = 10_000/);
+  assert.match(sessionTools, /const stuckCompletionRecoveryRetryMs = 30_000/);
+  assert.match(sessionTools, /const stuckCompletionRecoveryCooldownMs = 60_000/);
+  assert.match(sessionTools, /const stuckCompletionRecoveryResetMs = 5 \* 60_000/);
+  assert.match(sessionTools, /const stuckCompletionRecoveryMaxAttempts = 3/);
+  assert.match(sessionTools, /const stuckCompletionBridgePath = "\/session\/completion-state"/);
+  assert.match(sessionTools, /const completionRecoveryStateByKey = new Map\(\)/);
+  assert.doesNotMatch(sessionTools, /recoveredCompletionKeys|completionRecoveryCooldownUntil/);
+  assert.match(
+    sessionTools,
+    /\{ timeoutMs: stuckCompletionProbeTimeoutMs \}/,
+  );
+  assert.match(
+    sessionTools,
+    /window\.setInterval\(\(\) => \{\s*void probeStuckTaskCompletion\(\);\s*\}, stuckCompletionProbeIntervalMs\)/,
+  );
+  assert.match(sessionTools, /window\.addEventListener\("focus", probeStuckTaskCompletion\)/);
+  assert.match(sessionTools, /window\.addEventListener\("pageshow", probeStuckTaskCompletion\)/);
   assert.match(sessionTools, /window\.__codeyRendererInvalidateHeaderMount\?\.\(root\)/);
   assert.doesNotMatch(sessionTools, /headerMountDirty/);
   assert.match(sessionTools, /const threadUpdatedAtRows = new Set\(\)/);
+  assert.match(sessionTools, /window\.__codeySessionToolsInjectLoading = true/);
+  assert.match(sessionTools, /if \(window\.__codeySessionToolsInjectLoading\) return/);
+  assert.match(sessionTools, /const scheduleInitialScan = \(\) =>/);
+  assert.match(sessionTools, /window\.requestIdleCallback\(run\)/);
+  assert.match(
+    sessionTools,
+    /window\.__codeySessionToolsInjectLoaded = true;\s*window\.__codeySessionToolsInjectLoading = false;\s*void probeStuckTaskCompletion\(\);\s*scheduleInitialScan\(\)/,
+  );
+  assert.doesNotMatch(sessionTools, /addStyle\(\);\s*scan\(\)/);
+  assert.doesNotMatch(sessionTools, /installThreadUpdatedTimes\(document(?:, true)?\)/);
+  assert.doesNotMatch(sessionTools, /pendingScanRoots\.add\(document\.documentElement\)/);
+  const addPendingScanRootBody = sessionTools.match(
+    /const addPendingScanRoot = \(root\) => \{([\s\S]*?)\n  \};/,
+  )?.[1] ?? "";
+  assert.ok(addPendingScanRootBody.length > 0);
+  assert.ok(
+    addPendingScanRootBody.indexOf("__codeyRendererInvalidateHeaderMount")
+      < addPendingScanRootBody.indexOf("maxPendingScanRoots"),
+    "header mount invalidation must run before the pending-root budget check",
+  );
   const sessionObserverFilter = sessionTools.match(
     /attributeFilter:\s*\[([\s\S]*?)\],\s*childList:\s*true/,
   )?.[1] ?? "";
   assert.match(sessionObserverFilter, /"class"/);
+  assert.match(sessionObserverFilter, /"aria-describedby"/);
   assert.doesNotMatch(sessionObserverFilter, /"style"/);
   assert.doesNotMatch(
     sessionTools,
     /flushThreadUpdatedAtFetch[\s\S]*queryWithin\(document, "\[data-app-action-sidebar-thread-row\]"\)/,
   );
   const sessionObserverBody = sessionTools.match(
-    /new MutationObserver\(\(mutations\) => \{([\s\S]*?)\}\)\.observe\(document\.documentElement/,
+    /const handleSessionToolMutations = \(mutations\) => \{([\s\S]*?)\n  \};\n  const sessionToolMutationOptions/,
   )?.[1] ?? "";
   assert.match(sessionObserverBody, /addPendingScanRoot\(threadRow\)/);
+  assert.match(sessionObserverBody, /syncConversationRichTooltipOpen\(target\)/);
   assert.doesNotMatch(sessionObserverBody, /syncSidebarThreadTimeState\(threadRow\)/);
-  const modelWhitelist = await readFile(
-    new URL("public/model-whitelist-inject.js", root),
-    "utf8",
-  );
+  assert.doesNotMatch(sessionObserverBody, /probeStuckTaskCompletion/);
+  assert.match(sessionTools, /mutationDispatcher\.subscribe\(\s*handleSessionToolMutations/);
+  assert.match(sessionTools, /new MutationObserver\(handleSessionToolMutations\)/);
+  assert.match(promptOptimize, /mutationDispatcher\.subscribe\(\s*handleComposerMutations/);
+  const modelWhitelist = await readSource("public/model-whitelist-inject.js");
   assert.match(modelWhitelist, /const maxTrackedModelListRequests = 256/);
   assert.match(modelWhitelist, /const maxKnownModelQueryClients = 8/);
   assert.match(modelWhitelist, /knownModelQueryClients\.delete\(client\)/);
+  assert.match(modelWhitelist, /dispatcher\.subscribe\(handleGroupedMenuMutations/);
+  assert.match(modelWhitelist, /groupedMenuObserver\.observe\(document\.body, \{/);
+  assert.doesNotMatch(
+    modelWhitelist,
+    /groupedMenuObserver\.observe\(document\.body, \{[\s\S]*?characterData:\s*true/,
+  );
+  assert.match(modelWhitelist, /characterData:\s*true/);
   assert.doesNotMatch(inject, /__codeyBlockNativePetControls/);
   assert.match(petShield, /const block = \(root = document\)/);
   assert.match(petShield, /if \(!enabled\) \{/);
@@ -98,35 +157,104 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.doesNotMatch(securityShield, /new MutationObserver/);
 });
 
-test("renderer core defaults Codex locale to Chinese before remote config settles", async () => {
-  const inject = await readFile(new URL("public/renderer-inject.js", root), "utf8");
+test("locale bootstrap patches navigator and Statsig independently from renderer controls", async () => {
+  const [localeSource, rendererSource] = await Promise.all([
+    readSource("public/default-chinese-locale.js"),
+    readSource("public/renderer-inject.js"),
+  ]);
+  assert.doesNotMatch(rendererSource, /installDefaultChineseLocale/);
 
-  assert.match(inject, /const defaultChineseLocale = "zh-CN"/);
-  assert.match(inject, /const statsigI18nDynamicConfigId = "72216192"/);
-  assert.match(inject, /defineNavigatorGetter\(target, "language", defaultChineseLocale\)/);
-  assert.match(inject, /defineNavigatorGetter\(target, "languages", defaultChineseLanguages\)/);
-  assert.match(inject, /key: "localeOverride"/);
-  assert.match(inject, /value: defaultChineseLocale/);
-  assert.match(inject, /body: JSON\.stringify\(params\)/);
-  assert.doesNotMatch(inject, /body: JSON\.stringify\(\{ params \}\)/);
-  assert.match(inject, /enable_i18n: true/);
-  assert.match(inject, /locale_source: "SYSTEM"/);
-  assert.match(inject, /name === statsigI18nDynamicConfigId/);
-  assert.match(inject, /Object\.defineProperty\(window, "__STATSIG__"/);
-  assert.match(inject, /patchStatsigClients\(\)/);
-  assert.match(inject, /scanStatsigUntilReady/);
-  assert.match(inject, /elapsed < 1000 \? 50 : 250/);
-  assert.match(inject, /const retryDelays = \[0, 250, 750, 1500, 3000, 5000\]/);
-  assert.match(inject, /verification\?\.value !== defaultChineseLocale/);
-  assert.match(inject, /existing\.ensureSynced\?\.\(\)/);
-  assert.match(
-    inject,
-    /globalThis\.__CODEY_DEFAULT_CHINESE_LOCALE_RENDERER_PATCH__ === true/,
-  );
+  function Navigator() {}
+  const dynamicConfig = {
+    value: {},
+    get(key, fallback) {
+      return this.value[key] ?? fallback;
+    },
+  };
+  const statsigClient = {
+    getDynamicConfig() {
+      return dynamicConfig;
+    },
+  };
+  const window = {
+    __codeySharedRuntime: {
+      statsigClients: () => [statsigClient],
+    },
+    addEventListener() {},
+    navigator: Object.create(Navigator.prototype),
+  };
+  window.window = window;
+  const sandbox = {
+    console: { warn() {} },
+    Navigator,
+    window,
+  };
+
+  vm.runInNewContext(localeSource, sandbox);
+  const firstState = window.__codeyDefaultChineseLocale;
+  assert.equal(window.navigator.language, "zh-CN");
+  assert.deepEqual([...window.navigator.languages], ["zh-CN", "zh", "en-US", "en"]);
+  assert.equal(dynamicConfig.get("enable_i18n", false), true);
+  assert.equal(dynamicConfig.get("locale_source", ""), "SYSTEM");
+  assert.equal(firstState.snapshot().locale, "zh-CN");
+  assert.equal(firstState.snapshot().statsigClientsPatched, 1);
+  assert.match(localeSource, /window\.setTimeout\?\.\(scanStatsigUntilReady, 250\)/);
+  assert.doesNotMatch(localeSource, /elapsed < 1000 \? 50/);
+  assert.match(localeSource, /wrapStatsigRootInstances/);
+
+  vm.runInNewContext(localeSource, sandbox);
+  assert.equal(window.__codeyDefaultChineseLocale, firstState);
+  assert.equal(firstState.snapshot().statsigClientsPatched, 1);
+});
+
+test("locale bootstrap patches Statsig instances added in place without a 50ms burst", async () => {
+  const localeSource = await readSource("public/default-chinese-locale.js");
+
+  function Navigator() {}
+  const dynamicConfig = {
+    value: {},
+    get(key, fallback) {
+      return this.value[key] ?? fallback;
+    },
+  };
+  const statsigClient = {
+    getDynamicConfig() {
+      return dynamicConfig;
+    },
+  };
+  const lateClient = {
+    getDynamicConfig() {
+      return dynamicConfig;
+    },
+  };
+  const instances = {};
+  const window = {
+    __codeySharedRuntime: {
+      statsigClients: () => [statsigClient, ...Object.values(instances).filter(Boolean)],
+    },
+    addEventListener() {},
+    navigator: Object.create(Navigator.prototype),
+    __STATSIG__: {
+      firstInstance: statsigClient,
+      instances,
+    },
+  };
+  window.window = window;
+  const sandbox = {
+    console: { warn() {} },
+    Navigator,
+    Proxy,
+    window,
+  };
+
+  vm.runInNewContext(localeSource, sandbox);
+  window.__STATSIG__.instances.late = lateClient;
+  assert.equal(lateClient.__codeyDefaultChineseLocalePatched, true);
+  assert.equal(window.__codeyDefaultChineseLocale.snapshot().statsigClientsPatched, 2);
 });
 
 test("plugin bridge fast-paths unrelated IPC payloads without a DOM observer", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   const nativeCalls = [];
   const localCalls = [];
   const window = {
@@ -262,8 +390,8 @@ test("plugin bridge fast-paths unrelated IPC payloads without a DOM observer", a
 
 test("plugin fetch wrapper returns unrelated native requests without promise or header work", async () => {
   const [bridgeSource, source] = await Promise.all([
-    readFile(new URL("public/codey-bridge.js", root), "utf8"),
-    readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8"),
+    readSource("public/codey-bridge.js"),
+    readSource("public/plugin-marketplace-fix.js"),
   ]);
   const nativeResponse = {
     headers: {
@@ -319,7 +447,7 @@ test("plugin fetch wrapper returns unrelated native requests without promise or 
 });
 
 test("plugin bridge reports effective only after the runtime method is patched", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   const events = [];
   const window = {
     __codeyInjectionStatus: {
@@ -366,7 +494,7 @@ test("plugin bridge reports effective only after the runtime method is patched",
 });
 
 test("a stalled local plugin refresh cannot block the native marketplace list", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   let timeoutCallback;
   const window = {
     __codeyCall() {
@@ -403,7 +531,7 @@ test("a stalled local plugin refresh cannot block the native marketplace list", 
 });
 
 test("ordinary conversation app requests do not refresh the local plugin marketplace", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   const localCalls = [];
   const window = {
     __codeyCall(...args) {
@@ -444,7 +572,7 @@ test("ordinary conversation app requests do not refresh the local plugin marketp
 });
 
 test("plugin response normalization handles cyclic bridge payloads", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   const window = {
     __codeyLocalPlugins: [],
     clearTimeout() {},
@@ -474,7 +602,7 @@ test("plugin response normalization handles cyclic bridge payloads", async () =>
 });
 
 test("plugin mutations queue one trailing list refresh while a refresh is in flight", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   const listResolvers = [];
   let listCalls = 0;
   const window = {

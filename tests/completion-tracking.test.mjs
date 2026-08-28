@@ -4,16 +4,14 @@ import test from "node:test";
 import { TextEncoder } from "node:util";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const source = readFileSync(new URL("../public/codey-inject.js", import.meta.url), "utf8");
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(attributes = {}) {
-    this.attributes = new Map(Object.entries(attributes));
-    this.dataset = {};
-    this.disabled = false;
-    this.parentElement = null;
+    super("div", { attributes });
     this.removed = false;
-    this.textContent = "";
     this.querySelectorAllCalls = [];
     const classes = new Set();
     this.classList = {
@@ -26,22 +24,9 @@ class FakeElement {
     };
   }
 
-  getAttribute(name) {
-    return this.attributes.get(name) ?? null;
-  }
-
-  setAttribute(name, value) {
-    this.attributes.set(name, String(value));
-  }
-
-  hasAttribute(name) {
-    return this.attributes.has(name);
-  }
-
   querySelector(selector) {
-    if (selector === "[data-codey-message-select]") return {};
     if (selector === "[data-local-conversation-final-assistant]") return {};
-    return null;
+    return super.querySelector(selector);
   }
 
   querySelectorAll(selector) {
@@ -53,7 +38,18 @@ class FakeElement {
   }
 
   matches(selector) {
-    return selector === "[data-turn-key]" && this.hasAttribute("data-turn-key");
+    const selectors = String(selector).split(",").map((candidate) => candidate.trim());
+    return selectors.some((candidate) => (
+      candidate === "[data-turn-key]" && this.hasAttribute("data-turn-key")
+    ) || (
+      candidate === "[data-message-author-role]" && this.hasAttribute("data-message-author-role")
+    ) || (
+      candidate === "[data-testid=conversation-turn]" && this.getAttribute("data-testid") === "conversation-turn"
+    ) || (
+      candidate === "[data-testid=\"conversation-turn\"]" && this.getAttribute("data-testid") === "conversation-turn"
+    ) || (
+      candidate === "[data-message-id]" && this.hasAttribute("data-message-id")
+    ));
   }
 
   closest() {
@@ -75,9 +71,11 @@ class FakeElement {
 
 function loadInjection({
   initialRunning = true,
+  initialNow = 1_000_000,
   turnIds = ["turn-1"],
   sessionTitle = "排查飞书通知",
   bridgeHandler = null,
+  codexSessionController = null,
   codexSignalDispatcher = null,
   selectedTurnIds = [],
 } = {}) {
@@ -94,6 +92,8 @@ function loadInjection({
   });
   const stopButton = new FakeElement({ "aria-label": "停止" });
   let running = initialRunning;
+  let now = initialNow;
+  let sessionId = "session-1";
   const bridgeCalls = [];
   const alerts = [];
   let reloadCount = 0;
@@ -104,6 +104,7 @@ function loadInjection({
   const document = {
     documentElement,
     body: new FakeElement(),
+    visibilityState: "visible",
     getElementById(id) {
       if (id === "codey-injected-style" || id === "codey-settings-button") return placeholder;
       if (id === "codey-message-toolbar") return toolbar;
@@ -111,12 +112,17 @@ function loadInjection({
     },
     querySelector(selector) {
       if (selector === "[data-session-id]") {
-        return new FakeElement({ "data-session-id": "session-1" });
+        return new FakeElement({ "data-session-id": sessionId });
       }
       return null;
     },
     querySelectorAll(selector) {
-      if (selector === "[data-turn-key]") return rows.filter((row) => !row.removed);
+      if (selector === "[data-turn-key]") {
+        return rows.filter((row) => !row.removed && row.hasAttribute("data-turn-key"));
+      }
+      if (selector === "[data-turn-key], [data-message-author-role], [data-testid=conversation-turn], [data-message-id]") {
+        return rows.filter((row) => !row.removed && row.matches(selector));
+      }
       if (selector === "[data-codey-message-id]") {
         return rows.filter((row) => !row.removed && row.dataset.codeyMessageId);
       }
@@ -138,11 +144,12 @@ function loadInjection({
     },
   };
   const window = {
-    __codexSessionDeleteBridge: async (path, payload) => {
-      bridgeCalls.push({ path, payload });
-      if (bridgeHandler) return bridgeHandler(path, payload);
+    __codexSessionDeleteBridge: async (path, payload, options = {}) => {
+      bridgeCalls.push({ options, path, payload });
+      if (bridgeHandler) return bridgeHandler(path, payload, options);
       return { status: "ok" };
     },
+    __codeyCodexSessionController: codexSessionController,
     __codeyCodexSignalDispatcher: codexSignalDispatcher,
     addEventListener: () => {},
     alert: (message) => alerts.push(String(message)),
@@ -150,6 +157,10 @@ function loadInjection({
     confirm: () => true,
     dispatchEvent: () => true,
     getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+    requestIdleCallback: (callback) => {
+      callback({ didTimeout: false, timeRemaining: () => 50 });
+      return 1;
+    },
     setTimeout: (callback) => {
       timers.push(callback);
       return timers.length;
@@ -165,6 +176,15 @@ function loadInjection({
   const MutationObserver = class {
     observe() {}
   };
+  class ControlledDate extends Date {
+    constructor(...args) {
+      super(...(args.length ? args : [now]));
+    }
+
+    static now() {
+      return now;
+    }
+  }
   vm.runInNewContext(source, {
     atob: (value) => Buffer.from(value, "base64").toString("binary"),
     btoa: (value) => Buffer.from(value, "binary").toString("base64"),
@@ -175,6 +195,7 @@ function loadInjection({
         this.detail = options.detail;
       }
     },
+    Date: ControlledDate,
     document,
     HTMLElement: FakeElement,
     location: {
@@ -193,8 +214,15 @@ function loadInjection({
     row.dataset.codeyMessageId = window.__codeyGetMessageId(row);
   });
   return {
+    advanceTime: (milliseconds) => {
+      now += milliseconds;
+    },
     appendTurn: (turnId) => {
       const row = new FakeElement({ "data-turn-key": turnId });
+      rows.push(row);
+      return row;
+    },
+    appendExistingRow: (row) => {
       rows.push(row);
       return row;
     },
@@ -205,9 +233,293 @@ function loadInjection({
     getVisibleTurnIds: () => rows
       .filter((row) => !row.removed)
       .map((row) => row.getAttribute("data-turn-key")),
+    setRunning: (value) => {
+      running = Boolean(value);
+    },
+    setSessionId: (value) => {
+      sessionId = String(value);
+    },
     window,
   };
 }
+
+const completedProbeResult = (overrides = {}) => ({
+  status: "ok",
+  sessionId: "session-1",
+  turnId: "turn-1",
+  sessionKnown: true,
+  turnKnown: true,
+  lifecycle: "idle",
+  terminal: true,
+  terminalKind: "completed",
+  completedAt: 42,
+  ...overrides,
+});
+
+const createRecoveryController = (events, overrides = {}) => ({
+  kind: "manager",
+  async discardConversation(sessionId) {
+    events.push(`discard:${sessionId}`);
+  },
+  async notifyConversationDeleted() {},
+  async refreshRecentConversations() {
+    events.push("refresh");
+  },
+  async resumeConversation(payload) {
+    events.push(`resume:${payload.conversationId}`);
+  },
+  ...overrides,
+});
+
+test("waits for the stuck-running grace period before probing completion", async () => {
+  const runtime = loadInjection({
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult({ lifecycle: "running", terminal: false, terminalKind: null })
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(29_999);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.equal(
+    runtime.bridgeCalls.filter((call) => call.path === "/session/completion-state").length,
+    0,
+  );
+
+  runtime.advanceTime(1);
+  await runtime.window.__codeyProbeStuckTaskCompletion();
+  assert.equal(
+    runtime.bridgeCalls.filter((call) => call.path === "/session/completion-state").length,
+    1,
+  );
+});
+
+test("probes the outer conversation turn instead of a nested activity turn", async () => {
+  const runtime = loadInjection({
+    turnIds: ["turn-outer"],
+    bridgeHandler: async () => ({
+      status: "ok",
+      sessionId: "session-1",
+      turnId: "turn-outer",
+      sessionKnown: true,
+      turnKnown: true,
+      lifecycle: "running",
+      terminal: false,
+      terminalKind: null,
+    }),
+  });
+  const nested = new FakeElement({ "data-turn-key": "turn-nested" });
+  nested.parentElement = runtime.getTurnRow();
+  runtime.appendExistingRow(nested);
+
+  runtime.advanceTime(30_000);
+  await runtime.window.__codeyProbeStuckTaskCompletion();
+
+  const probe = runtime.bridgeCalls.find((call) => call.path === "/session/completion-state");
+  assert.deepEqual(JSON.parse(JSON.stringify(probe?.payload)), {
+    sessionId: "session-1",
+    turnId: "turn-outer",
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(probe?.options)), { timeoutMs: 10_000 });
+});
+
+test("does not recover while the authoritative lifecycle is running or waiting", async () => {
+  const events = [];
+  let lifecycle = "running";
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult({ lifecycle, terminal: false, terminalKind: null })
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  lifecycle = "waiting";
+  runtime.advanceTime(15_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.deepEqual(events, []);
+});
+
+test("retries a completed task when native recovery resolves but the Stop state remains", async () => {
+  const events = [];
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult()
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  assert.deepEqual(events, ["discard:session-1", "resume:session-1", "refresh"]);
+
+  runtime.advanceTime(29_999);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  runtime.advanceTime(1);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  assert.deepEqual(events, [
+    "discard:session-1", "resume:session-1", "refresh",
+    "discard:session-1", "resume:session-1", "refresh",
+  ]);
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  runtime.advanceTime(299_999);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  runtime.advanceTime(1);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  assert.equal(events.filter((event) => event === "refresh").length, 4);
+});
+
+test("clears completed-task retry history after the native Stop state disappears", async () => {
+  const events = [];
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult()
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  runtime.setRunning(false);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+
+  runtime.setRunning(true);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  assert.equal(events.filter((event) => event === "refresh").length, 2);
+});
+
+test("rejects mismatched completion confirmation", async () => {
+  const events = [];
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult({ turnId: "turn-other" })
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.deepEqual(events, []);
+});
+
+test("cancels recovery when the visible task changes during confirmation", async () => {
+  const events = [];
+  let resolveCompletion;
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => {
+      if (path !== "/session/completion-state") return { status: "ok" };
+      return new Promise((resolve) => {
+        resolveCompletion = resolve;
+      });
+    },
+  });
+
+  runtime.advanceTime(30_000);
+  const probe = runtime.window.__codeyProbeStuckTaskCompletion();
+  await Promise.resolve();
+  runtime.setSessionId("session-2");
+  resolveCompletion(completedProbeResult());
+
+  assert.equal(await probe, false);
+  assert.deepEqual(events, []);
+});
+
+test("cancels recovery when Codex clears its native running state", async () => {
+  const events = [];
+  let resolveCompletion;
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => {
+      if (path !== "/session/completion-state") return { status: "ok" };
+      return new Promise((resolve) => {
+        resolveCompletion = resolve;
+      });
+    },
+  });
+
+  runtime.advanceTime(30_000);
+  const probe = runtime.window.__codeyProbeStuckTaskCompletion();
+  await Promise.resolve();
+  runtime.setRunning(false);
+  resolveCompletion(completedProbeResult());
+
+  assert.equal(await probe, false);
+  assert.deepEqual(events, []);
+});
+
+test("backs off after a native recovery failure without reloading", async () => {
+  let discardCalls = 0;
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController([], {
+      async discardConversation() {
+        discardCalls += 1;
+        throw new Error("controller failed");
+      },
+    }),
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult()
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.equal(discardCalls, 1);
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.equal(discardCalls, 1);
+  runtime.advanceTime(31_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.equal(discardCalls, 2);
+  assert.equal(runtime.getReloadCount(), 0);
+});
+
+test("scopes native recovery cooldown to the failed task", async () => {
+  const events = [];
+  let failNextDiscard = true;
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events, {
+      async discardConversation(sessionId) {
+        if (failNextDiscard) {
+          failNextDiscard = false;
+          throw new Error("controller failed");
+        }
+        events.push(`discard:${sessionId}`);
+      },
+    }),
+    bridgeHandler: async (path, payload) => (
+      path === "/session/completion-state"
+        ? completedProbeResult({ sessionId: payload.sessionId, turnId: payload.turnId })
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+
+  runtime.setSessionId("session-2");
+  runtime.appendTurn("turn-2");
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  assert.deepEqual(events, ["discard:session-2", "resume:session-2", "refresh"]);
+});
 
 test("unloads Codex memory without discarding the active conversation", async () => {
   const dispatcherCalls = [];
@@ -270,6 +582,68 @@ test("unloads Codex memory without discarding the active conversation", async ()
     sessionId: "session-1",
     messageIds: ["turn-deleted"],
   });
+});
+
+test("uses the current AppServerManager flow to evict, clean, resume, and refresh", async () => {
+  const events = [];
+  const managerCalls = [];
+  const runtime = loadInjection({
+    initialRunning: false,
+    codexSessionController: {
+      kind: "manager",
+      async discardConversation(sessionId) {
+        managerCalls.push({ method: "discardConversation", sessionId });
+        events.push("manager:discard");
+      },
+      async notifyConversationDeleted(sessionId) {
+        managerCalls.push({ method: "notifyConversationDeleted", sessionId });
+      },
+      async refreshRecentConversations() {
+        managerCalls.push({ method: "refreshRecentConversations" });
+        events.push("manager:refresh");
+      },
+      async resumeConversation(payload) {
+        managerCalls.push({ method: "resumeConversation", payload });
+        events.push("manager:resume");
+      },
+    },
+    bridgeHandler: async (path) => {
+      events.push(`bridge:${path}`);
+      return path === "/session/delete-messages"
+        ? { status: "ok", deleted: 0 }
+        : { status: "ok" };
+    },
+  });
+  events.length = 0;
+
+  await runtime.window.__codeyReloadConversationAfterHardDelete(
+    "local:session-1",
+    ["turn-deleted"],
+  );
+
+  assert.deepEqual(events, [
+    "manager:discard",
+    "bridge:/session/delete-messages",
+    "manager:resume",
+    "manager:refresh",
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(managerCalls)), [{
+    method: "discardConversation",
+    sessionId: "session-1",
+  }, {
+    method: "resumeConversation",
+    payload: {
+      collaborationMode: null,
+      conversationId: "session-1",
+      model: null,
+      reasoningEffort: null,
+      serviceTier: null,
+      showThreadGoalResumeConfirmation: false,
+      workspaceRoots: [],
+    },
+  }, {
+    method: "refreshRecentConversations",
+  }]);
 });
 
 test("removes a hard-deleted turn and rejects a stale React rerender", async () => {
@@ -442,6 +816,63 @@ test("rescans a direct turn boundary without enumerating its subtree", () => {
   runtime.window.__codeyInstallMessageSelection(row);
 
   assert.equal(row.querySelectorAllCalls.includes("[data-turn-key]"), false);
+});
+
+test("installs selection on mixed Codex turn row shapes", () => {
+  const runtime = loadInjection({
+    turnIds: ["turn-keyed"],
+  });
+  const reactOnlyRow = new FakeElement({
+    "data-testid": "conversation-turn",
+  });
+  reactOnlyRow.__reactFiber$test = {
+    memoizedProps: {
+      turn: { id: "history-content:turn:react-turn" },
+    },
+    return: null,
+  };
+  runtime.appendExistingRow(reactOnlyRow);
+
+  runtime.window.__codeyInstallMessageSelection();
+
+  assert.equal(reactOnlyRow.dataset.codeyMessageId, "react-turn");
+});
+
+test("extracts message ids from React turn state when DOM attributes omit ids", () => {
+  const runtime = loadInjection();
+  const row = new FakeElement({
+    "data-testid": "conversation-turn",
+  });
+  row.__reactFiber$test = {
+    memoizedProps: {
+      children: {
+        props: {
+          message: {
+            id: "history-content:turn:react-message",
+          },
+        },
+      },
+    },
+    return: null,
+  };
+
+  assert.equal(runtime.window.__codeyGetMessageId(row), "react-message");
+});
+
+test("prefers React turn ids over response object ids", () => {
+  const runtime = loadInjection();
+  const row = new FakeElement({
+    "data-testid": "conversation-turn",
+  });
+  row.__reactFiber$test = {
+    memoizedProps: {
+      response: { id: "resp-wrong-layer" },
+      turn: { id: "history-content:turn:turn-right-layer" },
+    },
+    return: null,
+  };
+
+  assert.equal(runtime.window.__codeyGetMessageId(row), "turn-right-layer");
 });
 
 test("syncs Codex sidebar titles to the notification backend", async () => {

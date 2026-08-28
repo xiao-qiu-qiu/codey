@@ -85,22 +85,54 @@ fn build_bridge_script_for_session(binding_name: &str, session_token: &str) -> S
   const bridgeSession = {session_token};
   window.__codexSessionDeleteCallbacks = new Map();
   window.__codexSessionDeleteSeq = 0;
-  window.__codexSessionDeleteResolve = (id, result) => {{
+  const takeCallback = (id) => {{
     const callback = window.__codexSessionDeleteCallbacks.get(id);
-    if (!callback) return;
+    if (!callback) return null;
     window.__codexSessionDeleteCallbacks.delete(id);
+    if (callback.timeout) window.clearTimeout(callback.timeout);
+    return callback;
+  }};
+  window.__codexSessionDeleteResolve = (id, result) => {{
+    const callback = takeCallback(id);
+    if (!callback) return;
     callback.resolve(result);
   }};
   window.__codexSessionDeleteReject = (id, message) => {{
-    const callback = window.__codexSessionDeleteCallbacks.get(id);
+    const callback = takeCallback(id);
     if (!callback) return;
-    window.__codexSessionDeleteCallbacks.delete(id);
-    callback.resolve({{ status: "failed", message }});
+    callback.resolve({{ status: "failed", code: "bridge_request_failed", message }});
   }};
-  window.__codexSessionDeleteBridge = (path, payload) => new Promise((resolve) => {{
+  window.__codexSessionDeleteBridge = (path, payload, options = {{}}) => new Promise((resolve) => {{
     const id = String(++window.__codexSessionDeleteSeq);
-    window.__codexSessionDeleteCallbacks.set(id, {{ resolve }});
-    window.{binding_name}(JSON.stringify({{ id, path, payload, bridgeSession }}));
+    const configuredTimeout = Number(options?.timeoutMs);
+    const timeoutMs = Number.isFinite(configuredTimeout)
+      ? Math.max(250, Math.min(configuredTimeout, 60_000))
+      : 0;
+    const callback = {{ resolve, timeout: 0 }};
+    window.__codexSessionDeleteCallbacks.set(id, callback);
+    if (timeoutMs > 0) {{
+      callback.timeout = window.setTimeout(() => {{
+        const expired = takeCallback(id);
+        if (!expired) return;
+        expired.resolve({{
+          status: "failed",
+          code: "bridge_timeout",
+          message: "Codey 后端响应超时",
+          timeout: true,
+        }});
+      }}, timeoutMs);
+    }}
+    try {{
+      window.{binding_name}(JSON.stringify({{ id, path, payload, bridgeSession }}));
+    }} catch (error) {{
+      const failed = takeCallback(id);
+      if (!failed) return;
+      failed.resolve({{
+        status: "failed",
+        code: "bridge_unavailable",
+        message: error instanceof Error ? error.message : String(error),
+      }});
+    }}
   }});
 }})();
 "#
@@ -108,17 +140,23 @@ fn build_bridge_script_for_session(binding_name: &str, session_token: &str) -> S
 }
 
 pub fn bridge_health_check_script() -> &'static str {
+    // Tri-state probe: "busy" means the bridge is installed but the page could
+    // not round-trip within the in-page budget, which must not be confused
+    // with a missing bridge — reinjecting into a busy renderer adds more work
+    // to an already stalled page.
     r#"
 (() => {
   const bridge = window.__codexSessionDeleteBridge;
-  if (typeof bridge !== "function") return false;
+  if (typeof bridge !== "function") return "missing";
   try {
     return Promise.race([
-      Promise.resolve(bridge("/backend/status", {})).then((result) => !!result && result.status === "ok"),
-      new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
+      Promise.resolve(bridge("/backend/health", {})).then((result) => (
+        !!result && result.status === "ok" ? "healthy" : "unhealthy"
+      )),
+      new Promise((resolve) => setTimeout(() => resolve("busy"), 2000)),
     ]);
   } catch (error) {
-    return false;
+    return "missing";
   }
 })()
 "#
@@ -515,7 +553,9 @@ fn bridge_path_can_run_concurrently(path: &str) -> bool {
         "/settings/get"
             | "/codex-model-catalog"
             | "/backend/status"
+            | "/backend/health"
             | "/account/usage"
+            | "/session/completion-state"
             | "/api/check_for_updates"
             | "/session/wake-watcher"
             | "/plugins/list"

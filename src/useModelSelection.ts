@@ -8,41 +8,37 @@ import {
 
 import { invoke } from "./api";
 import type {
-  CcSwitchStatus,
   Config,
   ModelState,
   Notice,
   RuntimeStatus,
 } from "./App.types";
-import { errorText } from "./appUtils";
 import {
+  AUTO_REVIEW_MODEL,
   includesModelId,
   modelKey,
   partitionModelIdsByKey,
   uniqueModelIds,
   withoutModelId,
 } from "./modelIds";
+import { buildSubagentModelOptions } from "./subagentModels";
 
 const MAX_MODEL_ID_BYTES = 512;
 const MAX_MODEL_COUNT = 10_000;
 const modelIdEncoder = new TextEncoder();
+const AUTO_REVIEW_MODEL_KEY = modelKey(AUTO_REVIEW_MODEL);
 
-const pickerSelection = (state: ModelState) => [
-  ...state.officialModels
-    .filter((model) => model.supported)
-    .map((model) => model.slug),
-  ...state.thirdPartyModels,
-];
-
-export type SubagentModelOption = {
-  value: string;
-  label: string;
-  supportedReasoningEfforts: string[];
-  defaultReasoningEffort: string;
-};
+const pickerSelection = (state: ModelState) =>
+  [
+    ...state.officialModels
+      .filter((model) => model.supported)
+      .map((model) => model.slug),
+    ...state.thirdPartyModels,
+  ].filter((model) => modelKey(model) !== AUTO_REVIEW_MODEL_KEY);
 
 type UseModelSelectionOptions = {
-  provider: CcSwitchStatus["provider"] | undefined;
+  config: Config | null;
+  officialAccountAvailable: boolean;
   runOperation: (name: string, action: () => Promise<void>) => Promise<void>;
   setPersistedConfig: (config: Config) => void;
   setStatus: Dispatch<SetStateAction<RuntimeStatus>>;
@@ -52,14 +48,17 @@ type UseModelSelectionOptions = {
 type ModelRuntimeUpdate = {
   restartRequired?: boolean;
   modelHotReloaded?: boolean;
+  modelHotReloadDeferred?: boolean;
   modelHotReloadError?: string;
   subagentConfigHotReloaded?: boolean;
+  subagentConfigRepaired?: boolean;
   subagentConfigHotReloadError?: string;
   modelCatalogFallback?: boolean;
 };
 
 export function useModelSelection({
-  provider,
+  config,
+  officialAccountAvailable,
   runOperation,
   setPersistedConfig,
   setStatus,
@@ -74,16 +73,23 @@ export function useModelSelection({
     defaultModel: "",
   });
   const [modelPickerVisible, setModelPickerVisible] = useState(false);
+  const [modelPickerRouteId, setModelPickerRouteId] = useState<string | null>(null);
+  const [modelPickerState, setModelPickerState] = useState<ModelState | null>(null);
   const [draftModels, setDraftModels] = useState<string[]>([]);
   const [draftManualThirdPartyModels, setDraftManualThirdPartyModels] = useState<string[]>([]);
   const [deletedThirdPartyModels, setDeletedThirdPartyModels] = useState<string[]>([]);
   const [customModelInput, setCustomModelInput] = useState("");
   const [modelInputError, setModelInputError] = useState("");
   const [modelSyncWarning, setModelSyncWarning] = useState("");
+  const [draftAutoReviewSupported, setDraftAutoReviewSupported] = useState(false);
 
+  const modelEditorState = modelPickerState ?? modelState;
   const officialSlugKeys = useMemo(
-    () => new Set(modelState.officialModelIds.map(modelKey)),
-    [modelState.officialModelIds],
+    () =>
+      new Set(
+        modelPickerRouteId ? [] : modelEditorState.officialModelIds.map(modelKey),
+      ),
+    [modelEditorState.officialModelIds, modelPickerRouteId],
   );
   const draftModelSet = useMemo(
     () => new Set(draftModels.map(modelKey)),
@@ -94,8 +100,8 @@ export function useModelSelection({
     [draftManualThirdPartyModels],
   );
   const manualThirdPartyModelKeys = useMemo(
-    () => new Set(modelState.manualThirdPartyModels.map(modelKey)),
-    [modelState.manualThirdPartyModels],
+    () => new Set(modelEditorState.manualThirdPartyModels.map(modelKey)),
+    [modelEditorState.manualThirdPartyModels],
   );
   const deletedThirdPartyModelKeys = useMemo(
     () => new Set(deletedThirdPartyModels.map(modelKey)),
@@ -105,14 +111,15 @@ export function useModelSelection({
     () => {
       const seenKeys = new Set<string>();
       return [
-        ...modelState.upstreamModels,
-        ...modelState.thirdPartyModels,
+        ...modelEditorState.upstreamModels,
+        ...modelEditorState.thirdPartyModels,
         ...draftModels,
       ].reduce<string[]>((models, model) => {
         const normalized = model.trim();
         const key = modelKey(normalized);
         if (
           normalized &&
+          key !== AUTO_REVIEW_MODEL_KEY &&
           !officialSlugKeys.has(key) &&
           !deletedThirdPartyModelKeys.has(key) &&
           !seenKeys.has(key)
@@ -126,74 +133,38 @@ export function useModelSelection({
     [
       draftModels,
       deletedThirdPartyModelKeys,
-      modelState.thirdPartyModels,
-      modelState.upstreamModels,
+      modelEditorState.thirdPartyModels,
+      modelEditorState.upstreamModels,
       officialSlugKeys,
     ],
   );
-  const subagentModelOptions = useMemo<SubagentModelOption[]>(
-    () => [
-      ...modelState.officialModels
-        .filter((model) => model.supported && model.supportsSubagent)
-        .map((model) => ({
-          value: model.slug,
-          label: model.displayName,
-          supportedReasoningEfforts:
-            model.supportedReasoningEfforts.length > 0
-              ? model.supportedReasoningEfforts
-              : ["low"],
-          defaultReasoningEffort: model.defaultReasoningEffort || "low",
-        })),
-    ],
-    [modelState.officialModels],
+  const subagentModelOptions = useMemo(
+    () =>
+      buildSubagentModelOptions(
+        config,
+        modelState,
+        officialAccountAvailable,
+      ),
+    [config, modelState, officialAccountAvailable],
   );
 
-  const openModelPicker = useCallback((state: ModelState, warning = "") => {
+  const openModelPicker = useCallback((
+    state: ModelState,
+    warning = "",
+    routeId: string | null = null,
+    autoReviewSupported = false,
+  ) => {
     setDraftModels(pickerSelection(state));
     setDraftManualThirdPartyModels(state.manualThirdPartyModels);
     setDeletedThirdPartyModels([]);
     setCustomModelInput("");
     setModelInputError("");
     setModelSyncWarning(warning);
+    setModelPickerRouteId(routeId);
+    setModelPickerState(state);
+    setDraftAutoReviewSupported(autoReviewSupported);
     setModelPickerVisible(true);
   }, []);
-
-  const fetchCurrentModels = useCallback(async () => {
-    if (!provider || provider.official) return;
-    await runOperation("fetch-models", async () => {
-      try {
-        const result = await invoke<
-          { modelState: ModelState } & ModelRuntimeUpdate
-        >(
-          "fetch_current_provider_models",
-        );
-        setModelState(result.modelState);
-        if (typeof result.restartRequired === "boolean") {
-          setStatus((current) => ({
-            ...current,
-            restartRequired: result.restartRequired,
-          }));
-        }
-        openModelPicker(result.modelState);
-      } catch (error) {
-        const warning =
-          `自动同步失败：${errorText(error)}。当前线路可能不支持 /v1/models 或 /models 接口，` +
-          "请手动确认支持的官方模型，或输入其他模型 ID。";
-        openModelPicker(modelState, warning);
-        setNotice({
-          tone: "error",
-          text: "第三方模型同步失败，当前线路可能不支持 /v1/models 或 /models 接口，已打开手动配置。",
-        });
-      }
-    });
-  }, [
-    modelState,
-    openModelPicker,
-    provider,
-    runOperation,
-    setNotice,
-    setStatus,
-  ]);
 
   const toggleDraftModel = useCallback((model: string, checked: boolean) => {
     if (checked) {
@@ -226,6 +197,12 @@ export function useModelSelection({
       setModelInputError("请输入要添加的模型 ID");
       return;
     }
+    if (modelKey(model) === AUTO_REVIEW_MODEL_KEY) {
+      setModelInputError(
+        `${AUTO_REVIEW_MODEL} 是线路能力，请使用上方 Auto Review 开关`,
+      );
+      return;
+    }
     if (modelIdEncoder.encode(model).byteLength > MAX_MODEL_ID_BYTES) {
       setModelInputError(`模型 ID 不能超过 ${MAX_MODEL_ID_BYTES} 字节`);
       return;
@@ -237,16 +214,18 @@ export function useModelSelection({
       setModelInputError(`模型数量不能超过 ${MAX_MODEL_COUNT} 个`);
       return;
     }
-    const officialModel = modelState.officialModelIds.find(
-      (official) => modelKey(official) === modelKey(model),
-    );
+    const officialModel = modelPickerRouteId
+      ? undefined
+      : modelEditorState.officialModelIds.find(
+          (official) => modelKey(official) === modelKey(model),
+        );
     if (officialModel) {
       setModelInputError(
         `${officialModel} 已在上方官方模型列表中，请直接勾选，不可重复输入`,
       );
       return;
     }
-    const existingUpstreamModel = modelState.upstreamModels.find(
+    const existingUpstreamModel = modelEditorState.upstreamModels.find(
       (upstream) => modelKey(upstream) === modelKey(model),
     );
     setDraftModels((current) =>
@@ -268,8 +247,9 @@ export function useModelSelection({
     customModelInput,
     draftModels,
     manualThirdPartyModelKeys,
-    modelState.officialModelIds,
-    modelState.upstreamModels,
+    modelEditorState.officialModelIds,
+    modelEditorState.upstreamModels,
+    modelPickerRouteId,
   ]);
 
   const deleteDraftThirdPartyModel = useCallback((model: string) => {
@@ -301,6 +281,7 @@ export function useModelSelection({
     thirdPartyModels: string[],
     manualThirdPartyModels: string[],
     deletedModels: string[],
+    supportsAutoReview: boolean,
     summary: string,
     closePicker: boolean,
   ) => {
@@ -312,6 +293,8 @@ export function useModelSelection({
       thirdPartyModels,
       manualThirdPartyModels,
       deletedThirdPartyModels: deletedModels,
+      supportsAutoReview,
+      routeId: modelPickerRouteId,
     });
     setPersistedConfig(result.config);
     setModelState(result.modelState);
@@ -321,29 +304,43 @@ export function useModelSelection({
     }));
     if (closePicker) {
       setModelPickerVisible(false);
+      setModelPickerRouteId(null);
+      setModelPickerState(null);
     }
     setDeletedThirdPartyModels([]);
     const hotReloadFailed = Boolean(
       result.modelHotReloadError || result.subagentConfigHotReloadError,
     );
-    const subagentSuffix = result.subagentConfigHotReloaded
-      ? "；受影响的子代理角色也已同步"
-      : "";
+    const subagentSuffix = result.subagentConfigRepaired
+      ? "；已校验并修复受影响的子代理运行配置"
+      : result.subagentConfigHotReloaded
+        ? "；受影响的子代理角色也已同步"
+        : "";
+    const modelReloadNotice = result.modelHotReloaded
+      ? result.modelHotReloadDeferred
+        ? result.restartRequired
+          ? "；Codex 模型列表将在打开模型选择器时更新，其他设置仍需重启"
+          : `；Codex 模型列表将在打开模型选择器时更新${subagentSuffix}`
+        : result.restartRequired
+          ? "；Codex 模型列表已立即更新，其他设置仍需重启"
+          : `；Codex 模型列表已立即更新${subagentSuffix}`
+      : hotReloadFailed || result.restartRequired
+        ? "；当前 Codex 模型列表暂未能刷新，重启 Codex 后生效"
+        : "";
     setNotice({
       tone:
-        hotReloadFailed || result.restartRequired ? "info" : "success",
-      text: result.modelHotReloaded
-        ? result.restartRequired
-          ? `${summary}；Codex 模型列表已立即更新，其他设置仍需重启`
-          : `${summary}；Codex 模型列表已立即更新${subagentSuffix}`
-        : hotReloadFailed || result.restartRequired
-          ? `${summary}；当前 Codex 模型列表暂未能刷新，重启 Codex 后生效`
-          : summary,
+        hotReloadFailed ||
+        result.restartRequired ||
+        result.modelHotReloadDeferred
+          ? "info"
+          : "success",
+      text: `${summary}${modelReloadNotice}`,
     });
   }, [
     setNotice,
     setPersistedConfig,
     setStatus,
+    modelPickerRouteId,
   ]);
 
   const saveModelSelection = useCallback(async () => {
@@ -362,8 +359,8 @@ export function useModelSelection({
         thirdPartyModels,
         manualThirdPartyModels,
         deletedThirdPartyModels,
-        `已更新模型支持情况：${officialModels.length} 个官方模型、` +
-          `${thirdPartyModels.length} 个其他模型`,
+        draftAutoReviewSupported,
+        `已更新模型声明：${thirdPartyModels.length} 个线路模型`,
         true,
       );
     });
@@ -372,111 +369,32 @@ export function useModelSelection({
     deletedThirdPartyModels,
     draftManualThirdPartyModels,
     draftModels,
+    draftAutoReviewSupported,
     officialSlugKeys,
     runOperation,
-  ]);
-
-  const deleteThirdPartyModel = useCallback(async (model: string) => {
-    const normalized = model.trim();
-    if (!normalized) return;
-    const deletedKey = modelKey(normalized);
-    if (!manualThirdPartyModelKeys.has(deletedKey)) {
-      setNotice({
-        tone: "error",
-        text: `${normalized} 不是手动添加的其他模型，不能删除`,
-      });
-      return;
-    }
-    await runOperation("delete-model", async () => {
-      const officialModels = modelState.officialModels
-        .filter((candidate) => candidate.supported)
-        .map((candidate) => candidate.slug);
-      const thirdPartyModels = withoutModelId(
-        modelState.thirdPartyModels,
-        normalized,
-      );
-      const manualThirdPartyModels = withoutModelId(
-        modelState.manualThirdPartyModels,
-        normalized,
-      );
-      await applyModelSelection(
-        officialModels,
-        thirdPartyModels,
-        manualThirdPartyModels,
-        [normalized],
-        `已删除其他模型 ${normalized}`,
-        false,
-      );
-      setDraftModels((current) =>
-        withoutModelId(current, normalized),
-      );
-      setDraftManualThirdPartyModels((current) =>
-        withoutModelId(current, normalized),
-      );
-    });
-  }, [
-    applyModelSelection,
-    manualThirdPartyModelKeys,
-    modelState.manualThirdPartyModels,
-    modelState.officialModels,
-    modelState.thirdPartyModels,
-    runOperation,
-    setNotice,
-  ]);
-
-  const setDefaultModel = useCallback(async (model: string) => {
-    await runOperation("save-default-model", async () => {
-      const result = await invoke<{
-        config: Config;
-        modelState: ModelState;
-      } & ModelRuntimeUpdate>("save_default_model", { model });
-      setPersistedConfig(result.config);
-      setModelState(result.modelState);
-      setStatus((current) => ({
-        ...current,
-        restartRequired: result.restartRequired ?? current.restartRequired,
-      }));
-      const summary = `已将 ${result.modelState.defaultModel} 设为默认模型`;
-      const hotReloadFailed = Boolean(result.modelHotReloadError);
-      setNotice({
-        tone:
-          hotReloadFailed || result.restartRequired ? "info" : "success",
-        text: result.modelHotReloaded
-          ? result.restartRequired
-            ? `${summary}；默认模型已立即更新，其他设置仍需重启`
-            : `${summary}；Codex 模型选择器已立即更新，新对话将使用该模型`
-          : hotReloadFailed || result.restartRequired
-            ? `${summary}；当前 Codex 暂未能热更新，重启后新对话生效`
-            : summary,
-      });
-    });
-  }, [
-    runOperation,
-    setNotice,
-    setPersistedConfig,
-    setStatus,
   ]);
 
   return {
     subagentModelOptions,
     modelState,
+    modelEditorState,
     setModelState,
     modelPickerVisible,
     setModelPickerVisible,
     customModelInput,
     modelInputError,
     modelSyncWarning,
+    draftAutoReviewSupported,
+    setDraftAutoReviewSupported,
     draftModelSet,
     draftManualThirdPartyModelKeys,
     manualThirdPartyModelKeys,
     thirdPartyModelOptions,
-    fetchCurrentModels,
+    openModelPicker,
     toggleDraftModel,
     deleteDraftThirdPartyModel,
     updateCustomModelInput,
     addCustomModel,
     saveModelSelection,
-    deleteThirdPartyModel,
-    setDefaultModel,
   };
 }

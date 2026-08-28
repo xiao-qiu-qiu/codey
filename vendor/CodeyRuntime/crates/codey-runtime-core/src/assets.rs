@@ -141,9 +141,8 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
     let plugin_marketplaces = local_plugin_marketplaces();
     let paste_fix = paste_fix_enabled_config(settings);
     let force_chinese_locale = force_chinese_locale_config(settings);
-    let fast_startup = fast_startup_config(settings);
     format!(
-        "window.__CODEX_SESSION_DELETE_HELPER__ = {};\nwindow.__CODEY_VERSION__ = {};\nwindow.__CODEY_BUILD__ = {};\nwindow.__CODEY_IMAGE_OVERLAY__ = {};\nwindow.__CODEY_PLUGIN_MARKETPLACES__ = {};\nwindow.__CODEY_PASTE_FIX__ = {};\nwindow.__CODEY_FORCE_CHINESE_LOCALE__ = {};\nwindow.__CODEY_FAST_STARTUP__ = {};\n{}\n{}",
+        "window.__CODEX_SESSION_DELETE_HELPER__ = {};\nwindow.__CODEY_VERSION__ = {};\nwindow.__CODEY_BUILD__ = {};\nwindow.__CODEY_IMAGE_OVERLAY__ = {};\nwindow.__CODEY_PLUGIN_MARKETPLACES__ = {};\nwindow.__CODEY_PASTE_FIX__ = {};\nwindow.__CODEY_FORCE_CHINESE_LOCALE__ = {};\n{}\n{}",
         serde_json::to_string(&helper_url).expect("helper URL should serialize"),
         serde_json::to_string(crate::version::VERSION).expect("version should serialize"),
         serde_json::to_string(DIAGNOSTIC_BUILD_ID).expect("build id should serialize"),
@@ -152,7 +151,6 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&paste_fix).expect("paste fix config should serialize"),
         serde_json::to_string(&force_chinese_locale)
             .expect("force Chinese locale config should serialize"),
-        serde_json::to_string(&fast_startup).expect("fast startup config should serialize"),
         renderer_script(),
         stepwise_script(),
     )
@@ -318,11 +316,11 @@ fn merge_plugin_manifest(plugin: &mut Map<String, Value>, manifest: Map<String, 
 }
 
 fn installed_plugins_from_config(home: &Path) -> std::collections::BTreeSet<String> {
-    let text = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
-    let doc = text.parse::<toml_edit::DocumentMut>().ok();
+    let manager = crate::config_manager::ConfigManager::for_home(home);
+    let doc = manager.load().ok();
     let Some(plugins) = doc
         .as_ref()
-        .and_then(|doc| doc.get("plugins"))
+        .and_then(|snapshot| snapshot.document().get("plugins"))
         .and_then(toml_edit::Item::as_table)
     else {
         return std::collections::BTreeSet::new();
@@ -367,10 +365,6 @@ pub fn paste_fix_enabled_config(settings: &BackendSettings) -> Value {
 
 pub fn force_chinese_locale_config(settings: &BackendSettings) -> Value {
     json!({ "enabled": settings.codex_app_force_chinese_locale, "locale": "zh-CN" })
-}
-
-pub fn fast_startup_config(settings: &BackendSettings) -> Value {
-    json!({ "enabled": settings.codex_app_fast_startup, "statsigTimeoutMs": 800 })
 }
 
 fn image_data_uri(mime_type: &str, bytes: &[u8]) -> String {

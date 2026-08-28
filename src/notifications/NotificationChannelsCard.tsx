@@ -7,7 +7,8 @@ import {
 } from "@tabler/icons-react";
 
 import type { Config } from "../App.types";
-import { Badge, Button, Card } from "../components/semi";
+import { Badge, Button, Card } from "../components/mantine";
+import { surfaceCardPaddingClass } from "../uiClasses";
 import { getNotificationChannelDefinition } from "./channelRegistry";
 import { NotificationChannelDialog } from "./NotificationChannelDialog";
 import {
@@ -67,13 +68,27 @@ function NotificationChannelsCardComponent({
     return onAddChannel(channel);
   }
 
+  function channelStatus(channel: NotificationChannel) {
+    if (channel.kind === "wechatClaw" && channel.sessionStatus === "expired") {
+      return { label: "登录失效", variant: "warning" as const };
+    }
+    return channel.enabled
+      ? { label: "已启用", variant: "success" as const }
+      : { label: "未启用", variant: "secondary" as const };
+  }
+
   return (
     <>
       <section className="secondary-section" aria-labelledby="notification-title">
         <div className="section-title compact">
-          <div>
-            <h2 id="notification-title">消息通知</h2>
-            <p>已配置渠道会同时接收完成、失败和等待提醒。</p>
+          <div className="section-heading">
+            <span className="section-icon" aria-hidden="true">
+              <IconBell size={15} />
+            </span>
+            <div>
+              <h2 id="notification-title">消息通知</h2>
+              <p>已配置渠道会同时接收完成、失败和等待提醒。</p>
+            </div>
           </div>
           <div className="notification-add-actions">
             <Button
@@ -93,7 +108,7 @@ function NotificationChannelsCardComponent({
           </div>
         </div>
         {config.webhook.channels.length === 0 ? (
-          <Card className="secondary-card notification-empty">
+          <Card className={`secondary-card notification-empty ${surfaceCardPaddingClass}`}>
             <IconBell size={20} aria-hidden="true" />
             <strong>还没有通知渠道</strong>
             <small>点击“添加渠道”选择推送方式并完成配置。</small>
@@ -102,14 +117,18 @@ function NotificationChannelsCardComponent({
           <ul className="notification-channel-list" aria-label="已配置通知渠道">
             {config.webhook.channels.map((channel) => {
               const definition = getNotificationChannelDefinition(channel.kind);
-              const status = channel.enabled
-                ? { label: "已启用", variant: "success" as const }
-                : { label: "未启用", variant: "secondary" as const };
+              const status = channelStatus(channel);
+              const cardState =
+                status.variant === "warning"
+                  ? "expired"
+                  : channel.enabled
+                    ? "active"
+                    : "inactive";
               const ChannelIcon = definition.Icon;
               return (
                 <li key={channel.id}>
                   <Card
-                    className={`secondary-card notification-card ${channel.enabled ? "active" : "inactive"}`}
+                    className={`secondary-card notification-card ${surfaceCardPaddingClass} ${cardState}`}
                   >
                     <div className="notification-card-header">
                       <div className="notification-title">
@@ -125,7 +144,7 @@ function NotificationChannelsCardComponent({
                         <Badge variant={status.variant}>{status.label}</Badge>
                         <Button
                           className="notification-edit-button"
-                          variant="ghost"
+                          variant="outline"
                           size="xs"
                           disabled={isBusy}
                           onClick={() => openEditDialog(channel.id)}

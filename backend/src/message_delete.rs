@@ -5,13 +5,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
-use codey_runtime_core::codex_sqlite::codex_session_db_paths_from_home;
+use codey_runtime_core::codex_sqlite::{
+    codex_session_db_paths_from_home, codex_sqlite_sidecar_paths,
+};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+// Rollout JSONL lives under date-sharded folders; archived threads move to the
+// sibling folder but keep the same rollout-<timestamp>-<thread-id>.jsonl name.
+const ROLLOUT_SEARCH_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const TOMBSTONE_VERSION: u32 = 1;
 const TOMBSTONE_DIR: &str = ".codey-message-delete-tombstones-v1";
 const TOMBSTONE_LOCK_FILE: &str = ".codey-message-delete-tombstones-v1.lock";
@@ -94,13 +99,36 @@ pub(crate) fn reapply_persisted_deletions(home: &Path) -> Result<MessageDeleteRe
                     Err(error) => summary.failures.push((session_id, format!("{error:#}"))),
                 }
             }
-            Ok(result) => summary.failures.push((
-                session_id,
-                format!(
-                    "无法确认消息删除是否已落地；{} 个数据库结构不受支持",
-                    result.unsupported_databases.len()
-                ),
-            )),
+            Ok(result) => {
+                // 未识别结构的库可能只是目录型 catalog。只有 rollout 文件和所有
+                // 数据库（含原始字节层面）都找不到该会话时，才认定整条会话已被
+                // 整体删除：删除意图已经无从落地，清掉失效墓碑，不再每次启动
+                // 重复报 patch_failed。任一存储仍引用该会话时保持保守失败。
+                if session_absent_from_every_store(home, &session_id) {
+                    match remove_delete_tombstones(&paths) {
+                        Ok(()) => {
+                            summary.cleared_sessions += 1;
+                            eprintln!("会话已不存在，清理了失效的消息删除墓碑：{session_id}");
+                        }
+                        Err(error) => summary.failures.push((session_id, format!("{error:#}"))),
+                    }
+                } else {
+                    summary.failures.push((
+                        session_id,
+                        format!(
+                            "无法确认消息删除是否已落地；{} 个数据库结构不受支持（{}）；且未找到匹配的会话记录文件",
+                            result.unsupported_databases.len(),
+                            result
+                                .unsupported_databases
+                                .iter()
+                                .filter_map(|path| Path::new(path).file_name())
+                                .map(|name| name.to_string_lossy().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
+                    ));
+                }
+            }
             Err(error) => summary.failures.push((session_id, format!("{error:#}"))),
         }
     }
@@ -212,13 +240,8 @@ fn record_resolved_tail_aliases_unlocked(
                 anyhow::bail!("消息删除尾部别名哈希冲突：{}", path.display());
             }
         }
-        let temp = crate::fs_util::unique_temp_path(&path);
         let bytes = serde_json::to_vec(&tombstone)?;
-        if let Err(error) = write_private_file(&temp, &bytes) {
-            let _ = fs::remove_file(&temp);
-            return Err(error);
-        }
-        crate::fs_util::persist_temp_file(&temp, &path)
+        crate::fs_util::atomic_write_private(&path, &bytes)
             .with_context(|| format!("保存消息删除尾部别名失败：{}", path.display()))?;
     }
     sync_directory(&directory)
@@ -416,34 +439,57 @@ fn resolve_persistent_message_ids(
     session_id: &str,
     message_ids: &BTreeSet<String>,
 ) -> Result<ResolvedPersistentMessageIds> {
-    let tail_message_ids = message_ids
+    let mut tail_message_ids = message_ids
         .iter()
         .filter_map(|message_id| tail_message_index(message_id).map(|index| (message_id, index)))
         .collect::<Vec<_>>();
     if tail_message_ids.is_empty() {
         return Ok((message_ids.clone(), Vec::new()));
     }
-    if tail_message_ids.len() != 1 || tail_message_ids[0].1 != 0 {
-        anyhow::bail!("无法安全解析多个或非当前页面尾部轮次");
+    tail_message_ids.sort_by_key(|(_, index)| *index);
+    if tail_message_ids
+        .iter()
+        .enumerate()
+        .any(|(expected, (_, index))| expected != *index)
+    {
+        anyhow::bail!("只能安全解析从当前页面末轮开始连续选择的尾部轮次");
     }
 
-    let tail_message_id = tail_message_ids[0].0;
-    let stable_turn_id = if let Some(message_id) =
-        read_resolved_tail_alias_unlocked(home, session_id, tail_message_id)?
-    {
-        message_id
-    } else {
+    let mut stable_turn_ids = vec![None; tail_message_ids.len()];
+    for (tail_message_id, index) in &tail_message_ids {
+        stable_turn_ids[*index] =
+            read_resolved_tail_alias_unlocked(home, session_id, tail_message_id)?;
+    }
+    if stable_turn_ids.iter().any(Option::is_none) {
         let rollout_path =
             find_rollout_path(home, session_id)?.context("找不到页面尾部轮次对应的会话记录")?;
         let canonical_rollout = canonical_rollout_path(home, &rollout_path)?;
         let original = fs::read_to_string(&canonical_rollout)
             .with_context(|| format!("读取会话记录失败：{}", canonical_rollout.display()))?;
-        last_stable_rollout_turn_id(&original).context("页面尾部轮次尚未稳定写入会话记录")?
-    };
+        let rollout_tail_ids = stable_rollout_tail_turn_ids(&original, tail_message_ids.len())
+            .context("所选页面尾部轮次尚未稳定写入完整会话记录")?;
+        for (index, stable_turn_id) in stable_turn_ids.iter_mut().enumerate() {
+            match stable_turn_id {
+                Some(existing) if existing != &rollout_tail_ids[index] => {
+                    anyhow::bail!("页面尾部轮次别名与当前会话尾部不一致，已拒绝重新解析");
+                }
+                None => *stable_turn_id = Some(rollout_tail_ids[index].clone()),
+                Some(_) => {}
+            }
+        }
+    }
+
     let mut resolved = message_ids.clone();
-    resolved.remove(tail_message_id);
-    resolved.insert(stable_turn_id.clone());
-    Ok((resolved, vec![(tail_message_id.clone(), stable_turn_id)]))
+    let mut aliases = Vec::with_capacity(tail_message_ids.len());
+    for (tail_message_id, index) in tail_message_ids {
+        let stable_turn_id = stable_turn_ids[index]
+            .take()
+            .context("页面尾部轮次缺少稳定会话标识")?;
+        resolved.remove(tail_message_id);
+        resolved.insert(stable_turn_id.clone());
+        aliases.push((tail_message_id.clone(), stable_turn_id));
+    }
+    Ok((resolved, aliases))
 }
 
 fn find_rollout_path(home: &Path, session_id: &str) -> Result<Option<PathBuf>> {
@@ -478,7 +524,113 @@ fn find_rollout_path(home: &Path, session_id: &str) -> Result<Option<PathBuf>> {
             }));
         }
     }
-    Ok(None)
+    // Some Codex builds only keep a catalog row (or none at all) and never map
+    // the thread to its rollout file. The filename itself embeds the thread id,
+    // so the rollout can still be located without any database cooperation.
+    Ok(find_rollout_file_by_session_id(home, session_id))
+}
+
+fn find_rollout_file_by_session_id(home: &Path, session_id: &str) -> Option<PathBuf> {
+    for dirname in ROLLOUT_SEARCH_DIRS {
+        let root = home.join(dirname);
+        if !root.exists() {
+            continue;
+        }
+        let mut files = Vec::new();
+        if let Err(error) = collect_rollout_files(&root, &mut files) {
+            // A broken fallback must not fail the whole delete; the SQLite path
+            // above is still authoritative whenever it can answer.
+            eprintln!("扫描会话目录失败：{error:#}");
+        }
+        // 目录顺序即优先级：活跃会话目录命中后才看归档目录，同一目录内按
+        // 路径排序保证确定性（日期分片下最早文件优先）。
+        files.sort();
+        let matched = files.into_iter().find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    rollout_thread_id_from_filename(name)
+                        .is_some_and(|thread_id| thread_id.eq_ignore_ascii_case(session_id))
+                })
+        });
+        if matched.is_some() {
+            return matched;
+        }
+    }
+    None
+}
+
+fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in
+        fs::read_dir(root).with_context(|| format!("扫描会话目录失败：{}", root.display()))?
+    {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_rollout_files(&path, files)?;
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn rollout_thread_id_from_filename(name: &str) -> Option<String> {
+    let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    if stem.len() < 36 {
+        return None;
+    }
+    let candidate = &stem[stem.len() - 36..];
+    let valid = candidate
+        .chars()
+        .enumerate()
+        .all(|(index, ch)| match index {
+            8 | 13 | 18 | 23 => ch == '-',
+            _ => ch.is_ascii_hexdigit(),
+        });
+    valid.then(|| candidate.to_string())
+}
+
+/// 扫描字节时的上限。超大文件宁可保留墓碑保守失败，也不在启动路径上全文扫描。
+const MAX_SESSION_SCAN_BYTES: usize = 256 * 1024 * 1024;
+
+/// 仅当整条会话在所有已知存储中都找不到时才返回 true：
+/// 文件名兜底扫描一无所获，且每个候选数据库（含 wal/shm）的原始字节里都不出现
+/// 该会话 id。非 uuid 形态的 id 无法通过文件名匹配验证，一律保持保守（false）。
+fn session_absent_from_every_store(home: &Path, session_id: &str) -> bool {
+    if rollout_thread_id_from_filename(&format!("rollout-anchor-{session_id}.jsonl"))
+        .is_none_or(|thread_id| thread_id != session_id)
+    {
+        return false;
+    }
+    if find_rollout_file_by_session_id(home, session_id).is_some() {
+        return false;
+    }
+    !databases_reference_session(home, session_id)
+}
+
+/// 未知结构的库仍可能藏着这段历史，因此按原始字节查证会话 id 是否被引用。
+/// SQLite 的 TEXT/blob 值不压缩存储，会话 id 会以明文出现在文件或 wal 中；
+/// 查不到只说明「没有证据表明它存在」，误报方向是继续保守失败而非丢墓碑。
+fn databases_reference_session(home: &Path, session_id: &str) -> bool {
+    let needle = session_id.as_bytes();
+    for db_path in codex_session_db_paths_from_home(home) {
+        for path in codex_sqlite_sidecar_paths(&db_path) {
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            if bytes.len() > MAX_SESSION_SCAN_BYTES {
+                continue;
+            }
+            if bytes.windows(needle.len()).any(|window| window == needle) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn delete_turns_from_rollout(
@@ -496,7 +648,11 @@ fn delete_turns_from_rollout(
     let mut found = HashSet::new();
     for line in original.split_inclusive('\n') {
         let json_line = line.trim_end_matches(['\r', '\n']);
-        if let Some(turn_id) = turn_boundary_id(json_line) {
+        // 先做子串预筛：边界行必然携带 "turn_context"/"task_started" 字面量，
+        // 不满足的行绝不可能是边界，避免对每行做完整 serde_json::Value 解析。
+        if (json_line.contains("\"turn_context\"") || json_line.contains("\"task_started\""))
+            && let Some(turn_id) = turn_boundary_id(json_line)
+        {
             removing_turn = selected.contains(&turn_id);
             if removing_turn {
                 selected_turn_seen = true;
@@ -506,7 +662,10 @@ fn delete_turns_from_rollout(
         // A later compaction snapshot may contain the deleted turn inside its
         // encrypted summary.  It cannot be edited safely, so discard the
         // snapshot and let Codex rebuild history from the remaining rollout.
-        if selected_turn_seen && is_compacted_summary(json_line) {
+        if selected_turn_seen
+            && json_line.contains("\"compacted\"")
+            && is_compacted_summary(json_line)
+        {
             continue;
         }
         if !removing_turn {
@@ -535,21 +694,31 @@ fn canonical_rollout_path(home: &Path, rollout_path: &Path) -> Result<PathBuf> {
     Ok(canonical_rollout)
 }
 
-fn last_stable_rollout_turn_id(rollout: &str) -> Option<String> {
-    let mut last_boundary = None;
-    let mut last_terminal = None;
+fn stable_rollout_tail_turn_ids(rollout: &str, count: usize) -> Option<Vec<String>> {
+    let mut turns = Vec::<(String, bool)>::new();
     for line in rollout.lines() {
-        if let Some(turn_id) = turn_boundary_id(line) {
-            last_boundary = Some(turn_id);
+        if let Some(turn_id) = turn_boundary_id(line)
+            && turns.last().is_none_or(|(current, _)| current != &turn_id)
+        {
+            turns.push((turn_id, false));
         }
-        if let Some(turn_id) = terminal_turn_id(line) {
-            last_terminal = Some(turn_id);
+        if let Some(turn_id) = terminal_turn_id(line)
+            && let Some((current, terminal)) = turns.last_mut()
+            && current == &turn_id
+        {
+            *terminal = true;
         }
     }
-    match (last_boundary, last_terminal) {
-        (Some(boundary), Some(terminal)) if boundary == terminal => Some(boundary),
-        _ => None,
+    if count > turns.len() {
+        return None;
     }
+    let tail = &turns[turns.len() - count..];
+    tail.iter().all(|(_, terminal)| *terminal).then(|| {
+        tail.iter()
+            .rev()
+            .map(|(turn_id, _)| turn_id.clone())
+            .collect()
+    })
 }
 
 fn terminal_turn_id(line: &str) -> Option<String> {
@@ -831,6 +1000,152 @@ mod tests {
         let remaining = fs::read_to_string(&rollout).unwrap();
         assert!(remaining.contains("t1"));
         assert!(remaining.contains("keep"));
+    }
+
+    #[test]
+    fn resolves_consecutive_tail_keys_before_deleting_multiple_last_turns() {
+        let home = tempdir().unwrap();
+        let rollout_dir = home.path().join("sessions/2026/08/18");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-multiple-tail-keys.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"keep\"}]}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t2\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t2\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"remove older tail\"}]}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"t2\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t3\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t3\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"remove newest tail\"}]}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t3\"}}\n",
+            ),
+        )
+        .unwrap();
+        let db = home.path().join("state_5.sqlite");
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                params!["s1", rollout.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let newest_tail_key = "history-content:tail:0:local:newest-temporary-id";
+        let older_tail_key = "history-content:tail:1:local:older-temporary-id";
+        let result = delete_messages_persistently(
+            home.path(),
+            "s1",
+            &[older_tail_key.into(), newest_tail_key.into()],
+        )
+        .unwrap();
+
+        assert_eq!(result.deleted, 2);
+        assert_eq!(result.resolved_message_ids, ["t2", "t3"]);
+        for (selector, expected) in [(newest_tail_key, "t3"), (older_tail_key, "t2")] {
+            let alias: MessageDeleteTombstone = serde_json::from_slice(
+                &fs::read(tombstone_path(
+                    &tombstone_directory(home.path()),
+                    "s1",
+                    selector,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(alias.message_id, expected);
+        }
+        let remaining = fs::read_to_string(&rollout).unwrap();
+        assert!(remaining.contains("t1"));
+        assert!(remaining.contains("keep"));
+        assert!(!remaining.contains("t2"));
+        assert!(!remaining.contains("remove older tail"));
+        assert!(!remaining.contains("t3"));
+        assert!(!remaining.contains("remove newest tail"));
+
+        let repeated = delete_messages_persistently(
+            home.path(),
+            "s1",
+            &[older_tail_key.into(), newest_tail_key.into()],
+        )
+        .unwrap();
+
+        assert_eq!(repeated.deleted, 0);
+        assert_eq!(repeated.resolved_message_ids, ["t2", "t3"]);
+    }
+
+    #[test]
+    fn refuses_non_consecutive_tail_keys() {
+        let home = tempdir().unwrap();
+        let tail_key = "history-content:tail:1:local:temporary-id";
+
+        let error =
+            delete_messages_persistently(home.path(), "s1", &[tail_key.into()]).unwrap_err();
+
+        assert!(error.to_string().contains("从当前页面末轮开始连续选择"));
+        assert!(!tombstone_path(&tombstone_directory(home.path()), "s1", tail_key).exists());
+    }
+
+    #[test]
+    fn refuses_to_mix_a_stale_tail_alias_with_an_unresolved_tail_key() {
+        let home = tempdir().unwrap();
+        let rollout_dir = home.path().join("sessions/2026/08/18");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-stale-tail-alias.jsonl");
+        let original = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t2\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t2\"}}\n",
+        );
+        fs::write(&rollout, original).unwrap();
+        let db = home.path().join("state_5.sqlite");
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                params!["s1", rollout.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let stale_tail_key = "history-content:tail:0:local:stale-temporary-id";
+        let unresolved_tail_key = "history-content:tail:1:local:new-temporary-id";
+        record_resolved_tail_aliases_unlocked(
+            home.path(),
+            "s1",
+            &[(stale_tail_key.into(), "deleted-t3".into())],
+        )
+        .unwrap();
+
+        let error = delete_messages_persistently(
+            home.path(),
+            "s1",
+            &[stale_tail_key.into(), unresolved_tail_key.into()],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("别名与当前会话尾部不一致"));
+        assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
+        assert!(!tombstone_path(&tombstone_directory(home.path()), "s1", "t1").exists());
+        assert!(!tombstone_path(&tombstone_directory(home.path()), "s1", "t2").exists());
     }
 
     #[test]
@@ -1125,6 +1440,124 @@ mod tests {
         assert_eq!(replay.cleared_sessions, 0);
         assert_eq!(replay.failures.len(), 1);
         assert!(tombstone_path.exists());
+    }
+
+    #[test]
+    fn replays_a_tombstone_when_only_the_rollout_filename_knows_the_session() {
+        let home = tempdir().unwrap();
+        let session_id = "019ff8aa-0b6e-7a01-a605-7a717a7795e3";
+        let rollout_dir = home.path().join("sessions/2026/08/27");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join(format!("rollout-2026-08-27T09-08-00-{session_id}.jsonl"));
+        let original = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019ff8aa\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t2\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t2\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t2\"}}\n",
+        );
+        fs::write(&rollout, original).unwrap();
+
+        let directory = tombstone_directory(home.path());
+        create_private_directory(&directory).unwrap();
+        write_private_file(
+            &tombstone_path(&directory, session_id, "history-content:turn:t1"),
+            &serde_json::to_vec(&MessageDeleteTombstone {
+                version: TOMBSTONE_VERSION,
+                session_id: session_id.into(),
+                message_id: "history-content:turn:t1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let replay = reapply_persisted_deletions(home.path()).unwrap();
+
+        assert_eq!(replay.deleted, 1);
+        assert_eq!(replay.cleared_sessions, 1);
+        assert!(replay.failures.is_empty());
+        assert!(!tombstone_path(&directory, session_id, "history-content:turn:t1").exists());
+        let remaining = fs::read_to_string(&rollout).unwrap();
+        assert!(!remaining.contains("t1"));
+        assert!(remaining.contains("t2"));
+    }
+
+    #[test]
+    fn drops_a_tombstone_once_the_whole_session_vanishes_from_every_store() {
+        let home = tempdir().unwrap();
+        let session_id = "019ff8aa-0b6e-7a01-a605-7a717a7795e3";
+        let sqlite_dir = home.path().join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        let catalog = Connection::open(sqlite_dir.join("codex.db")).unwrap();
+        catalog
+            .execute("CREATE TABLE automation_runs (id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        drop(catalog);
+
+        let directory = tombstone_directory(home.path());
+        create_private_directory(&directory).unwrap();
+        let tombstone = tombstone_path(&directory, session_id, "history-content:turn:t1");
+        write_private_file(
+            &tombstone,
+            &serde_json::to_vec(&MessageDeleteTombstone {
+                version: TOMBSTONE_VERSION,
+                session_id: session_id.into(),
+                message_id: "history-content:turn:t1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let replay = reapply_persisted_deletions(home.path()).unwrap();
+
+        assert_eq!(replay.deleted, 0);
+        assert_eq!(replay.cleared_sessions, 1);
+        assert!(replay.failures.is_empty());
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn keeps_a_tombstone_while_any_store_still_mentions_the_session() {
+        let home = tempdir().unwrap();
+        let session_id = "019ff8aa-0b6e-7a01-a605-7a717a7795e3";
+        let sqlite_dir = home.path().join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        let catalog = Connection::open(sqlite_dir.join("codex.db")).unwrap();
+        catalog
+            .execute(
+                "CREATE TABLE local_thread_catalog (thread_id TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        catalog
+            .execute("INSERT INTO local_thread_catalog VALUES (?1)", [session_id])
+            .unwrap();
+        drop(catalog);
+
+        let directory = tombstone_directory(home.path());
+        create_private_directory(&directory).unwrap();
+        let tombstone = tombstone_path(&directory, session_id, "history-content:turn:t1");
+        write_private_file(
+            &tombstone,
+            &serde_json::to_vec(&MessageDeleteTombstone {
+                version: TOMBSTONE_VERSION,
+                session_id: session_id.into(),
+                message_id: "history-content:turn:t1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let replay = reapply_persisted_deletions(home.path()).unwrap();
+
+        assert_eq!(replay.cleared_sessions, 0);
+        assert_eq!(replay.failures.len(), 1);
+        assert!(replay.failures[0].1.contains("无法确认消息删除是否已落地"));
+        assert!(tombstone.exists());
     }
 
     #[test]

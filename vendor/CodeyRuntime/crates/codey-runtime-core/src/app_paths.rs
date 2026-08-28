@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -420,7 +420,9 @@ fn windows_version_translations(info: &[u8]) -> Vec<(u16, u16)> {
     let translations =
         unsafe { std::slice::from_raw_parts(translations.cast::<u8>(), translations_len as usize) };
     translations
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pair| {
             (
                 u16::from_le_bytes([pair[0], pair[1]]),
@@ -530,16 +532,22 @@ pub fn codex_runtime_version(app_dir: &Path) -> Option<String> {
         return entry.version.clone();
     }
 
-    let version = Command::new(&executable)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            parse_codex_runtime_version(&String::from_utf8_lossy(&output.stdout))
-                .or_else(|| parse_codex_runtime_version(&String::from_utf8_lossy(&output.stderr)))
-        });
-    if let Ok(mut cache) = cache.lock() {
+    let mut version = None;
+    let mut cacheable = false;
+    for attempt in 0..2 {
+        if let Ok(output) = Command::new(&executable).arg("--version").output()
+            && output.status.success()
+        {
+            version = parse_codex_runtime_version(&String::from_utf8_lossy(&output.stdout))
+                .or_else(|| parse_codex_runtime_version(&String::from_utf8_lossy(&output.stderr)));
+            cacheable = true;
+            break;
+        }
+        if attempt == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    if cacheable && let Ok(mut cache) = cache.lock() {
         cache.insert(
             executable,
             RuntimeVersionCacheEntry {

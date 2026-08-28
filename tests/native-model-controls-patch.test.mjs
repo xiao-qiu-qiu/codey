@@ -12,7 +12,7 @@ async function loadPatchExpression() {
   assert.ok(template, "startup patch template should be readable");
   return template
     .replaceAll("__DISABLE_PET__", "false")
-    .replaceAll("__FAST_CODEX_STARTUP__", "true");
+    .replaceAll("__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__", "false");
 }
 
 test("API and ChatGPT auth share model-aware native service-tier controls", async () => {
@@ -41,7 +41,7 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
   try {
     assert.equal(
       (0, eval)(await loadPatchExpression()),
-      "codey-startup-patch-installed-v22",
+      "codey-startup-patch-installed-v37",
     );
     Module._load("electron", undefined, false).protocol.handle(
       "app",
@@ -704,12 +704,7 @@ test("starting or restarting Codex replaces the old runtime with one managed by 
   assert.match(restartFlow, /restart_task/);
   assert.match(restartFlow, /oneshot::channel\(\)/);
   assert.match(restartFlow, /is_shutting_down\(\)/);
-  assert.match(restartFlow, /RestartTrigger::RouteChange/);
-  assert.match(restartFlow, /wait_for_cc_switch_route_recovery/);
-  assert.match(
-    restartFlow,
-    /if !is_cc_switch_route_recovery_error\(&error\) \{[\s\S]*?request_shutdown\(\)/,
-  );
+  assert.match(restartFlow, /request_shutdown\(\)/);
   assert.match(
     runtimeSource,
     /pub async fn begin_shutdown[\s\S]*?cancel\.send\(\(\)\)[\s\S]*?task\.await/,

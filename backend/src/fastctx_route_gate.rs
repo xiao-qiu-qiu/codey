@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -63,8 +63,11 @@ pub fn run_hook_if_requested() -> Result<bool> {
         .take(MAX_HOOK_INPUT_BYTES + 1)
         .read_to_end(&mut raw)
         .context("读取 Codex FastCtx 路由 Hook 输入失败")?;
+    // 路由改道只是上下文优化,不是安全边界:输入超限或解析失败时显式放行原命令,
+    // 与未安装本 Hook 的行为一致,避免非零退出在 Codex 中被反复报告为 Hook 错误。
     if raw.len() as u64 > MAX_HOOK_INPUT_BYTES {
-        bail!("Codex FastCtx 路由 Hook 输入超过 1 MiB 上限");
+        eprintln!("Codey FastCtx 路由 Hook 输入超过 1 MiB 上限，已放行");
+        return write_hook_output(&json!({})).map(|()| true);
     }
     let output = match serde_json::from_slice::<HookInput>(&raw) {
         Ok(input) => handle_hook(&input),
@@ -87,19 +90,29 @@ fn write_hook_output(output: &Value) -> Result<()> {
 }
 
 fn handle_hook(input: &HookInput) -> Value {
-    if input.hook_event_name != "PreToolUse" {
+    hook_output(
+        &input.hook_event_name,
+        input.tool_name.as_deref(),
+        input.tool_input.as_ref(),
+    )
+}
+
+pub(crate) fn hook_output(
+    hook_event_name: &str,
+    tool_name: Option<&str>,
+    tool_input: Option<&Value>,
+) -> Value {
+    if hook_event_name != "PreToolUse" {
         return json!({});
     }
-    let Some(tool_name) = input.tool_name.as_deref() else {
+    let Some(tool_name) = tool_name else {
         return json!({});
     };
 
     if !tool_name.eq_ignore_ascii_case("Bash") {
-        return handle_resource_tool(tool_name, input.tool_input.as_ref());
+        return handle_resource_tool(tool_name, tool_input);
     }
-    let Some(command) = input
-        .tool_input
-        .as_ref()
+    let Some(command) = tool_input
         .and_then(|tool_input| tool_input.get("command"))
         .and_then(Value::as_str)
     else {
@@ -135,6 +148,9 @@ fn guard_resource_read(tool_input: Option<&Value>) -> Value {
     }
     if server.is_some_and(is_codey_fastctx_resource_alias) {
         return deny(fastctx_resource_reason());
+    }
+    if uri.is_some_and(is_local_file_uri) {
+        return deny(local_resource_bypass_reason());
     }
     if uri.is_some_and(|uri| is_plain_local_path(uri) || !has_uri_scheme(uri)) {
         return deny(invalid_resource_read_reason());
@@ -196,12 +212,21 @@ fn has_uri_scheme(uri: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
+fn is_local_file_uri(uri: &str) -> bool {
+    uri.split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
+}
+
 fn invalid_resource_read_reason() -> String {
     "MCP 资源读取已停止：`server` 和 `uri` 必须原样使用成功资源发现返回的真实值，不能填写 `x`、`none`、本地路径或其他占位内容。本地工作区文件请直接调用 `mcp__codey_fastctx__inspect_local_file`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位。".to_string()
 }
 
 fn fastctx_resource_reason() -> String {
     "Codey FastCtx 只提供直接调用的文件工具，不能作为资源服务器使用。本地文件请调用 `mcp__codey_fastctx__inspect_local_file`，搜索与发现请分别调用 `mcp__codey_fastctx__grep` 和 `mcp__codey_fastctx__glob`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位。".to_string()
+}
+
+fn local_resource_bypass_reason() -> String {
+    "本地 `file://` MCP 资源读取已停止：本地工作区文件必须通过 Codey FastCtx 直接文件工具访问，不能经外部 filesystem 资源服务器绕过 direct-only 边界。请调用 `mcp__codey_fastctx__inspect_local_file`；搜索与发现请分别调用 `mcp__codey_fastctx__grep` 和 `mcp__codey_fastctx__glob`。".to_string()
 }
 
 fn deny(reason: String) -> Value {
@@ -223,10 +248,9 @@ fn route_for_command(command: &str) -> Option<FastctxRoute> {
         return None;
     }
     let segments = split_shell_segments(command)?;
-    let compound = segments.len() > 1;
     let mut route = None;
     for segment in segments {
-        match classify_segment(&segment, compound) {
+        match classify_segment(&segment) {
             SegmentClass::Unknown => return None,
             SegmentClass::Harmless => {}
             SegmentClass::Routed(candidate) => {
@@ -319,7 +343,7 @@ fn push_segment(segments: &mut Vec<String>, current: &mut String) {
     current.clear();
 }
 
-fn classify_segment(segment: &str, compound: bool) -> SegmentClass {
+fn classify_segment(segment: &str) -> SegmentClass {
     let Some(words) = shell_words(segment) else {
         return SegmentClass::Unknown;
     };
@@ -344,32 +368,8 @@ fn classify_segment(segment: &str, compound: bool) -> SegmentClass {
         "rg" | "ripgrep" if safe_ripgrep(&args) && !args.is_empty() => {
             SegmentClass::Routed(FastctxRoute::Search)
         }
-        "grep" | "egrep" | "fgrep" | "findstr" | "select-string" | "sls"
-            if args.len() >= 2 || compound && !args.is_empty() =>
-        {
-            SegmentClass::Routed(FastctxRoute::Search)
-        }
-        "cat" | "bat" | "batcat" | "get-content" | "gc" if has_file_operand(&args) => {
+        "cat" | "get-content" | "gc" if simple_file_inspection(&command, &args) => {
             SegmentClass::Routed(FastctxRoute::Inspect)
-        }
-        "cat" | "bat" | "batcat" | "get-content" | "gc" if !args.is_empty() => {
-            SegmentClass::Harmless
-        }
-        "head" | "tail" | "nl" | "wc" if has_file_operand(&args) => {
-            SegmentClass::Routed(FastctxRoute::Inspect)
-        }
-        "head" | "tail" | "nl" | "wc" if !args.is_empty() => SegmentClass::Harmless,
-        "sed" if safe_read_only_sed(&args) => SegmentClass::Routed(FastctxRoute::Inspect),
-        "sed" if safe_stdin_sed(&args) => SegmentClass::Harmless,
-        "find" if safe_file_find(&args) => SegmentClass::Routed(FastctxRoute::Discover),
-        "fd" | "fdfind" if requests_files_only(&args) => {
-            SegmentClass::Routed(FastctxRoute::Discover)
-        }
-        "get-childitem" | "gci" if args.contains(&"-file") => {
-            SegmentClass::Routed(FastctxRoute::Discover)
-        }
-        "ls" if !args.iter().any(|argument| argument.starts_with("--dired")) => {
-            SegmentClass::Routed(FastctxRoute::Discover)
         }
         _ => SegmentClass::Unknown,
     }
@@ -392,9 +392,8 @@ fn command_and_arguments(words: &[String]) -> Option<(&str, &[String])> {
 
 fn normalized_command(command: &str) -> String {
     let basename = command
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(command)
+        .rsplit_once(['/', '\\'])
+        .map_or(command, |(_, basename)| basename)
         .to_ascii_lowercase();
     basename
         .strip_suffix(".exe")
@@ -483,68 +482,85 @@ fn has_file_operand(arguments: &[&str]) -> bool {
         .any(|argument| argument.contains(['/', '\\']) || argument.contains('.'))
 }
 
-fn safe_read_only_sed(arguments: &[&str]) -> bool {
-    safe_stdin_sed(arguments) && arguments.len() >= 3 && has_file_operand(arguments)
+fn simple_file_inspection(command: &str, arguments: &[&str]) -> bool {
+    has_file_operand(arguments)
+        && arguments
+            .iter()
+            .all(|argument| !argument.starts_with('-') || command == "cat" && *argument == "--")
 }
 
 fn safe_ripgrep(arguments: &[&str]) -> bool {
+    // 参数在比较前已统一转为小写,因此短形式 `-f` 同时覆盖 `-f`(--file)
+    // 与 `-F`(--fixed-strings),`-m` 同时覆盖 `-m`(--max-count)与
+    // `-M`(--max-columns),`-u` 同时覆盖 `-u`(--unrestricted)与 `-U`(--multiline);
+    // 长形式则必须逐一列出。这些 flag 的语义 FastCtx grep 无法等价表达,一律放行到 shell。
     !arguments.iter().any(|argument| {
-        matches!(*argument, "-r" | "--replace" | "--pre" | "--pre-glob")
-            || argument.starts_with("--replace=")
+        matches!(
+            *argument,
+            "-r" | "--replace"
+                | "--pre"
+                | "--pre-glob"
+                | "-p"
+                | "--pcre2"
+                | "-u"
+                | "-uu"
+                | "-uuu"
+                | "--unrestricted"
+                | "--no-ignore"
+                | "--no-ignore-vcs"
+                | "--no-ignore-parent"
+                | "--no-ignore-global"
+                | "--hidden"
+                | "--follow"
+                | "-a"
+                | "--text"
+                | "--binary"
+                | "-z"
+                | "--search-zip"
+                | "--json"
+                | "--vimgrep"
+                | "--pretty"
+                | "--stats"
+                | "--debug"
+                | "--trace"
+                | "-f"
+                | "--fixed-strings"
+                | "--file"
+                | "-v"
+                | "--invert-match"
+                | "-c"
+                | "--count"
+                | "--count-matches"
+                | "--column"
+                | "--byte-offset"
+                | "--passthru"
+                | "--files-without-match"
+                | "--type-list"
+                | "--engine"
+                | "--encoding"
+                | "--sort"
+                | "--sortr"
+                | "--max-count"
+                | "--max-filesize"
+                | "-m"
+                | "--max-columns"
+                | "-q"
+                | "--quiet"
+                | "-0"
+                | "--null"
+        ) || argument.starts_with("--replace=")
             || argument.starts_with("--pre=")
+            || argument.starts_with("--pre-glob=")
+            || argument.starts_with("--engine=")
+            || argument.starts_with("--encoding=")
+            || argument.starts_with("--sort=")
+            || argument.starts_with("--sortr=")
+            || argument.starts_with("--max-count=")
+            || argument.starts_with("--max-filesize=")
+            || argument.starts_with("--file=")
+            || argument.starts_with("--max-columns=")
+            || argument.starts_with("--multiline")
     })
-}
-
-fn safe_stdin_sed(arguments: &[&str]) -> bool {
-    arguments.contains(&"-n")
-        && !arguments
-            .iter()
-            .any(|argument| *argument == "-i" || argument.starts_with("--in-place"))
-        && arguments.len() >= 2
-}
-
-fn safe_file_find(arguments: &[&str]) -> bool {
-    if arguments.iter().any(|argument| {
-        matches!(
-            *argument,
-            "-delete"
-                | "-exec"
-                | "-execdir"
-                | "-ok"
-                | "-okdir"
-                | "-fls"
-                | "-fprint"
-                | "-fprint0"
-                | "-fprintf"
-                | "-printf"
-                | "-ls"
-        )
-    }) {
-        return false;
-    }
-    arguments
-        .windows(2)
-        .any(|pair| pair[0] == "-type" && pair[1] == "f")
-}
-
-fn requests_files_only(arguments: &[&str]) -> bool {
-    if arguments.iter().any(|argument| {
-        matches!(*argument, "-x" | "-X" | "--exec" | "--exec-batch")
-            || argument.starts_with("--exec=")
-            || argument.starts_with("--exec-batch=")
-    }) {
-        return false;
-    }
-    arguments.iter().any(|argument| {
-        matches!(
-            *argument,
-            "-tf" | "--type=f" | "--type=file" | "--type" | "-t"
-        )
-    }) && (arguments.contains(&"f")
-        || arguments.contains(&"file")
-        || arguments.contains(&"-tf")
-        || arguments.contains(&"--type=f")
-        || arguments.contains(&"--type=file"))
 }
 
 #[cfg(test)]
@@ -574,19 +590,13 @@ mod tests {
     }
 
     #[test]
-    fn routes_common_posix_and_windows_file_commands() {
+    fn routes_only_semantically_portable_file_commands() {
         for (command, expected) in [
             ("rg -n needle src", FastctxRoute::Search),
             ("/usr/bin/rg --files", FastctxRoute::Discover),
             ("cat src/main.rs", FastctxRoute::Inspect),
-            ("nl -ba src/main.rs | sed -n '1,80p'", FastctxRoute::Inspect),
             ("cd C:\\repo && rg --files", FastctxRoute::Discover),
             ("Get-Content .\\src\\main.rs", FastctxRoute::Inspect),
-            (
-                "Get-ChildItem -Recurse -File | Select-String needle",
-                FastctxRoute::Search,
-            ),
-            ("find . -type f -name '*.rs'", FastctxRoute::Discover),
         ] {
             assert_eq!(route_for_command(command), Some(expected), "{command}");
         }
@@ -607,6 +617,35 @@ mod tests {
             "cat input.txt > output.txt",
             "rg needle src && cargo test",
             "powershell -Command Get-Content file.rs",
+            "nl -ba src/main.rs | sed -n '1,80p'",
+            "Get-ChildItem -Recurse -File | Select-String needle",
+            "find . -type f -name '*.rs'",
+            "fd -t f",
+            "ls -la src",
+            "tail -f app.log",
+            "wc -l src/main.rs",
+            "grep -n needle src/main.rs",
+            "bat src/main.rs",
+            "cat -n src/main.rs",
+            "Get-Content -Raw .\\src\\main.rs",
+            "rg -P '(?=needle)' src",
+            "rg -uu needle src",
+            "rg --no-ignore needle src",
+            "rg --encoding=shift_jis needle src",
+            "rg --count needle src",
+            "rg -F a.b src",
+            "rg --fixed-strings a.b src",
+            "rg -f patterns.txt src",
+            "rg --file patterns.txt src",
+            "rg --file=patterns.txt src",
+            "rg -m 5 needle src",
+            "rg -M 80 needle src",
+            "rg --max-columns 80 needle src",
+            "rg -q needle src",
+            "rg --null -l needle src",
+            "rg -U 'a\\nb' src",
+            "rg --multiline 'a\\nb' src",
+            "rg --multiline-dotall 'a.*b' src",
         ] {
             assert_eq!(route_for_command(command), None, "{command}");
         }
@@ -679,13 +718,23 @@ mod tests {
             )),
             json!({})
         );
-        assert_eq!(
-            handle_hook(&tool_hook_input(
+    }
+
+    #[test]
+    fn blocks_file_uri_resource_reads_instead_of_bypassing_direct_fastctx_tools() {
+        for (server, uri) in [
+            ("filesystem", "file:///workspace/src/main.rs"),
+            ("filesystem", "FILE:///workspace/src/main.rs"),
+            ("another-local-server", "file:///workspace/src/main.rs"),
+        ] {
+            let output = handle_hook(&tool_hook_input(
                 "read_mcp_resource",
-                json!({ "server": "filesystem", "uri": "file:///workspace/src/main.rs" }),
-            )),
-            json!({})
-        );
+                json!({ "server": server, "uri": uri }),
+            ));
+            let reason = assert_denied(&output);
+            assert!(reason.contains("direct-only 边界"), "{reason}");
+            assert!(reason.contains("mcp__codey_fastctx__inspect_local_file"));
+        }
     }
 
     #[test]

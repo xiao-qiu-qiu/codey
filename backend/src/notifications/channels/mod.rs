@@ -1,5 +1,7 @@
 mod feishu;
 mod telegram;
+mod wechat_claw;
+mod wecom;
 
 use anyhow::Result;
 use reqwest::{Client, RequestBuilder};
@@ -9,6 +11,22 @@ use super::{NotificationChannelConfig, NotificationChannelKind, NotificationEven
 pub(super) trait NotificationChannelAdapter: Send + Sync {
     fn display_name(&self) -> &'static str;
     fn configuration_error(&self) -> Option<&'static str>;
+    /// Some providers require a lightweight, idempotent activation before the
+    /// first delivery in a process. Returning `None` keeps the common path free
+    /// of an extra request.
+    fn prepare_request(&self, _client: &Client) -> Option<Result<RequestBuilder>> {
+        None
+    }
+    fn mark_prepared(&self) {}
+    fn settle_on_success_status_error(&self, _body: &str) -> bool {
+        false
+    }
+    fn retry_with_fresh_context_on_success_status_error(&self, _body: &str) -> bool {
+        false
+    }
+    fn pause_on_stale_token_success_status_error(&self, _body: &str) -> bool {
+        false
+    }
     fn build_request(&self, client: &Client, event: &NotificationEvent) -> Result<RequestBuilder>;
     fn validate_response(&self, body: &str) -> std::result::Result<(), String>;
     fn sanitize_error(&self, error: &str) -> String;
@@ -29,6 +47,10 @@ pub(super) fn adapter_for(
 ) -> Box<dyn NotificationChannelAdapter + '_> {
     match config.kind {
         NotificationChannelKind::Feishu => Box::new(feishu::FeishuChannel::new(config)),
+        NotificationChannelKind::Wecom => Box::new(wecom::WecomChannel::new(config)),
         NotificationChannelKind::Telegram => Box::new(telegram::TelegramChannel::new(config)),
+        NotificationChannelKind::WechatClaw => {
+            Box::new(wechat_claw::WechatClawChannel::new(config))
+        }
     }
 }

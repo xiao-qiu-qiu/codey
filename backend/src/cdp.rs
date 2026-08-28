@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -7,17 +8,16 @@ use anyhow::{Context, Result};
 use codey_runtime_core::bridge::{
     BridgeHandler, BridgePumpHandle, bridge_health_check_script, install_bridge,
 };
-use codey_runtime_core::cdp::{list_targets, pick_injectable_codex_page_target};
+use codey_runtime_core::cdp::{CdpTarget, list_targets, pick_injectable_codex_page_target};
 use serde::{Deserialize, Serialize};
 
 use crate::error_log;
 
 const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load";
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
-const FAST_STARTUP_STATSIG_TIMEOUT_MS: u64 = 1500;
 const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(30);
-const FAST_STARTUP_SHIELD_SCRIPT: &str =
-    include_str!("../../dist-overlay/inject/fast-startup-shield.js");
+const INJECTION_STATUS_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const INJECTION_DEADLINE_MARGIN: Duration = Duration::from_millis(100);
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
 const GIT_REQUEST_GUARD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/git-request-guard.js");
@@ -25,14 +25,17 @@ const WINDOWS_WMI_SAMPLER_GUARD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/windows-wmi-sampler-guard.js");
 const MODEL_WHITELIST_INJECT_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/model-whitelist-inject.js");
-const RENDERER_INJECT_SCRIPT: &str = include_str!("../../dist-overlay/inject/renderer-inject.js");
+const RENDERER_INJECT_SCRIPT: &str = concat!(
+    include_str!("../../dist-overlay/inject/default-chinese-locale.js"),
+    "\n",
+    include_str!("../../dist-overlay/inject/renderer-inject.js")
+);
 const CODEY_SESSION_TOOLS_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-inject.js");
 const PET_CONTROL_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/pet-control-shield.js");
 const SECURITY_WARNING_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/security-warning-shield.js");
 const SETTINGS_OVERLAY_SCRIPT: &str = include_str!("../../dist-overlay/codey-overlay.js");
-const SETTINGS_OVERLAY_STYLES: &str = include_str!("../../dist-overlay/codey.css");
 const PLUGIN_MARKETPLACE_FIX_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/plugin-marketplace-fix.js");
 const PROMPT_OPTIMIZE_SCRIPT: &str = include_str!("../../dist-overlay/inject/prompt-optimize.js");
@@ -40,12 +43,91 @@ const MAX_INJECTION_ERROR_CHARS: usize = 500;
 static SETTINGS_OVERLAY_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
 static SESSION_TOOLS_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
 
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum InjectionPhase {
+    DiscoverTargets,
+    SelectTarget,
+    InstallBridge,
+    VerifyOverlay,
+    ReadStatuses,
+}
+
+impl InjectionPhase {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            value if value == Self::SelectTarget as u8 => Self::SelectTarget,
+            value if value == Self::InstallBridge as u8 => Self::InstallBridge,
+            value if value == Self::VerifyOverlay as u8 => Self::VerifyOverlay,
+            value if value == Self::ReadStatuses as u8 => Self::ReadStatuses,
+            _ => Self::DiscoverTargets,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DiscoverTargets => "枚举 CDP 页面",
+            Self::SelectTarget => "选择 Codex renderer",
+            Self::InstallBridge => "安装 CDP bridge 与注入脚本",
+            Self::VerifyOverlay => "验证 Codey 浮层",
+            Self::ReadStatuses => "读取注入状态",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct InjectionScriptDescriptor {
     id: String,
     name: String,
     source: &'static str,
+    visibility: InjectionScriptVisibility,
     probe: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InjectionScriptVisibility {
+    Feature,
+    Internal,
+}
+
+impl InjectionScriptVisibility {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Feature => "feature",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InjectionHostPlatform {
+    Windows,
+    Other,
+}
+
+impl InjectionHostPlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InjectionScriptApplicability {
+    All,
+    WindowsOnly,
+}
+
+impl InjectionScriptApplicability {
+    fn supports(self, platform: InjectionHostPlatform) -> bool {
+        match self {
+            Self::All => true,
+            Self::WindowsOnly => platform == InjectionHostPlatform::Windows,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -54,6 +136,7 @@ pub struct InjectionScriptStatus {
     pub id: String,
     pub name: String,
     pub source: String,
+    pub visibility: String,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -115,11 +198,27 @@ impl InjectedTarget {
 }
 
 pub fn prepare_injection_scripts(
-    fast_codex_startup: bool,
     slim_codex_pet: bool,
     hide_full_access_warning: bool,
     user_scripts: &[String],
 ) -> PreparedInjectionScripts {
+    prepare_injection_scripts_for_platform(
+        slim_codex_pet,
+        hide_full_access_warning,
+        user_scripts,
+        InjectionHostPlatform::current(),
+    )
+}
+
+fn prepare_injection_scripts_for_platform(
+    slim_codex_pet: bool,
+    hide_full_access_warning: bool,
+    user_scripts: &[String],
+    platform: InjectionHostPlatform,
+) -> PreparedInjectionScripts {
+    use InjectionScriptApplicability::{All, WindowsOnly};
+    use InjectionScriptVisibility::{Feature, Internal};
+
     let builtin_scripts = [
         (
             "bridge-helpers",
@@ -129,22 +228,8 @@ pub fn prepare_injection_scripts(
               && typeof window.__codeyCall === "function"
               ? "桥接函数可调用" : """#
                 .to_string(),
-        ),
-        (
-            "fast-startup-shield",
-            "Codex 快速启动保护",
-            FAST_STARTUP_SHIELD_SCRIPT,
-            format!(
-                r#"(() => {{
-                  const shield = window.__codeyFastStartupShield;
-                  if (!shield || shield.enabled !== {fast_codex_startup}
-                    || typeof shield.snapshot !== "function") return "";
-                  const snapshot = shield.snapshot();
-                  return shield.enabled
-                    ? `慢请求保护已启用（${{snapshot.timeoutMs}}ms，已降级 ${{snapshot.statsigTimeouts}} 次）`
-                    : "慢请求保护已关闭";
-                }})()"#
-            ),
+            Internal,
+            All,
         ),
         (
             "git-request-guard",
@@ -174,6 +259,8 @@ pub fn prepare_injection_scripts(
               };
             })()"#
                 .to_string(),
+            Feature,
+            WindowsOnly,
         ),
         (
             "windows-wmi-sampler",
@@ -196,19 +283,26 @@ pub fn prepare_injection_scripts(
                     : "";
                 return `已阻止 ${snapshot.blocked} 次 WMI 周期进程采样${matchDetail}`;
               }
-              if (snapshot.selfTestPassed === true) {
-                const workersObserved =
-                  Number(snapshot.mainProcessSnapshot?.workersObserved) || 0;
-                return "WMI 周期采样保护一次性自检通过" +
-                  (workersObserved > 0
-                    ? `；已观察 ${workersObserved} 个其他 Worker，实际目标采样尚未触发`
-                    : "；实际目标采样尚未触发");
-              }
               if (snapshot.mainProcessSnapshot?.selfTestError) {
                 return {
                   effective: false,
                   detail: `WMI 周期采样保护自检失败：${snapshot.mainProcessSnapshot.selfTestError}`,
                 };
+              }
+              if (snapshot.installed === true && snapshot.selfTestConfirmed === true) {
+                const workersObserved =
+                  Number(snapshot.mainProcessSnapshot?.workersObserved) || 0;
+                let detail = "WMI Worker 拦截器已安装且完整自检通过";
+                if (snapshot.sourceReadFailures > 0) {
+                  detail += `；有 ${snapshot.sourceReadFailures} 个 Worker 源码无法检查，尚未观察到实际 WMI 采样`;
+                } else if (snapshot.sourceInspections > 0) {
+                  detail += `；已检查 ${snapshot.sourceInspections} 个 Worker，尚未观察到实际 WMI 采样`;
+                } else if (workersObserved > 0) {
+                  detail += `；已观察 ${workersObserved} 个 Worker，尚未触发实际 WMI 采样`;
+                } else {
+                  detail += "；尚未触发实际 WMI 采样";
+                }
+                return detail;
               }
               if (snapshot.sourceReadFailures > 0) {
                 return {
@@ -223,7 +317,9 @@ pub fn prepare_injection_scripts(
                   ? snapshot.sourceInspections > 0
                     ? `已检查 ${snapshot.sourceInspections} 个 Worker，尚未命中完整 WMI 周期采样特征；若 WMI 仍高占用，当前来源尚未被识别`
                     : "WMI 周期采样保护已安装，但观察窗内未匹配到可识别的目标 Worker"
-                  : `WMI 周期采样保护已安装，等待首次采样确认（已观察 ${Math.floor(snapshot.observationMs / 1000)} 秒）`;
+                  : snapshot.selfTestPassed === true
+                    ? "旧版 WMI Worker 拦截器自检通过，等待实际目标采样确认"
+                    : `WMI 周期采样保护已安装，等待首次采样确认（已观察 ${Math.floor(snapshot.observationMs / 1000)} 秒）`;
                 return {
                   effective: false,
                   detail,
@@ -235,6 +331,8 @@ pub fn prepare_injection_scripts(
               };
             })()"#
                 .to_string(),
+            Feature,
+            WindowsOnly,
         ),
         (
             "model-whitelist",
@@ -249,6 +347,8 @@ pub fn prepare_injection_scripts(
                 : "";
             })()"#
                 .to_string(),
+            Internal,
+            All,
         ),
         (
             "pet-control-shield",
@@ -258,13 +358,19 @@ pub fn prepare_injection_scripts(
                 r#"window.__codeyPetControlShield?.enabled === {slim_codex_pet}
                   && typeof window.__codeyPetControlShield?.block === "function"
                   ? {} : """#,
-                serde_json::to_string(if slim_codex_pet {
-                    "宠物控制精简已启用"
+                if slim_codex_pet {
+                    serde_json::to_string("宠物控制精简已启用")
+                        .expect("pet probe detail should serialize")
                 } else {
-                    "控制器已就绪，当前精简策略关闭"
-                })
-                .expect("pet probe detail should serialize")
+                    format!(
+                        "{{ effective: false, inactive: true, detail: {} }}",
+                        serde_json::to_string("控制器已就绪，当前精简策略关闭")
+                            .expect("pet inactive detail should serialize")
+                    )
+                }
             ),
+            Feature,
+            All,
         ),
         (
             "security-warning-shield",
@@ -275,13 +381,19 @@ pub fn prepare_injection_scripts(
                   && window.__codeySecurityWarningShield?.enabled === {hide_full_access_warning}
                   && typeof window.__codeySecurityWarningShield?.dismissWarnings === "function"
                   ? {} : """#,
-                serde_json::to_string(if hide_full_access_warning {
-                    "安全提示屏蔽已启用"
+                if hide_full_access_warning {
+                    serde_json::to_string("安全提示屏蔽已启用")
+                        .expect("security probe detail should serialize")
                 } else {
-                    "控制器已就绪，当前屏蔽策略关闭"
-                })
-                .expect("security probe detail should serialize")
+                    format!(
+                        "{{ effective: false, inactive: true, detail: {} }}",
+                        serde_json::to_string("控制器已就绪，当前屏蔽策略关闭")
+                            .expect("security inactive detail should serialize")
+                    )
+                }
             ),
+            Feature,
+            All,
         ),
         (
             "settings-overlay-loader",
@@ -292,6 +404,8 @@ pub fn prepare_injection_scripts(
                 ? "配置面板按需加载器可用" : "配置面板已加载")
               : """#
                 .to_string(),
+            Internal,
+            All,
         ),
         (
             "renderer-controls",
@@ -307,6 +421,8 @@ pub fn prepare_injection_scripts(
                 : "渲染器控制与按需加载 API 可用";
             })()"#
                 .to_string(),
+            Internal,
+            All,
         ),
         (
             "plugin-marketplace-compatibility",
@@ -317,6 +433,8 @@ pub fn prepare_injection_scripts(
               && window.electronBridge?.sendMessageFromView?.__codeyPatched === true
               ? "插件市场桥接已接管" : """#
                 .to_string(),
+            Internal,
+            All,
         ),
         (
             "prompt-optimize",
@@ -326,16 +444,18 @@ pub fn prepare_injection_scripts(
               const optimizer = window.__codeyPromptOptimize;
               if (!optimizer || typeof optimizer.snapshot !== "function") return "";
               const snapshot = optimizer.snapshot();
-              return snapshot.ready === true
-                ? (snapshot.enabled === true ? "提示词优化按钮已就绪" : "提示词优化已关闭")
-                : "";
+              if (snapshot.ready !== true) return "";
+              return snapshot.enabled === true
+                ? "提示词优化按钮已就绪"
+                : { effective: false, inactive: true, detail: "提示词优化已关闭" };
             })()"#
                 .to_string(),
+            Feature,
+            All,
         ),
     ];
     let mut core_bundle = String::with_capacity(
-        FAST_STARTUP_SHIELD_SCRIPT.len()
-            + CODEY_BRIDGE_SCRIPT.len()
+        CODEY_BRIDGE_SCRIPT.len()
             + GIT_REQUEST_GUARD_SCRIPT.len()
             + WINDOWS_WMI_SAMPLER_GUARD_SCRIPT.len()
             + MODEL_WHITELIST_INJECT_SCRIPT.len()
@@ -347,14 +467,18 @@ pub fn prepare_injection_scripts(
             + 4096,
     );
     let mut descriptors = Vec::with_capacity(builtin_scripts.len() + user_scripts.len());
-    for (id, name, script, probe) in builtin_scripts {
+    for (id, name, script, probe, visibility, applicability) in builtin_scripts {
+        if !applicability.supports(platform) {
+            continue;
+        }
         let descriptor = InjectionScriptDescriptor {
             id: id.to_string(),
             name: name.to_string(),
             source: "builtin",
+            visibility,
             probe: Some(probe),
         };
-        let prepared = prepare_script(script, fast_codex_startup, slim_codex_pet);
+        let prepared = prepare_script(script, slim_codex_pet);
         append_guarded_script(&mut core_bundle, &descriptor, prepared.as_ref());
         descriptors.push(descriptor);
     }
@@ -370,6 +494,7 @@ pub fn prepare_injection_scripts(
             id: format!("user-script-{}", index + 1),
             name: format!("用户脚本 {}", index + 1),
             source: "user",
+            visibility: Feature,
             probe: None,
         };
         let mut guarded = String::with_capacity(script.len() + 512);
@@ -383,28 +508,14 @@ pub fn prepare_injection_scripts(
     }
 }
 
-fn prepare_script(script: &str, fast_codex_startup: bool, slim_codex_pet: bool) -> Cow<'_, str> {
-    if !script.contains("__CODEY_FAST_CODEX_STARTUP__")
-        && !script.contains("__CODEY_STATSIG_TIMEOUT_MS__")
-        && !script.contains("__CODEY_SLIM_PET__")
-    {
+fn prepare_script(script: &str, slim_codex_pet: bool) -> Cow<'_, str> {
+    if !script.contains("__CODEY_SLIM_PET__") {
         return Cow::Borrowed(script);
     }
-    Cow::Owned(
-        script
-            .replace(
-                "__CODEY_FAST_CODEX_STARTUP__",
-                if fast_codex_startup { "true" } else { "false" },
-            )
-            .replace(
-                "__CODEY_STATSIG_TIMEOUT_MS__",
-                &FAST_STARTUP_STATSIG_TIMEOUT_MS.to_string(),
-            )
-            .replace(
-                "__CODEY_SLIM_PET__",
-                if slim_codex_pet { "true" } else { "false" },
-            ),
-    )
+    Cow::Owned(script.replace(
+        "__CODEY_SLIM_PET__",
+        if slim_codex_pet { "true" } else { "false" },
+    ))
 }
 
 fn append_guarded_script(
@@ -465,25 +576,41 @@ pub async fn retry_inject_with_scripts(
     // hard startup deadline.
     let deadline = tokio::time::Instant::now() + CDP_INJECTION_TIMEOUT;
     let mut delay = Duration::from_millis(100);
+    let phase = Arc::new(AtomicU8::new(InjectionPhase::DiscoverTargets as u8));
+    let mut previous_error = None;
     let last_error = loop {
+        phase.store(InjectionPhase::DiscoverTargets as u8, Ordering::Release);
         match tokio::time::timeout_at(
             deadline,
-            inject_with_scripts(debug_port, handler.clone(), scripts),
+            inject_with_scripts(debug_port, handler.clone(), scripts, &phase, deadline),
         )
         .await
         {
             Ok(Ok(target)) => return Ok(target),
             Ok(Err(error)) => {
+                let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
                 if tokio::time::Instant::now() + delay > deadline {
-                    break error;
+                    break anyhow::anyhow!(
+                        "Codex CDP bridge 注入失败（阶段：{}；{}）",
+                        current_phase.label(),
+                        safe_injection_error_summary(&error)
+                    );
                 }
+                previous_error = Some(safe_injection_error_summary(&error));
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(2));
             }
             Err(_) => {
+                let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
+                let previous_error = previous_error
+                    .as_deref()
+                    .map(|error| format!("；最近一次失败：{error}"))
+                    .unwrap_or_default();
                 break anyhow::anyhow!(
-                    "等待 Codex CDP bridge 注入超时（{} ms）",
-                    CDP_INJECTION_TIMEOUT.as_millis()
+                    "等待 Codex CDP bridge 注入超时（{} ms，阶段：{}{}）",
+                    CDP_INJECTION_TIMEOUT.as_millis(),
+                    current_phase.label(),
+                    previous_error
                 );
             }
         }
@@ -491,13 +618,106 @@ pub async fn retry_inject_with_scripts(
     Err(InjectionRetryFailure { error: last_error })
 }
 
+fn summarize_cdp_targets(targets: &[CdpTarget]) -> String {
+    if targets.is_empty() {
+        return "[]".to_string();
+    }
+    let visible = targets
+        .iter()
+        .take(6)
+        .map(|target| {
+            format!(
+                "{{type:{},url:{:?},ws:{}}}",
+                truncate_chars(target.target_type.clone(), 20),
+                safe_target_url_shape(&target.url),
+                target.web_socket_debugger_url.is_some()
+            )
+        })
+        .collect::<Vec<_>>();
+    let omitted = targets.len().saturating_sub(visible.len());
+    if omitted == 0 {
+        format!("[{}]", visible.join(","))
+    } else {
+        format!("[{},+{omitted}]", visible.join(","))
+    }
+}
+
+fn safe_target_url_shape(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.to_ascii_lowercase().starts_with("app://") {
+        let end = trimmed
+            .char_indices()
+            .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index))
+            .unwrap_or(trimmed.len());
+        return truncate_chars(trimmed[..end].to_string(), 100);
+    }
+    trimmed
+        .split_once(':')
+        .filter(|(scheme, _)| {
+            !scheme.is_empty()
+                && scheme.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+                })
+        })
+        .map(|(scheme, _)| format!("{}:", scheme.to_ascii_lowercase()))
+        .unwrap_or_else(|| "<unknown>".to_string())
+}
+
+fn safe_injection_error_summary(error: &anyhow::Error) -> String {
+    let message = format!("{error:#}");
+    if let Some((_, targets)) = message.split_once("CDP targets=") {
+        let targets = targets
+            .split_once(']')
+            .map(|(targets, _)| format!("{targets}]"))
+            .unwrap_or_else(|| "[]".to_string());
+        return truncate_chars(
+            format!("未发现匹配的 Codex renderer；CDP targets={targets}"),
+            MAX_INJECTION_ERROR_CHARS,
+        );
+    }
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("failed to query cdp targets")
+        || normalized.contains("枚举 codex cdp 页面失败")
+    {
+        "CDP 页面列表尚不可用".to_string()
+    } else if normalized.contains("timed out connecting cdp websocket")
+        || normalized.contains("failed to connect")
+    {
+        "CDP WebSocket 连接失败".to_string()
+    } else if normalized.contains("timed out waiting for cdp command") {
+        "CDP 命令未在单次响应预算内完成".to_string()
+    } else if normalized.contains("codey 内嵌配置面板注入失败") {
+        "Codey 浮层未就绪".to_string()
+    } else {
+        "内部注入尝试失败".to_string()
+    }
+}
+
+fn injection_status_read_budget(remaining: Duration) -> Option<Duration> {
+    let budget = remaining
+        .saturating_sub(INJECTION_DEADLINE_MARGIN)
+        .min(INJECTION_STATUS_READ_TIMEOUT);
+    (!budget.is_zero()).then_some(budget)
+}
+
 async fn inject_with_scripts(
     debug_port: u16,
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
+    phase: &AtomicU8,
+    deadline: tokio::time::Instant,
 ) -> Result<InjectedTarget> {
-    let targets = list_targets(debug_port).await?;
-    let target = pick_injectable_codex_page_target(&targets)?;
+    phase.store(InjectionPhase::DiscoverTargets as u8, Ordering::Release);
+    let targets = list_targets(debug_port)
+        .await
+        .context("枚举 Codex CDP 页面失败")?;
+    phase.store(InjectionPhase::SelectTarget as u8, Ordering::Release);
+    let target = pick_injectable_codex_page_target(&targets).with_context(|| {
+        format!(
+            "没有找到可注入的 Codex renderer；CDP targets={}",
+            summarize_cdp_targets(&targets)
+        )
+    })?;
     let websocket_url: Arc<str> = Arc::from(
         target
             .web_socket_debugger_url
@@ -505,19 +725,34 @@ async fn inject_with_scripts(
             .ok_or_else(|| anyhow::anyhow!("Codex 页面没有 CDP WebSocket 地址"))?,
     );
     let handler = with_lazy_loaders(handler, websocket_url.clone());
+    phase.store(InjectionPhase::InstallBridge as u8, Ordering::Release);
     let pump = install_bridge(
         &websocket_url,
         codey_runtime_core::bridge::BRIDGE_BINDING_NAME,
         handler,
         &scripts.scripts,
     )
-    .await?;
-    ensure_settings_overlay_ready(&websocket_url).await?;
-    let injection_statuses = read_injection_statuses(&websocket_url, scripts)
+    .await
+    .with_context(|| format!("向 Codex renderer {} 安装 CDP bridge 失败", target.id))?;
+    phase.store(InjectionPhase::VerifyOverlay as u8, Ordering::Release);
+    ensure_settings_overlay_ready(&websocket_url)
         .await
-        .unwrap_or_else(|error| {
-            scripts.statuses_with_error(format!("读取注入状态失败：{error:#}"))
-        });
+        .with_context(|| format!("验证 Codex renderer {} 的 Codey 浮层失败", target.id))?;
+    phase.store(InjectionPhase::ReadStatuses as u8, Ordering::Release);
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let injection_statuses = match injection_status_read_budget(remaining) {
+        Some(status_budget) => match tokio::time::timeout(
+            status_budget,
+            read_injection_statuses(&websocket_url, scripts),
+        )
+        .await
+        {
+            Ok(Ok(statuses)) => statuses,
+            Ok(Err(_)) => scripts.statuses_with_error("读取注入状态失败，将在运行期复核"),
+            Err(_) => scripts.statuses_with_error("读取注入状态超时，将在运行期复核"),
+        },
+        None => scripts.statuses_with_error("启动预算即将结束，注入状态将在运行期复核"),
+    };
     Ok(InjectedTarget {
         websocket_url,
         pump,
@@ -535,6 +770,7 @@ impl PreparedInjectionScripts {
                     id: descriptor.id.clone(),
                     name: descriptor.name.clone(),
                     source: descriptor.source.to_string(),
+                    visibility: descriptor.visibility.as_str().to_string(),
                     status: "unknown".to_string(),
                     detail: None,
                     error: Some(error.clone()),
@@ -616,14 +852,21 @@ async fn record_failed_injection_statuses(websocket_url: &str, statuses: &[Injec
     }
 }
 
+#[derive(Debug)]
+pub struct ModelWhitelistRefresh {
+    /// The catalog was accepted and the transport patch guarantees future
+    /// `model/list` responses carry it, but no live model query existed yet
+    /// to patch in place (cold renderer, picker not mounted).
+    pub deferred: bool,
+}
+
 pub async fn refresh_model_whitelist(
     websocket_url: &str,
-    expected_models: &[String],
-    expected_default_model: &str,
-) -> Result<()> {
+    expected_catalog: &serde_json::Value,
+) -> Result<ModelWhitelistRefresh> {
     let response = codey_runtime_core::bridge::evaluate_script_with_await_promise(
         websocket_url,
-        &model_whitelist_refresh_script(expected_models, expected_default_model),
+        &model_whitelist_refresh_script(expected_catalog),
         true,
     )
     .await
@@ -631,24 +874,20 @@ pub async fn refresh_model_whitelist(
     verify_model_whitelist_refresh_response(&response)
 }
 
-fn model_whitelist_refresh_script(
-    expected_models: &[String],
-    expected_default_model: &str,
-) -> String {
-    let expected_models =
-        serde_json::to_string(expected_models).expect("model ids should serialize");
-    let expected_default_model =
-        serde_json::to_string(expected_default_model).expect("default model should serialize");
+fn model_whitelist_refresh_script(expected_catalog: &serde_json::Value) -> String {
+    let expected_catalog =
+        serde_json::to_string(expected_catalog).expect("model catalog should serialize");
     format!(
         r#"(async () => {{
-  const expectedModels = {expected_models};
-  const expectedDefaultModel = {expected_default_model};
-  const expectedCatalog = {{
-    status: expectedModels.length > 0 ? "ok" : "not_configured",
-    model: expectedDefaultModel,
-    default_model: expectedDefaultModel,
-    models: expectedModels,
-  }};
+  const expectedCatalog = {expected_catalog};
+  const expectedModels = Array.isArray(expectedCatalog.models)
+    ? expectedCatalog.models
+    : [];
+  const expectedDefaultModel = typeof expectedCatalog.default_model === "string"
+    ? expectedCatalog.default_model
+    : typeof expectedCatalog.model === "string"
+      ? expectedCatalog.model
+      : "";
   const matchesExpected = (snapshot) => (
     snapshot?.loaded === true
     && Array.isArray(snapshot.models)
@@ -656,17 +895,28 @@ fn model_whitelist_refresh_script(
     && snapshot.models.every((model, index) => model === expectedModels[index])
     && snapshot.defaultModel === expectedDefaultModel
   );
-  const reachedActiveModelPicker = (delivery) => (
+  // The response patch rewrites every future `model/list` bridge reply and
+  // the scheduled/interaction passes keep patching the query cache, so a
+  // renderer whose model picker has not mounted yet still receives the
+  // catalog — just lazily. That counts as a deferred delivery, not a
+  // failure; only a missing Statsig or response patch is a real failure.
+  const catalogAccepted = (delivery) => (
     delivery?.responsePatchInstalled === true
     && Number(delivery.statsigClients) > 0
     && Number(delivery.notifiedClients) > 0
+  );
+  const reachedActiveModelPicker = (delivery) => (
+    catalogAccepted(delivery)
     && Number(delivery.queryClients) > 0
     && Number(delivery.queryEntries) > 0
   );
+  const deliverySummary = (delivery) => delivery
+    ? `（statsigClients=${{Number(delivery.statsigClients)}}, notifiedClients=${{Number(delivery.notifiedClients)}}, queryClients=${{Number(delivery.queryClients)}}, queryEntries=${{Number(delivery.queryEntries)}}）`
+    : "";
   let snapshot = null;
   let delivery = null;
   let lastError = "模型白名单补丁尚未就绪";
-  for (const delay of [0, 80, 200, 500]) {{
+  for (const delay of [0, 80, 200, 500, 1000, 2000]) {{
     if (delay > 0) {{
       await new Promise((resolve) => window.setTimeout(resolve, delay));
     }}
@@ -684,37 +934,45 @@ fn model_whitelist_refresh_script(
       const updated = await patch.setCatalog(expectedCatalog);
       snapshot = patch.snapshot();
       delivery = patch.delivery();
-      if (
-        updated === true
-        && matchesExpected(snapshot)
-        && reachedActiveModelPicker(delivery)
-      ) {{
-        return JSON.stringify({{ ok: true, snapshot, delivery }});
-      }}
       if (updated !== true) {{
         lastError = "模型白名单拒绝了后端推送的目录";
       }} else if (!matchesExpected(snapshot)) {{
         lastError = "模型白名单快照与已保存配置不一致";
+      }} else if (reachedActiveModelPicker(delivery)) {{
+        return JSON.stringify({{ ok: true, delivered: "active", snapshot, delivery }});
+      }} else if (catalogAccepted(delivery)) {{
+        // Catalog is on the transport patch; waiting for a mounted picker
+        // would only upgrade deferred to active while holding evaluate open.
+        return JSON.stringify({{ ok: true, delivered: "deferred", snapshot, delivery }});
+      }} else if (delivery?.responsePatchInstalled !== true) {{
+        lastError = "模型响应补丁未安装";
+      }} else if (Number(delivery.statsigClients) < 1) {{
+        lastError = "未找到 Codex 的 Statsig 客户端";
       }} else {{
-        lastError = "未能刷新 Codex 当前对话的模型查询缓存";
+        lastError = "未能通知 Codex 的 Statsig 客户端";
       }}
     }} catch (error) {{
       lastError = error instanceof Error ? error.message : String(error);
     }}
   }}
-  return JSON.stringify({{ ok: false, error: lastError, snapshot, delivery }});
+  return JSON.stringify({{ ok: false, error: `${{lastError}}${{deliverySummary(delivery)}}`, snapshot, delivery }});
 }})()"#
     )
 }
 
-fn verify_model_whitelist_refresh_response(response: &serde_json::Value) -> Result<()> {
+fn verify_model_whitelist_refresh_response(
+    response: &serde_json::Value,
+) -> Result<ModelWhitelistRefresh> {
     let payload = runtime_value(response)
         .and_then(serde_json::Value::as_str)
         .context("Codex 模型列表热更新未返回可解析结果")?;
     let report = serde_json::from_str::<serde_json::Value>(payload)
         .context("解析 Codex 模型列表热更新结果失败")?;
     if report.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-        return Ok(());
+        return Ok(ModelWhitelistRefresh {
+            deferred: report.get("delivered").and_then(serde_json::Value::as_str)
+                == Some("deferred"),
+        });
     }
     let error = report
         .get("error")
@@ -742,15 +1000,18 @@ fn injection_status_snapshot_script(descriptors: &[InjectionScriptDescriptor]) -
   const verify = () => {{
     for (const [id, probe] of Object.entries(probes)) {{
       const entry = registry[id];
-      if (!entry || entry.status !== "executed") continue;
+      if (!entry || !["executed", "effective", "inactive"].includes(entry.status)) continue;
       try {{
         const evidence = probe();
         const structured = evidence && typeof evidence === "object"
           && Object.prototype.hasOwnProperty.call(evidence, "effective");
         const effective = structured ? evidence.effective === true : Boolean(evidence);
+        const inactive = structured && evidence.inactive === true;
         const detail = structured ? evidence.detail : evidence;
         if (effective) {{
           entry.status = "effective";
+        }} else if (inactive) {{
+          entry.status = "inactive";
         }}
         if (detail) entry.detail = String(detail);
       }} catch (error) {{
@@ -791,6 +1052,7 @@ fn reconcile_injection_statuses(
                         id: descriptor.id.clone(),
                         name: descriptor.name.clone(),
                         source: descriptor.source.to_string(),
+                        visibility: descriptor.visibility.as_str().to_string(),
                         status: "unknown".to_string(),
                         detail: None,
                         error: Some("脚本未返回注入状态".to_string()),
@@ -804,7 +1066,7 @@ fn reconcile_injection_statuses(
                 } = status;
                 let valid_status = matches!(
                     reported_status.as_str(),
-                    "effective" | "executed" | "failed"
+                    "effective" | "executed" | "inactive" | "failed"
                 );
                 let normalized_detail = if valid_status {
                     detail
@@ -825,6 +1087,7 @@ fn reconcile_injection_statuses(
                     id: descriptor.id.clone(),
                     name: descriptor.name.clone(),
                     source: descriptor.source.to_string(),
+                    visibility: descriptor.visibility.as_str().to_string(),
                     status: if valid_status {
                         reported_status
                     } else {
@@ -894,12 +1157,7 @@ fn with_lazy_loaders(handler: BridgeHandler, websocket_url: Arc<str>) -> BridgeH
 
 fn prepared_settings_overlay_load_script() -> Arc<str> {
     SETTINGS_OVERLAY_LOAD_SCRIPT
-        .get_or_init(|| {
-            Arc::from(settings_overlay_load_script(
-                SETTINGS_OVERLAY_SCRIPT,
-                SETTINGS_OVERLAY_STYLES,
-            ))
-        })
+        .get_or_init(|| Arc::from(settings_overlay_load_script(SETTINGS_OVERLAY_SCRIPT)))
         .clone()
 }
 
@@ -965,9 +1223,8 @@ fn lazy_settings_overlay_loader_script() -> &'static str {
 })()"#
 }
 
-fn settings_overlay_load_script(script: &str, styles: &str) -> String {
+fn settings_overlay_load_script(script: &str) -> String {
     let wrapped = wrap_settings_overlay(script);
-    let styles = serde_json::to_string(styles).expect("serialize settings overlay styles");
     format!(
         r#"(() => {{
   const current = window.__codeySettingsOverlay;
@@ -975,12 +1232,10 @@ fn settings_overlay_load_script(script: &str, styles: &str) -> String {
     return "";
   }}
   if (current?.__codeyLazyLoader) delete window.__codeySettingsOverlay;
-  window.__codeyComponentStyles = {styles};
   {wrapped}
   const ready = typeof window.__codeySettingsOverlay === "object"
     && typeof window.__codeySettingsOverlay.toggle === "function"
     && !window.__codeySettingsOverlay.__codeyLazyLoader;
-  delete window.__codeyComponentStyles;
   if (ready) return "";
   if (current?.__codeyLazyLoader) window.__codeySettingsOverlay = current;
   return String(window.__codeyOverlayError || "未生成浮层控制器");
@@ -1023,6 +1278,8 @@ fn session_tools_load_script(script: &str) -> String {
       ? `${{error.name}}: ${{error.message}}${{error.stack ? `\n${{error.stack}}` : ""}}`
       : String(error);
     window.__codeySessionToolsError = message;
+    window.__codeySessionToolsInjectLoading = false;
+    window.__codeySessionToolsInjectLoaded = false;
     console.error("[Codey] session tools failed to load", error);
   }}
   return window.__codeySessionToolsInjectLoaded === true
@@ -1063,7 +1320,22 @@ fn runtime_value(response: &serde_json::Value) -> Option<&serde_json::Value> {
         .and_then(|value| value.get("value"))
 }
 
-pub async fn is_target_healthy(websocket_url: &str) -> Result<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetHealth {
+    Healthy,
+    Unhealthy,
+    Busy,
+}
+
+fn target_health_from_evaluate_response(response: &serde_json::Value) -> TargetHealth {
+    match runtime_value(response).and_then(serde_json::Value::as_str) {
+        Some("healthy") => TargetHealth::Healthy,
+        Some("busy") => TargetHealth::Busy,
+        _ => TargetHealth::Unhealthy,
+    }
+}
+
+pub async fn is_target_healthy(websocket_url: &str) -> Result<TargetHealth> {
     let result = codey_runtime_core::bridge::evaluate_script_with_await_promise(
         websocket_url,
         bridge_health_check_script(),
@@ -1071,12 +1343,18 @@ pub async fn is_target_healthy(websocket_url: &str) -> Result<bool> {
     )
     .await
     .context("检查 Codey bridge 健康状态失败")?;
-    Ok(result
-        .get("result")
-        .and_then(|value| value.get("result"))
-        .and_then(|value| value.get("value"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false))
+    Ok(target_health_from_evaluate_response(&result))
+}
+
+pub fn target_health_error_requires_rediscovery(error: &anyhow::Error) -> bool {
+    // Renderer command deadlines are deliberately inconclusive: injecting more
+    // work into a busy page can make it less responsive. A Tungstenite error,
+    // however, means the saved page endpoint could not carry the probe at all
+    // (including HTTP upgrade failures from a replaced CDP target), so the
+    // watchdog must rediscover `/json` instead of retrying the stale URL.
+    error
+        .downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+        .is_some()
 }
 
 pub fn bridge_handler<F, Fut>(handler: F) -> BridgeHandler
@@ -1100,6 +1378,61 @@ mod tests {
     }
 
     #[test]
+    fn nonessential_status_read_never_consumes_the_injection_deadline() {
+        assert_eq!(
+            injection_status_read_budget(Duration::from_secs(5)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            injection_status_read_budget(Duration::from_millis(150)),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            injection_status_read_budget(Duration::from_millis(100)),
+            None
+        );
+    }
+
+    #[test]
+    fn cdp_target_summary_keeps_shape_but_redacts_query_and_fragment() {
+        let targets = vec![CdpTarget {
+            id: "page-1".to_string(),
+            target_type: "page".to_string(),
+            title: "private task title".to_string(),
+            url: "app://-/index.html?token=secret#private".to_string(),
+            web_socket_debugger_url: Some("ws://127.0.0.1/devtools/page/1".to_string()),
+        }];
+
+        let summary = summarize_cdp_targets(&targets);
+
+        assert!(summary.contains("app://-/index.html"));
+        assert!(summary.contains("ws:true"));
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("private"));
+        assert!(!summary.contains("task title"));
+        assert!(!summary.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn injection_error_summary_does_not_persist_renderer_or_script_secrets() {
+        let target_error = anyhow::anyhow!(
+            "没有找到 renderer；CDP targets=[{{type:page,url:\"app://-/index.html\",ws:true}}]: secret title"
+        );
+        let script_error = anyhow::anyhow!(
+            "timed out waiting for CDP command Runtime.evaluate: token=secret stack=/private/path"
+        );
+
+        let target_summary = safe_injection_error_summary(&target_error);
+        let script_summary = safe_injection_error_summary(&script_error);
+
+        assert!(target_summary.contains("app://-/index.html"));
+        assert!(!target_summary.contains("secret title"));
+        assert_eq!(script_summary, "CDP 命令未在单次响应预算内完成");
+        assert!(!script_summary.contains("secret"));
+        assert!(!script_summary.contains("private"));
+    }
+
+    #[test]
     fn overlay_wrapper_records_runtime_errors() {
         let wrapped = wrap_settings_overlay("throw new Error('boom');");
         assert!(wrapped.contains("window.__codeyOverlayError = message"));
@@ -1115,11 +1448,67 @@ mod tests {
     }
 
     #[test]
-    fn model_whitelist_refresh_script_retries_and_verifies_the_expected_snapshot() {
-        let script = model_whitelist_refresh_script(
-            &["gpt-5.6-sol".into(), "provider-\"quoted".into()],
-            "provider-\"quoted",
+    fn target_health_parses_tri_state_probe_results() {
+        let response = |value: serde_json::Value| {
+            serde_json::json!({
+                "result": { "result": { "type": "string", "value": value } }
+            })
+        };
+        assert_eq!(
+            target_health_from_evaluate_response(&response(serde_json::json!("healthy"))),
+            TargetHealth::Healthy
         );
+        assert_eq!(
+            target_health_from_evaluate_response(&response(serde_json::json!("busy"))),
+            TargetHealth::Busy
+        );
+        for value in ["missing", "unhealthy"] {
+            assert_eq!(
+                target_health_from_evaluate_response(&response(serde_json::json!(value))),
+                TargetHealth::Unhealthy
+            );
+        }
+        // Legacy boolean and missing values degrade to unhealthy, never busy,
+        // so a genuinely absent bridge still triggers reinjection.
+        assert_eq!(
+            target_health_from_evaluate_response(&response(serde_json::json!(false))),
+            TargetHealth::Unhealthy
+        );
+        assert_eq!(
+            target_health_from_evaluate_response(&serde_json::json!({})),
+            TargetHealth::Unhealthy
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_errors_require_target_rediscovery_but_timeouts_do_not() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(tokio_tungstenite::tungstenite::http::StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Some(Vec::new()))
+            .unwrap();
+        let websocket_error =
+            anyhow::Error::new(tokio_tungstenite::tungstenite::Error::Http(response))
+                .context("failed to connect CDP websocket");
+        assert!(target_health_error_requires_rediscovery(&websocket_error));
+
+        let renderer_timeout = anyhow::anyhow!("timed out waiting for CDP command");
+        assert!(!target_health_error_requires_rediscovery(&renderer_timeout));
+    }
+
+    #[test]
+    fn model_whitelist_refresh_script_retries_and_verifies_the_expected_snapshot() {
+        let script = model_whitelist_refresh_script(&serde_json::json!({
+            "status": "ok",
+            "model": "provider-\"quoted",
+            "default_model": "provider-\"quoted",
+            "models": ["gpt-5.6-sol", "provider-\"quoted"],
+            "model_metadata": [{
+                "model": "provider-\"quoted",
+                "display_name": "Provider / provider-\"quoted",
+                "provider_id": "provider",
+                "source_model": "provider-\"quoted"
+            }]
+        }));
 
         assert!(script.contains("window.__codeyModelWhitelistPatch"));
         assert!(script.contains("await patch.setCatalog(expectedCatalog)"));
@@ -1127,10 +1516,18 @@ mod tests {
         assert!(script.contains("patch.snapshot()"));
         assert!(!script.contains("patch.refresh()"));
         assert!(!script.contains("/codex-model-catalog"));
-        assert!(script.contains("[0, 80, 200, 500]"));
+        assert!(script.contains("[0, 80, 200, 500, 1000, 2000]"));
+        assert!(script.contains("model_metadata"));
         assert!(script.contains(r#"provider-\"quoted"#));
         assert!(script.contains("snapshot.defaultModel === expectedDefaultModel"));
         assert!(script.contains("delivery.queryEntries"));
+        assert!(script.contains("catalogAccepted"));
+        assert!(script.contains("} else if (catalogAccepted(delivery)) {"));
+        assert!(script.contains(
+            "return JSON.stringify({ ok: true, delivered: \"deferred\", snapshot, delivery });"
+        ));
+        assert!(!script.contains("deferredDelivery"));
+        assert!(!script.contains("Keep retrying"));
     }
 
     #[test]
@@ -1139,53 +1536,67 @@ mod tests {
             "result": {
                 "result": {
                     "type": "string",
-                    "value": r#"{"ok":true,"snapshot":{"loaded":true}}"#
+                    "value": r#"{"ok":true,"delivered":"active","snapshot":{"loaded":true},"delivery":{"queryEntries":1}}"#
                 }
             }
         });
-        assert!(verify_model_whitelist_refresh_response(&success).is_ok());
-
+        let outcome = verify_model_whitelist_refresh_response(&success).unwrap();
+        assert!(!outcome.deferred);
         let mismatch = serde_json::json!({
             "result": {
                 "result": {
                     "type": "string",
-                    "value": r#"{"ok":false,"error":"模型白名单快照与已保存配置不一致"}"#
+                    "value": r#"{"ok":false,"error":"模型白名单快照与已保存配置不一致（statsigClients=1, notifiedClients=1, queryClients=1, queryEntries=0）"}"#
                 }
             }
         });
         let error = verify_model_whitelist_refresh_response(&mismatch).unwrap_err();
         assert!(format!("{error:#}").contains("快照与已保存配置不一致"));
+        assert!(format!("{error:#}").contains("queryEntries=0"));
     }
 
     #[test]
-    fn pet_control_shield_receives_the_launch_setting() {
-        let enabled = PET_CONTROL_SHIELD_SCRIPT.replace("__CODEY_SLIM_PET__", "true");
-        let disabled = PET_CONTROL_SHIELD_SCRIPT.replace("__CODEY_SLIM_PET__", "false");
-
-        assert!(enabled.contains(r#"["true"][0]==="true""#));
-        assert!(disabled.contains(r#"["false"][0]==="true""#));
+    fn model_whitelist_refresh_response_reports_a_deferred_delivery() {
+        let deferred = serde_json::json!({
+            "result": {
+                "result": {
+                    "type": "string",
+                    "value": r#"{"ok":true,"delivered":"deferred","snapshot":{"loaded":true},"delivery":{"queryEntries":0}}"#
+                }
+            }
+        });
+        let outcome = verify_model_whitelist_refresh_response(&deferred).unwrap();
+        assert!(outcome.deferred);
     }
 
     #[test]
     fn core_scripts_share_one_cdp_document_script_and_user_scripts_stay_isolated() {
-        let prepared = prepare_injection_scripts(
-            true,
+        let prepared = prepare_injection_scripts_for_platform(
             false,
             false,
             &["".to_string(), "window.userScriptRan = true;".to_string()],
+            InjectionHostPlatform::Windows,
         );
 
         assert_eq!(prepared.scripts.len(), 2);
         let core = &prepared.scripts[0];
-        assert!(core.contains("window.__codeyFastStartupShield"));
-        assert!(core.contains(r#"["true"][0]==="true""#));
         assert!(core.contains("window.__codeyBridgeHelpersInstalled"));
         assert!(core.contains("__codeyGitRequestGuard"));
         assert!(core.contains("__codeyWindowsWmiSamplerGuard"));
         assert!(core.contains("window.__codeyModelWhitelistPatch"));
         assert!(core.contains("/codex-model-catalog"));
+        let shared_runtime_offset = core
+            .find("window.__codeySharedRuntime=Object.freeze")
+            .expect("bridge helpers must initialize the shared runtime");
+        let locale_offset = core
+            .find("__codeyDefaultChineseLocale")
+            .expect("locale bootstrap must be part of renderer-controls");
+        let renderer_offset = core
+            .find("window.__codeyRendererCoreLoaded")
+            .expect("renderer bootstrap must be part of renderer-controls");
+        assert!(shared_runtime_offset < locale_offset);
+        assert!(locale_offset < renderer_offset);
         assert!(core.contains("window.__codeyRendererCoreLoaded"));
-        assert!(core.contains(r#"["true"][0]==="true""#));
         assert!(core.contains(r#"["false"][0]==="true""#));
         assert!(core.contains(SETTINGS_OVERLAY_LOAD_PATH));
         assert!(core.contains(SESSION_TOOLS_LOAD_PATH));
@@ -1198,9 +1609,22 @@ mod tests {
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 12);
-        assert_eq!(prepared.descriptors[11].id, "user-script-1");
-        assert_eq!(prepared.descriptors[11].source, "user");
+        assert_eq!(prepared.descriptors.len(), 11);
+        assert_eq!(prepared.descriptors[10].id, "user-script-1");
+        assert_eq!(prepared.descriptors[10].source, "user");
+        assert_eq!(
+            prepared.descriptors[0].visibility,
+            InjectionScriptVisibility::Internal
+        );
+        assert_eq!(prepared.descriptors[7].id, "renderer-controls");
+        assert_eq!(
+            prepared.descriptors[7].visibility,
+            InjectionScriptVisibility::Internal
+        );
+        assert_eq!(
+            prepared.descriptors[10].visibility,
+            InjectionScriptVisibility::Feature
+        );
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
         assert!(snapshot_script.contains("bridge-helpers"));
         assert!(snapshot_script.contains("Windows Git 请求限流已由主进程接管"));
@@ -1208,7 +1632,10 @@ mod tests {
         assert!(snapshot_script.contains("snapshot.mainProcessProtected === true"));
         assert!(snapshot_script.contains("WMI 周期采样保护已安装"));
         assert!(snapshot_script.contains("snapshot.blocked > 0"));
+        assert!(snapshot_script.contains("snapshot.selfTestConfirmed === true"));
         assert!(snapshot_script.contains("effective: false"));
+        assert!(snapshot_script.contains("entry.status = \"inactive\""));
+        assert!(snapshot_script.contains("[\"executed\", \"effective\", \"inactive\"].includes"));
         assert!(snapshot_script.contains("Object.prototype.hasOwnProperty.call"));
         assert!(snapshot_script.contains("模型目录已加载"));
         assert!(snapshot_script.contains("插件市场桥接已接管"));
@@ -1216,9 +1643,9 @@ mod tests {
         assert!(!snapshot_script.contains("user-script-1\": () =>"));
         let overlay_load_script = prepared_settings_overlay_load_script();
         assert!(overlay_load_script.contains("codey-settings-overlay-host"));
-        assert!(overlay_load_script.contains("window.__codeyComponentStyles = "));
-        assert!(overlay_load_script.contains(".semi-button"));
-        assert!(overlay_load_script.contains("--semi-color-primary:"));
+        assert!(overlay_load_script.contains("data-mantine-color-scheme"));
+        assert!(overlay_load_script.contains("--button-bg"));
+        assert!(overlay_load_script.contains("--mantine-color-blue-6:"));
         assert!(overlay_load_script.contains("delete window.__codeySettingsOverlay"));
         assert!(
             overlay_load_script.contains("window.__codeySettingsOverlay = current"),
@@ -1226,17 +1653,68 @@ mod tests {
         );
         let session_tools_load_script = prepared_session_tools_load_script();
         assert!(session_tools_load_script.contains("window.__codeySessionToolsInjectLoaded"));
+        assert!(
+            session_tools_load_script.contains("window.__codeySessionToolsInjectLoading = false")
+        );
         // 压缩会改写内部标识符，锚点必须用不会被改名的 window 属性。
         assert!(session_tools_load_script.contains("__codeyDeleteSelectedMessages"));
     }
 
     #[test]
-    fn injection_statuses_preserve_script_order_and_report_missing_entries() {
-        let prepared = prepare_injection_scripts(
+    fn windows_only_scripts_are_excluded_from_non_windows_injection() {
+        let user_scripts = ["window.userScriptRan = true;".to_string()];
+        let non_windows = prepare_injection_scripts_for_platform(
             false,
+            false,
+            &user_scripts,
+            InjectionHostPlatform::Other,
+        );
+        let windows = prepare_injection_scripts_for_platform(
+            false,
+            false,
+            &user_scripts,
+            InjectionHostPlatform::Windows,
+        );
+
+        for windows_only_id in ["git-request-guard", "windows-wmi-sampler"] {
+            assert!(
+                non_windows
+                    .descriptors
+                    .iter()
+                    .all(|descriptor| descriptor.id != windows_only_id)
+            );
+            assert!(
+                windows
+                    .descriptors
+                    .iter()
+                    .any(|descriptor| descriptor.id == windows_only_id)
+            );
+        }
+        assert!(!non_windows.scripts[0].contains("__codeyGitRequestGuard"));
+        assert!(!non_windows.scripts[0].contains("__codeyWindowsWmiSamplerGuard"));
+        assert_eq!(
+            non_windows
+                .descriptors
+                .last()
+                .map(|descriptor| descriptor.id.as_str()),
+            Some("user-script-1")
+        );
+
+        let current = prepare_injection_scripts(false, false, &[]);
+        let current_has_windows_scripts = current
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.id == "git-request-guard");
+        assert_eq!(current_has_windows_scripts, cfg!(windows));
+    }
+
+    #[test]
+    fn injection_statuses_preserve_script_order_and_report_missing_entries() {
+        let prepared = prepare_injection_scripts_for_platform(
             false,
             false,
             &["window.userScriptRan = true;".to_string()],
+            InjectionHostPlatform::Windows,
         );
         let reported = vec![
             RuntimeInjectionStatus {
@@ -1251,6 +1729,12 @@ mod tests {
                 detail: Some("桥接函数可调用".to_string()),
                 error: None,
             },
+            RuntimeInjectionStatus {
+                id: "security-warning-shield".to_string(),
+                status: "inactive".to_string(),
+                detail: Some("控制器已就绪，当前屏蔽策略关闭".to_string()),
+                error: None,
+            },
         ];
 
         let statuses = reconcile_injection_statuses(&prepared.descriptors, reported);
@@ -1259,14 +1743,14 @@ mod tests {
         assert_eq!(statuses[0].id, "bridge-helpers");
         assert_eq!(statuses[0].status, "effective");
         assert_eq!(statuses[0].detail.as_deref(), Some("桥接函数可调用"));
-        assert_eq!(statuses[1].id, "fast-startup-shield");
+        assert_eq!(statuses[1].id, "git-request-guard");
         assert_eq!(statuses[1].status, "unknown");
-        assert_eq!(statuses[2].id, "git-request-guard");
+        assert_eq!(statuses[2].id, "windows-wmi-sampler");
         assert_eq!(statuses[2].status, "unknown");
-        assert_eq!(statuses[3].id, "windows-wmi-sampler");
+        assert_eq!(statuses[3].id, "model-whitelist");
         assert_eq!(statuses[3].status, "unknown");
-        assert_eq!(statuses[4].id, "model-whitelist");
-        assert_eq!(statuses[4].status, "unknown");
+        assert_eq!(statuses[5].id, "security-warning-shield");
+        assert_eq!(statuses[5].status, "inactive");
         assert_eq!(
             statuses.last().map(|status| status.id.as_str()),
             Some("user-script-1")
@@ -1287,10 +1771,7 @@ mod tests {
 
     #[test]
     fn failed_settings_overlay_bundle_restores_the_lazy_loader() {
-        let script = settings_overlay_load_script(
-            "throw new Error('bundle failed');",
-            ".semi-button { color: red; }",
-        );
+        let script = settings_overlay_load_script("throw new Error('bundle failed');");
 
         let delete_index = script
             .find("delete window.__codeySettingsOverlay")
@@ -1301,6 +1782,5 @@ mod tests {
 
         assert!(restore_index > delete_index);
         assert!(script.contains("if (ready) return \"\""));
-        assert!(script.contains("delete window.__codeyComponentStyles"));
     }
 }

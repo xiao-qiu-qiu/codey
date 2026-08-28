@@ -1,12 +1,26 @@
 use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 pub(crate) fn timestamp_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// 小写十六进制 SHA-256。此前 subagent_gate、subagent_orchestrator、
+/// session_index_cleanup 各有一份逐字节相同的实现。
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// 与目标同目录的一次性临时文件名。随机 UUID 保证同一进程、同一毫秒内的
@@ -40,6 +54,67 @@ pub(crate) fn persist_temp_file(temp: &Path, destination: &Path) -> std::io::Res
             Err(error)
         }
     }
+}
+
+fn atomic_write_with(
+    destination: &Path,
+    write_temp: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let temp = unique_temp_path(destination);
+    if let Err(error) = write_temp(&temp) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    persist_temp_file(&temp, destination)
+}
+
+pub(crate) fn atomic_write(destination: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_with(destination, |temp| fs::write(temp, bytes))?;
+    Ok(())
+}
+
+pub(crate) fn atomic_write_private(destination: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_with(destination, |temp| {
+        #[cfg(unix)]
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(temp)?;
+            file.write_all(bytes)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(not(unix))]
+        fs::write(temp, bytes)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn atomic_write_private_with_parent(
+    destination: &Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", destination.display()))?;
+    fs::create_dir_all(parent)?;
+    atomic_write_private(destination, bytes)
+}
+
+pub(crate) fn atomic_write_preserving_permissions(
+    destination: &Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    atomic_write_with(destination, |temp| {
+        fs::write(temp, bytes)?;
+        if let Ok(metadata) = fs::metadata(destination) {
+            fs::set_permissions(temp, metadata.permissions())?;
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -83,5 +158,42 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert!(!temp.exists());
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn atomic_write_replaces_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("state.json");
+        fs::write(&destination, b"old").unwrap();
+
+        atomic_write(&destination, b"new").unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_atomic_write_uses_private_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("secret.json");
+
+        atomic_write_private(&destination, b"secret").unwrap();
+
+        let mode = fs::metadata(destination).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_can_preserve_existing_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("state.json");
+        fs::write(&destination, b"old").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+
+        atomic_write_preserving_permissions(&destination, b"new").unwrap();
+
+        let mode = fs::metadata(destination).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
     }
 }

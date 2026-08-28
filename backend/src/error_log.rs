@@ -1,10 +1,12 @@
-use std::fs::OpenOptions;
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use anyhow::Context;
 use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat, Utc};
@@ -14,11 +16,23 @@ use serde_json::Value;
 const ERROR_LOG_FILE: &str = "codey-errors.log";
 const ERROR_LOG_HELPER_ARGUMENT: &str = "--codey-record-error";
 const MAX_HELPER_INPUT_BYTES: u64 = 1024 * 1024;
+const MAX_HELPER_RECORDS: usize = 64;
+const MAX_LOG_FIELD_BYTES: usize = 8 * 1024;
+const MAX_LOG_ERROR_BYTES: usize = 16 * 1024;
+const MAX_LOG_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_LOG_CONTEXT_DEPTH: usize = 12;
+const MAX_LOG_COLLECTION_ITEMS: usize = 128;
+const MAX_LOG_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const REDACTED_VALUE: &str = "[REDACTED]";
+const TRUNCATED_VALUE: &str = "[TRUNCATED]";
 const BEIJING_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+const FAILURE_DEDUP_WINDOW: Duration = Duration::from_secs(600);
+const FAILURE_DEDUP_MAX_KEYS: usize = 64;
 static ERROR_LOG_WRITER: OnceLock<Mutex<ErrorLogWriter>> = OnceLock::new();
 static PANIC_LOG_HOOK: OnceLock<()> = OnceLock::new();
+static FAILURE_DEDUP: OnceLock<Mutex<FailureDedupCache>> = OnceLock::new();
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ErrorVersions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,7 +56,7 @@ impl ErrorVersions {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ErrorRecord {
     timestamp: String,
@@ -60,10 +74,86 @@ struct ErrorRecord {
     context: Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ErrorHelperInput {
+    Record(Box<ErrorRecord>),
+    Batch(Vec<ErrorRecord>),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FailureMetadata {
     pub stage: Option<String>,
     pub recoverable: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FailureDedupKey {
+    event: String,
+    operation: String,
+    error: String,
+}
+
+#[derive(Debug)]
+struct FailureDedupEntry {
+    last_emitted: Instant,
+    suppressed: u64,
+}
+
+#[derive(Debug, Default)]
+struct FailureDedupCache {
+    entries: HashMap<FailureDedupKey, FailureDedupEntry>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FailureDedupDecision {
+    Emit { suppressed: u64 },
+    Suppress,
+}
+
+impl FailureDedupCache {
+    // A watchdog on a stuck renderer otherwise appends the identical record
+    // every cycle for the whole session. Repeats inside the window are counted
+    // and folded into the next emitted record as `suppressedRepeats`.
+    fn decide(&mut self, key: FailureDedupKey, now: Instant) -> FailureDedupDecision {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if now.duration_since(entry.last_emitted) < FAILURE_DEDUP_WINDOW {
+                entry.suppressed = entry.suppressed.saturating_add(1);
+                return FailureDedupDecision::Suppress;
+            }
+            let suppressed = entry.suppressed;
+            entry.last_emitted = now;
+            entry.suppressed = 0;
+            return FailureDedupDecision::Emit { suppressed };
+        }
+        if self.entries.len() >= FAILURE_DEDUP_MAX_KEYS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_emitted)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            key,
+            FailureDedupEntry {
+                last_emitted: now,
+                suppressed: 0,
+            },
+        );
+        FailureDedupDecision::Emit { suppressed: 0 }
+    }
+}
+
+fn failure_dedup_decide(key: FailureDedupKey) -> FailureDedupDecision {
+    FAILURE_DEDUP
+        .get_or_init(|| Mutex::new(FailureDedupCache::default()))
+        .lock()
+        .map(|mut cache| cache.decide(key, Instant::now()))
+        // Logging must never be lost just because the dedup lock is poisoned.
+        .unwrap_or(FailureDedupDecision::Emit { suppressed: 0 })
 }
 
 fn beijing_offset() -> FixedOffset {
@@ -131,6 +221,309 @@ fn normalize_record(record: &mut ErrorRecord) {
         .node
         .take()
         .or_else(|| take_context_version(&mut record.context, "nodeVersion"));
+    sanitize_record(record);
+}
+
+fn sanitize_record(record: &mut ErrorRecord) {
+    sanitize_log_text(&mut record.event, MAX_LOG_FIELD_BYTES);
+    sanitize_log_text(&mut record.operation, MAX_LOG_FIELD_BYTES);
+    sanitize_log_text(&mut record.error, MAX_LOG_ERROR_BYTES);
+    if let Some(stage) = &mut record.stage {
+        sanitize_log_text(stage, MAX_LOG_FIELD_BYTES);
+    }
+    for version in [
+        &mut record.versions.codey,
+        &mut record.versions.codex,
+        &mut record.versions.electron,
+        &mut record.versions.chrome,
+        &mut record.versions.node,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        sanitize_log_text(version, 256);
+    }
+    sanitize_context(&mut record.context);
+}
+
+fn sanitize_context(context: &mut Value) {
+    sanitize_json_value(context, 0);
+    let serialized_bytes = serde_json::to_vec(context)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if serialized_bytes > MAX_LOG_CONTEXT_BYTES {
+        *context = serde_json::json!({
+            "contextTruncated": true,
+            "originalBytes": serialized_bytes,
+        });
+    }
+}
+
+fn sanitize_json_value(value: &mut Value, depth: usize) {
+    if depth >= MAX_LOG_CONTEXT_DEPTH {
+        *value = Value::String(TRUNCATED_VALUE.to_string());
+        return;
+    }
+    match value {
+        Value::Object(values) => {
+            if values.len() > MAX_LOG_COLLECTION_ITEMS {
+                let original_len = values.len();
+                let retained = std::mem::take(values)
+                    .into_iter()
+                    .take(MAX_LOG_COLLECTION_ITEMS)
+                    .collect();
+                *values = retained;
+                values.insert(
+                    "__codeyTruncatedItems".to_string(),
+                    Value::from(original_len - MAX_LOG_COLLECTION_ITEMS),
+                );
+            }
+            for (key, value) in values.iter_mut() {
+                if is_sensitive_key(key) {
+                    *value = Value::String(REDACTED_VALUE.to_string());
+                } else {
+                    sanitize_json_value(value, depth + 1);
+                }
+            }
+        }
+        Value::Array(values) => {
+            if values.len() > MAX_LOG_COLLECTION_ITEMS {
+                values.truncate(MAX_LOG_COLLECTION_ITEMS);
+                values.push(serde_json::json!({ "__codeyTruncatedItems": true }));
+            }
+            for value in values {
+                sanitize_json_value(value, depth + 1);
+            }
+        }
+        Value::String(value) => sanitize_log_text(value, MAX_LOG_FIELD_BYTES),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "proxyauthorization"
+            | "apikey"
+            | "xapikey"
+            | "key"
+            | "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "bottoken"
+            | "secret"
+            | "clientsecret"
+            | "password"
+            | "passwd"
+            | "cookie"
+            | "setcookie"
+            | "credential"
+            | "credentials"
+            | "webhook"
+            | "webhookurl"
+    ) || normalized.contains("authorization")
+        || normalized.ends_with("apikey")
+        || normalized.ends_with("token")
+        || normalized.ends_with("secret")
+        || normalized.ends_with("password")
+        || normalized.ends_with("cookie")
+        || normalized.ends_with("credential")
+        || normalized.ends_with("webhookurl")
+}
+
+fn sanitize_log_text(value: &mut String, max_bytes: usize) {
+    *value = redact_embedded_urls(&redact_labeled_secrets(value));
+    truncate_utf8(value, max_bytes);
+}
+
+fn redact_labeled_secrets(input: &str) -> String {
+    let mut value = input.to_string();
+    for label in [
+        "authorization:",
+        "proxy-authorization:",
+        "x-api-key:",
+        "api-key:",
+        "cookie:",
+        "set-cookie:",
+    ] {
+        value = redact_after_label(&value, label, true);
+    }
+    for label in ["bearer ", "basic "] {
+        value = redact_after_label(&value, label, false);
+    }
+    value
+}
+
+fn redact_after_label(input: &str, label: &str, until_line_end: bool) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(relative) = find_ascii_case_insensitive(&input[cursor..], label) {
+        let start = cursor + relative;
+        let value_start = start + label.len();
+        output.push_str(&input[cursor..value_start]);
+        output.push_str(REDACTED_VALUE);
+        let mut end = value_start;
+        for (offset, character) in input[value_start..].char_indices() {
+            let stop = if until_line_end {
+                matches!(character, '\n' | '\r')
+            } else {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        ',' | ';' | '"' | '\'' | '<' | '>' | ')' | ']' | '}'
+                    )
+            };
+            if stop {
+                end = value_start + offset;
+                break;
+            }
+            end = value_start + offset + character.len_utf8();
+        }
+        cursor = end;
+        if cursor == value_start && value_start == input.len() {
+            break;
+        }
+    }
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn find_ascii_case_insensitive(input: &str, needle: &str) -> Option<usize> {
+    let input = input.as_bytes();
+    let needle = needle.as_bytes();
+    input
+        .windows(needle.len())
+        .position(|candidate| candidate.eq_ignore_ascii_case(needle))
+}
+
+fn redact_embedded_urls(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    loop {
+        let http = find_ascii_case_insensitive(&input[cursor..], "http://");
+        let https = find_ascii_case_insensitive(&input[cursor..], "https://");
+        let Some(relative) = [http, https].into_iter().flatten().min() else {
+            output.push_str(&input[cursor..]);
+            break;
+        };
+        let start = cursor + relative;
+        output.push_str(&input[cursor..start]);
+        let mut end = input.len();
+        for (offset, character) in input[start..].char_indices() {
+            if character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>' | '`') {
+                end = start + offset;
+                break;
+            }
+        }
+        let mut candidate_end = end;
+        while candidate_end > start {
+            let Some(character) = input[start..candidate_end].chars().next_back() else {
+                break;
+            };
+            if !matches!(character, ',' | ';' | '.' | ')' | ']' | '}') {
+                break;
+            }
+            candidate_end -= character.len_utf8();
+        }
+        let candidate = &input[start..candidate_end];
+        output.push_str(sanitize_url(candidate).as_deref().unwrap_or(candidate));
+        output.push_str(&input[candidate_end..end]);
+        cursor = end;
+    }
+    output
+}
+
+fn sanitize_url(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value).ok()?;
+    let mut changed = false;
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_password(None);
+        let _ = url.set_username("");
+        changed = true;
+    }
+    let query = url.query_pairs().into_owned().collect::<Vec<_>>();
+    if query.iter().any(|(key, _)| is_sensitive_query_key(key)) {
+        let sanitized = query
+            .into_iter()
+            .map(|(key, value)| {
+                if is_sensitive_query_key(&key) {
+                    (key, "REDACTED".to_string())
+                } else {
+                    (key, value)
+                }
+            })
+            .collect::<Vec<_>>();
+        url.query_pairs_mut().clear().extend_pairs(sanitized);
+        changed = true;
+    }
+    if url.fragment().is_some() {
+        url.set_fragment(Some("REDACTED"));
+        changed = true;
+    }
+    let lower_path = url.path().to_ascii_lowercase();
+    if let Some((index, marker_len)) = lower_path
+        .find("/hook/")
+        .map(|index| (index, "/hook/".len()))
+        .or_else(|| {
+            lower_path
+                .find("/webhook/")
+                .map(|index| (index, "/webhook/".len()))
+        })
+    {
+        let marker_end = index + marker_len;
+        let mut prefix = url.path()[..marker_end].to_string();
+        prefix.push_str("REDACTED");
+        url.set_path(&prefix);
+        changed = true;
+    } else if lower_path.starts_with("/bot") && lower_path.len() > 4 {
+        url.set_path("/botREDACTED");
+        changed = true;
+    }
+    changed.then(|| url.to_string())
+}
+
+fn is_sensitive_query_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "key"
+            | "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "apikey"
+            | "secret"
+            | "password"
+            | "passwd"
+            | "auth"
+            | "authorization"
+            | "signature"
+            | "sig"
+            | "credential"
+            | "code"
+    )
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    const SUFFIX: &str = "…[truncated]";
+    let mut end = max_bytes.saturating_sub(SUFFIX.len()).min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str(SUFFIX);
 }
 
 #[derive(Default)]
@@ -152,7 +545,13 @@ impl ErrorLogWriter {
 
     fn append(&mut self, path: &Path, today: NaiveDate, line: &str) -> std::io::Result<()> {
         with_log_file_lock(path, || {
-            let truncate = file_is_from_different_day(path, today)?;
+            let incoming_bytes = u64::try_from(line.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            let size_limit_reached = fs::metadata(path)
+                .map(|metadata| metadata.len().saturating_add(incoming_bytes) > MAX_LOG_FILE_BYTES)
+                .unwrap_or(false);
+            let truncate = file_is_from_different_day(path, today)? || size_limit_reached;
             if !truncate {
                 repair_incomplete_tail(path)?;
             }
@@ -166,6 +565,8 @@ impl ErrorLogWriter {
                 options.append(true);
             }
             let mut file = options.open(path)?;
+            #[cfg(unix)]
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             let mut complete_line = String::with_capacity(line.len().saturating_add(1));
             complete_line.push_str(line);
             complete_line.push('\n');
@@ -270,22 +671,44 @@ pub fn record_failure_with_metadata(
     context: impl Serialize,
 ) {
     let now = beijing_now();
-    let context = serde_json::to_value(context).unwrap_or_else(|serialization_error| {
+    let mut event = event.into();
+    let mut operation = operation.into();
+    let mut error = error.into();
+    let mut context = serde_json::to_value(context).unwrap_or_else(|serialization_error| {
         serde_json::json!({
             "contextSerializationError": serialization_error.to_string(),
         })
     });
-    let record = ErrorRecord {
+    sanitize_log_text(&mut event, MAX_LOG_FIELD_BYTES);
+    sanitize_log_text(&mut operation, MAX_LOG_FIELD_BYTES);
+    sanitize_log_text(&mut error, MAX_LOG_ERROR_BYTES);
+    sanitize_context(&mut context);
+    match failure_dedup_decide(FailureDedupKey {
+        event: event.clone(),
+        operation: operation.clone(),
+        error: error.clone(),
+    }) {
+        FailureDedupDecision::Suppress => return,
+        FailureDedupDecision::Emit { suppressed } => {
+            if suppressed > 0
+                && let Some(values) = context.as_object_mut()
+            {
+                values.insert("suppressedRepeats".to_string(), Value::from(suppressed));
+            }
+        }
+    }
+    let mut record = ErrorRecord {
         timestamp: format_beijing_timestamp(now),
         platform: std::env::consts::OS.to_string(),
         versions: ErrorVersions::current(),
-        event: event.into(),
-        operation: operation.into(),
-        error: error.into(),
+        event,
+        operation,
+        error,
         stage: metadata.stage,
         recoverable: metadata.recoverable,
         context,
     };
+    sanitize_record(&mut record);
     if let Err(error) = append_record(&record, now.date_naive()) {
         eprintln!("写入 Codey 错误日志失败：{error}");
     }
@@ -419,27 +842,59 @@ pub fn run_helper_if_requested() -> anyhow::Result<bool> {
         u64::try_from(input.len()).unwrap_or(u64::MAX) <= MAX_HELPER_INPUT_BYTES,
         "Codey 错误日志 helper 输入过大"
     );
-    let mut record: ErrorRecord =
-        serde_json::from_str(&input).context("解析 Codey 错误日志 helper 输入失败")?;
-    anyhow::ensure!(
-        !record.event.trim().is_empty()
-            && !record.operation.trim().is_empty()
-            && !record.error.trim().is_empty(),
-        "Codey 错误日志 helper 缺少失败信息"
-    );
-    normalize_record(&mut record);
-    append_record(&record, beijing_now().date_naive()).context("Codey 错误日志 helper 写入失败")?;
+    let records = parse_helper_records(&input)?;
+    append_records(&records, beijing_now().date_naive())
+        .context("Codey 错误日志 helper 写入失败")?;
     Ok(true)
 }
 
+fn parse_helper_records(input: &str) -> anyhow::Result<Vec<ErrorRecord>> {
+    let input: ErrorHelperInput =
+        serde_json::from_str(input).context("解析 Codey 错误日志 helper 输入失败")?;
+    let mut records = match input {
+        ErrorHelperInput::Record(record) => vec![*record],
+        ErrorHelperInput::Batch(records) => records,
+    };
+    anyhow::ensure!(!records.is_empty(), "Codey 错误日志 helper 批次为空");
+    anyhow::ensure!(
+        records.len() <= MAX_HELPER_RECORDS,
+        "Codey 错误日志 helper 批次过大"
+    );
+    for (index, record) in records.iter_mut().enumerate() {
+        anyhow::ensure!(
+            !record.event.trim().is_empty()
+                && !record.operation.trim().is_empty()
+                && !record.error.trim().is_empty(),
+            "Codey 错误日志 helper 第 {} 条记录缺少失败信息",
+            index + 1
+        );
+        normalize_record(record);
+    }
+    Ok(records)
+}
+
 fn append_record(record: &ErrorRecord, today: NaiveDate) -> anyhow::Result<()> {
-    let line = serde_json::to_string(record).context("序列化 Codey 错误日志失败")?;
+    append_records(std::slice::from_ref(record), today)
+}
+
+fn append_records(records: &[ErrorRecord], today: NaiveDate) -> anyhow::Result<()> {
+    anyhow::ensure!(!records.is_empty(), "Codey 错误日志批次为空");
+    let lines = records
+        .iter()
+        .cloned()
+        .map(|mut record| {
+            sanitize_record(&mut record);
+            serde_json::to_string(&record)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .context("序列化 Codey 错误日志失败")?
+        .join("\n");
     let path = error_log_path();
     let writer = ERROR_LOG_WRITER.get_or_init(|| Mutex::new(ErrorLogWriter));
     writer
         .lock()
         .map_err(|_| anyhow::anyhow!("Codey error log lock is poisoned"))?
-        .append(&path, today, &line)
+        .append(&path, today, &lines)
         .map_err(anyhow::Error::from)
 }
 
@@ -463,6 +918,136 @@ fn file_is_from_different_day(path: &Path, today: NaiveDate) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recursive_log_sanitization_removes_credentials_and_url_secrets() {
+        let mut context = serde_json::json!({
+            "authorization": "Bearer authorization-secret",
+            "nested": {
+                "apiKey": "api-key-secret",
+                "tokenCount": 42,
+                "url": "https://user:password@example.com/open-apis/bot/v2/hook/hook-secret?token=query-secret&mode=safe#fragment-secret",
+                "message": "request failed with Bearer bearer-secret",
+                "webhookUrl": "https://example.com/hook/field-secret"
+            }
+        });
+
+        sanitize_context(&mut context);
+        let serialized = serde_json::to_string(&context).unwrap();
+
+        for secret in [
+            "authorization-secret",
+            "api-key-secret",
+            "user",
+            "password",
+            "hook-secret",
+            "query-secret",
+            "fragment-secret",
+            "bearer-secret",
+            "field-secret",
+        ] {
+            assert!(!serialized.contains(secret), "secret leaked: {secret}");
+        }
+        assert_eq!(context["nested"]["tokenCount"], 42);
+        assert!(serialized.contains("mode=safe"));
+        assert!(serialized.contains("REDACTED"));
+    }
+
+    #[test]
+    fn log_text_sanitization_handles_headers_and_embedded_urls() {
+        let mut message = "Authorization: Bearer header-secret\nrequest https://name:pass@example.com/v1?api_key=url-secret&debug=1 failed"
+            .to_string();
+
+        sanitize_log_text(&mut message, MAX_LOG_ERROR_BYTES);
+
+        assert!(!message.contains("header-secret"));
+        assert!(!message.contains("name:pass"));
+        assert!(!message.contains("url-secret"));
+        assert!(message.contains("debug=1"));
+    }
+
+    #[test]
+    fn log_fields_and_context_have_bounded_sizes() {
+        let mut field = "界".repeat(MAX_LOG_FIELD_BYTES);
+        sanitize_log_text(&mut field, MAX_LOG_FIELD_BYTES);
+        assert!(field.len() <= MAX_LOG_FIELD_BYTES);
+        assert!(field.ends_with("[truncated]"));
+
+        let mut context = serde_json::json!({
+            "items": (0..32)
+                .map(|_| "x".repeat(MAX_LOG_FIELD_BYTES))
+                .collect::<Vec<_>>()
+        });
+        sanitize_context(&mut context);
+        assert_eq!(context["contextTruncated"], true);
+        assert!(serde_json::to_vec(&context).unwrap().len() < MAX_LOG_CONTEXT_BYTES);
+    }
+
+    #[test]
+    fn repeated_failures_are_suppressed_within_the_dedup_window() {
+        let mut cache = FailureDedupCache::default();
+        let key = || FailureDedupKey {
+            event: "injection_health_check_failed".to_string(),
+            operation: "check_cdp_bridge_health".to_string(),
+            error: "timed out waiting for CDP command".to_string(),
+        };
+        let start = Instant::now();
+
+        assert_eq!(
+            cache.decide(key(), start),
+            FailureDedupDecision::Emit { suppressed: 0 }
+        );
+        for step in 1..=3_u64 {
+            assert_eq!(
+                cache.decide(key(), start + Duration::from_secs(35 * step)),
+                FailureDedupDecision::Suppress
+            );
+        }
+        assert_eq!(
+            cache.decide(key(), start + FAILURE_DEDUP_WINDOW + Duration::from_secs(1)),
+            FailureDedupDecision::Emit { suppressed: 3 }
+        );
+        // The counter resets after an emit, so the cadence stays one record
+        // per window no matter how long the renderer stays stuck.
+        assert_eq!(
+            cache.decide(key(), start + FAILURE_DEDUP_WINDOW + Duration::from_secs(2)),
+            FailureDedupDecision::Suppress
+        );
+    }
+
+    #[test]
+    fn dedup_cache_evicts_the_oldest_key_when_full() {
+        let mut cache = FailureDedupCache::default();
+        let start = Instant::now();
+        for index in 0..FAILURE_DEDUP_MAX_KEYS {
+            let key = FailureDedupKey {
+                event: format!("event-{index}"),
+                operation: "op".to_string(),
+                error: "err".to_string(),
+            };
+            assert_eq!(
+                cache.decide(key, start + Duration::from_secs(index as u64)),
+                FailureDedupDecision::Emit { suppressed: 0 }
+            );
+        }
+
+        let extra = FailureDedupKey {
+            event: "extra".to_string(),
+            operation: "op".to_string(),
+            error: "err".to_string(),
+        };
+        assert_eq!(
+            cache.decide(extra, start + Duration::from_secs(999)),
+            FailureDedupDecision::Emit { suppressed: 0 }
+        );
+        assert_eq!(cache.entries.len(), FAILURE_DEDUP_MAX_KEYS);
+        let evicted = FailureDedupKey {
+            event: "event-0".to_string(),
+            operation: "op".to_string(),
+            error: "err".to_string(),
+        };
+        assert!(!cache.entries.contains_key(&evicted));
+    }
 
     #[test]
     fn path_uses_codey_state_directory() {
@@ -508,6 +1093,51 @@ mod tests {
         assert!(value.get("durationMs").is_none());
         assert!(value.get("attempts").is_none());
         assert!(value.get("timeoutMs").is_none());
+    }
+
+    #[test]
+    fn helper_accepts_and_normalizes_a_failure_batch() {
+        let records = parse_helper_records(
+            &serde_json::json!([
+                {
+                    "timestamp": "2026-08-18T09:36:53Z",
+                    "platform": "windows",
+                    "event": "patch_failed",
+                    "operation": "renderer_patch:model allowlist",
+                    "error": "gate matched 0 times"
+                },
+                {
+                    "timestamp": "2026-08-18T09:36:54Z",
+                    "platform": "windows",
+                    "event": "patch_failed",
+                    "operation": "renderer_patch:model visibility",
+                    "error": "gate matched 0 times"
+                }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].timestamp, "2026-08-18T17:36:53+08:00");
+        assert_eq!(
+            records[1].versions.codey.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn helper_rejects_empty_and_oversized_batches() {
+        assert!(parse_helper_records("[]").is_err());
+        let record = serde_json::json!({
+            "timestamp": "2026-08-18T09:36:53Z",
+            "platform": "windows",
+            "event": "patch_failed",
+            "operation": "renderer_patch:test",
+            "error": "gate matched 0 times"
+        });
+        let oversized = Value::Array(vec![record; MAX_HELPER_RECORDS + 1]).to_string();
+        assert!(parse_helper_records(&oversized).is_err());
     }
 
     #[test]
@@ -593,6 +1223,22 @@ mod tests {
         writer
             .append(&path, next_day, r#"{"error":"new"}"#)
             .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "{\"error\":\"new\"}\n"
+        );
+    }
+
+    #[test]
+    fn same_day_log_restarts_when_the_file_size_cap_is_reached() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(ERROR_LOG_FILE);
+        std::fs::write(&path, vec![b'x'; MAX_LOG_FILE_BYTES as usize]).unwrap();
+        let today = beijing_now().date_naive();
+        let mut writer = ErrorLogWriter;
+
+        writer.append(&path, today, r#"{"error":"new"}"#).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),

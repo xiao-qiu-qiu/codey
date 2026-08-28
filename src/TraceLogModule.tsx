@@ -11,15 +11,15 @@ import {
   IconTrash as Trash2,
 } from "@tabler/icons-react";
 
-import { Badge, Button, Card } from "./components/semi";
+import { Badge, Button, Card } from "./components/mantine";
 import { formatBytes } from "./formatters";
 import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
+import { surfaceCardPaddingClass } from "./uiClasses";
 
 type TraceLogModuleProps = {
   stats?: TraceLogStats;
   crashpadStats?: CrashpadPendingStats;
   crashpadSupported: boolean;
-  snapshotStale: boolean;
   traceProtectionEnabled: boolean;
   crashpadProtectionEnabled: boolean;
   clearBusy: boolean;
@@ -65,7 +65,6 @@ function TraceLogModuleComponent({
   stats,
   crashpadStats,
   crashpadSupported,
-  snapshotStale,
   traceProtectionEnabled,
   crashpadProtectionEnabled,
   clearBusy,
@@ -101,14 +100,18 @@ function TraceLogModuleComponent({
   return (
     <section className="trace-section" aria-labelledby="trace-title">
       <div className="section-title compact trace-section-title">
-        <div>
-          <span className="section-kicker">Diagnostics</span>
-          <h2 id="trace-title">诊断存储保护</h2>
-          <p>
-            {crashpadSupported
-              ? "Trace 数据库 · Crashpad 待处理报告"
-              : "Trace 数据库写盘与占用分析"}
-          </p>
+        <div className="section-heading">
+          <span className="section-icon" aria-hidden="true">
+            <Archive size={15} />
+          </span>
+          <div>
+            <h2 id="trace-title">诊断存储保护</h2>
+            <p>
+              {crashpadSupported
+                ? "Trace 数据库 · Crashpad 待处理报告"
+                : "Trace 数据库写盘与占用分析"}
+            </p>
+          </div>
         </div>
         <div className="trace-module-actions">
           <Badge
@@ -135,18 +138,17 @@ function TraceLogModuleComponent({
             disabled={disabled}
             onClick={onRefresh}
           >
-            <RefreshCw className={loading ? "spinner" : ""} aria-hidden="true" />
+            <RefreshCw className={loading ? "animate-spin" : ""} aria-hidden="true" />
             刷新统计
           </Button>
           <Button
-            className="trace-clear-button"
-            variant="destructive"
+            variant="destructive-light"
             size="sm"
             disabled={disabled}
             onClick={onClear}
           >
             {clearBusy
-              ? <LoaderCircle className="spinner" aria-hidden="true" />
+              ? <LoaderCircle className="animate-spin" aria-hidden="true" />
               : <Trash2 aria-hidden="true" />}
             清理诊断存储
           </Button>
@@ -154,7 +156,7 @@ function TraceLogModuleComponent({
       </div>
 
       <Card
-        className={`trace-card${hasSnapshot ? "" : " trace-card-empty"}`}
+        className={`trace-card ${surfaceCardPaddingClass}${hasSnapshot ? "" : " trace-card-empty"}`}
         aria-busy={loading}
       >
         {!hasSnapshot ? (
@@ -163,7 +165,7 @@ function TraceLogModuleComponent({
               <div className="trace-empty-badge">
                 <span className="trace-empty-icon">
                   {loading
-                    ? <LoaderCircle className="spinner" size={28} aria-hidden="true" />
+                    ? <LoaderCircle className="animate-spin" size={28} aria-hidden="true" />
                     : <RefreshCw size={26} aria-hidden="true" />}
                 </span>
               </div>
@@ -189,11 +191,10 @@ function TraceLogModuleComponent({
                   size="default"
                   disabled={disabled}
                   onClick={onRefresh}
-                  className="trace-start-btn"
                 >
                   {loading ? (
                     <>
-                      <LoaderCircle className="spinner" aria-hidden="true" />
+                      <LoaderCircle className="animate-spin" aria-hidden="true" />
                       扫描分析中…
                     </>
                   ) : (
@@ -226,14 +227,11 @@ function TraceLogModuleComponent({
               </div>
               <Badge
                 variant={
-                  warningCount ||
-                  snapshotStale ||
-                  crashpadSnapshot?.overLimit
+                  warningCount || crashpadSnapshot?.overLimit
                     ? "warning"
                     : "secondary"
                 }
               >
-                {snapshotStale ? "清理前快照 · " : ""}
                 {formatSnapshotTime(capturedAt)}
               </Badge>
             </div>

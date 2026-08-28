@@ -1,7 +1,10 @@
 import { useId, type ComponentType, type SVGProps } from "react";
+import { IconBrandWechat } from "@tabler/icons-react";
 
 import { FeishuChannelEditor } from "./FeishuChannelEditor";
 import { TelegramChannelEditor } from "./TelegramChannelEditor";
+import { WechatClawChannelEditor } from "./WechatClawChannelEditor";
+import { WecomChannelEditor } from "./WecomChannelEditor";
 import type {
   NotificationChannel,
   NotificationChannelEditorProps,
@@ -82,6 +85,14 @@ function TelegramIcon({
   );
 }
 
+function WecomIcon(props: NotificationChannelIconProps) {
+  return <IconBrandWechat {...props} color="#07c160" />;
+}
+
+function WechatClawIcon(props: NotificationChannelIconProps) {
+  return <IconBrandWechat {...props} color="#07c160" />;
+}
+
 const CHANNEL_DEFINITIONS: Record<
   NotificationChannelKind,
   NotificationChannelDefinition
@@ -98,6 +109,18 @@ const CHANNEL_DEFINITIONS: Record<
     isConfigured: (channel) =>
       Boolean(channel.url.trim() || channel.urlConfigured),
   },
+  wecom: {
+    kind: "wecom",
+    addLabel: "企业微信",
+    displayName: "企业微信机器人",
+    title: "企业微信机器人 Webhook",
+    description: "发送完成、失败和等待介入提醒",
+    iconClassName: "wecom",
+    Icon: WecomIcon,
+    Editor: WecomChannelEditor,
+    isConfigured: (channel) =>
+      Boolean(channel.url.trim() || channel.urlConfigured),
+  },
   telegram: {
     kind: "telegram",
     addLabel: "Telegram",
@@ -110,6 +133,24 @@ const CHANNEL_DEFINITIONS: Record<
     isConfigured: (channel) =>
       Boolean(
         (channel.botToken.trim() || channel.botTokenConfigured) &&
+          channel.chatId.trim(),
+      ),
+  },
+  wechatClaw: {
+    kind: "wechatClaw",
+    addLabel: "微信 ClawBot",
+    displayName: "微信 ClawBot",
+    title: "微信 ClawBot 通知",
+    description: "扫码绑定后，把任务状态直接发送到个人微信",
+    iconClassName: "wecom",
+    Icon: WechatClawIcon,
+    Editor: WechatClawChannelEditor,
+    isConfigured: (channel) =>
+      Boolean(
+        channel.sessionStatus !== "expired" &&
+          (channel.botToken.trim() || channel.botTokenConfigured) &&
+          (channel.contextToken.trim() || channel.contextTokenConfigured) &&
+          (channel.url.trim() || channel.urlConfigured) &&
           channel.chatId.trim(),
       ),
   },
@@ -141,6 +182,11 @@ export function createNotificationChannel(
     botToken: "",
     botTokenConfigured: false,
     clearBotToken: false,
+    contextToken: "",
+    contextTokenConfigured: false,
+    clearContextToken: false,
+    getUpdatesBuf: "",
     chatId: "",
+    sessionStatus: "active",
   };
 }

@@ -38,7 +38,7 @@ test("every shutdown path reaps Codex and Codey process trees", async () => {
   const launcherModules = `${launcher}\n${launcherProcess}\n${launcherPlatform}`;
 
   const finalShutdown = library.slice(
-    library.indexOf("let shutdown_reason = 'runtime: loop"),
+    library.indexOf("let shutdown_reason = match"),
     library.indexOf("cleanup.map_err"),
   );
   assert.match(finalShutdown, /stop_runtime_with_retry\(&state\)\.await/);
@@ -115,7 +115,7 @@ test("startup stops the old Codex before permanent session maintenance", async (
 
   assert.notEqual(stopOldCodex, -1);
   assert.notEqual(permanentMaintenance, -1);
-  assert.notEqual(protocolProxy, -1);
+  assert.equal(protocolProxy, -1);
   assert.ok(
     stopOldCodex < permanentMaintenance,
     "the old Codex writer must stop before session files are maintained",

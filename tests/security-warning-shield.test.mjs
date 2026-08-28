@@ -3,41 +3,23 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const root = new URL("../", import.meta.url);
 const [bridgeSource, source] = await Promise.all([
   readFile(new URL("public/codey-bridge.js", root), "utf8"),
   readFile(new URL("public/security-warning-shield.js", root), "utf8"),
 ]);
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(tagName = "div", text = "") {
-    this.attributes = new Map();
-    this.children = [];
-    this.disabled = false;
-    this.isConnected = true;
-    this.parentElement = null;
-    this.style = {
-      setProperty: (name, value, priority) => {
-        this.style[name] = `${value}:${priority}`;
-      },
-    };
-    this.tagName = tagName.toUpperCase();
+    super(tagName, { connected: true });
     this.textContent = text;
     this.clicks = 0;
   }
 
-  appendChild(child) {
-    child.parentElement = this;
-    this.children.push(child);
-    return child;
-  }
-
   click() {
     this.clicks += 1;
-  }
-
-  getAttribute(name) {
-    return this.attributes.get(name) ?? null;
   }
 
   matches(selector) {
@@ -57,25 +39,13 @@ class FakeElement {
     visit(this);
     return matches;
   }
-
-  closest(selector) {
-    let node = this;
-    while (node) {
-      if (node.matches(selector)) return node;
-      node = node.parentElement;
-    }
-    return null;
-  }
-
-  setAttribute(name, value) {
-    this.attributes.set(name, String(value));
-  }
 }
 
 function createRuntime(config) {
   const html = new FakeElement("html");
   const body = html.appendChild(new FakeElement("body"));
   const listeners = new Map();
+  const statusEvents = [];
   let mutationCallback = null;
   const document = {
     body,
@@ -84,7 +54,20 @@ function createRuntime(config) {
   };
   const window = {
     __codexSessionDeleteBridge: async () => config,
+    __codeyInjectionStatus: {
+      "security-warning-shield": { status: "executed", detail: null, error: null },
+    },
     addEventListener: (name, listener) => listeners.set(name, listener),
+    CustomEvent: class {
+      constructor(type, init = {}) {
+        this.type = type;
+        this.detail = init.detail;
+      }
+    },
+    dispatchEvent: (event) => {
+      statusEvents.push(event);
+      return true;
+    },
     setTimeout: (callback) => {
       callback();
       return 1;
@@ -110,6 +93,7 @@ function createRuntime(config) {
   return {
     body,
     listeners,
+    statusEvents,
     get mutationCallback() {
       return mutationCallback;
     },
@@ -135,6 +119,26 @@ function appendPersistentEnglishWarning(body) {
   return { button, warning };
 }
 
+function appendCurrentSessionWarning(body) {
+  const warning = body.appendChild(new FakeElement(
+    "section",
+    "Full access is on ChatGPT can edit any file and run commands with internet access without your approval. This increases the risk of data loss, exposed information, and unexpected changes.",
+  ));
+  const button = warning.appendChild(new FakeElement("button", ""));
+  button.setAttribute("aria-label", "Dismiss Full access warning for this session");
+  return { button, warning };
+}
+
+function appendCurrentChineseWarning(body) {
+  const warning = body.appendChild(new FakeElement(
+    "aside",
+    "完整访问权限已开启 ChatGPT 可以在未经你批准的情况下编辑任何文件，并通过互联网访问权限运行命令。这会增加数据丢失、信息暴露和意外更改的风险。了解更多关于风险升高的信息。",
+  ));
+  warning.setAttribute("role", "status");
+  const button = warning.appendChild(new FakeElement("button", "不再显示"));
+  return { button, warning };
+}
+
 test("full-access warning shield is opt-in and persisted by Codey settings", async () => {
   const [sectionsSource, configSource, commandSource, cdpSource] = await Promise.all([
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
@@ -157,6 +161,10 @@ test("disabled shield preserves the native full-access warning", async () => {
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(runtime.window.__codeySecurityWarningShield.enabled, false);
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["security-warning-shield"].status,
+    "inactive",
+  );
   assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
   assert.equal(button.clicks, 0);
   assert.equal(warning.style.display, undefined);
@@ -168,6 +176,10 @@ test("enabled shield dismisses a verified full-access warning once", async () =>
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(button.clicks, 1);
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["security-warning-shield"].status,
+    "effective",
+  );
   assert.equal(warning.style.display, "none:important");
   assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
   assert.equal(button.clicks, 1);
@@ -178,6 +190,28 @@ test("enabled shield dismisses the persistent full-access warning", async () => 
   const { button, warning } = appendPersistentEnglishWarning(runtime.body);
   await new Promise((resolve) => setImmediate(resolve));
 
+  assert.equal(button.clicks, 1);
+  assert.equal(warning.style.display, "none:important");
+  assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
+});
+
+test("enabled shield dismisses the current icon-only session warning", async () => {
+  const runtime = createRuntime({ hideFullAccessWarning: true });
+  const { button, warning } = appendCurrentSessionWarning(runtime.body);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(button.textContent, "");
+  assert.equal(button.clicks, 1);
+  assert.equal(warning.style.display, "none:important");
+  assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
+});
+
+test("enabled shield dismisses the current Chinese full-access callout", async () => {
+  const runtime = createRuntime({ hideFullAccessWarning: true });
+  const { button, warning } = appendCurrentChineseWarning(runtime.body);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(warning.getAttribute("role"), "status");
   assert.equal(button.clicks, 1);
   assert.equal(warning.style.display, "none:important");
   assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
@@ -212,8 +246,27 @@ test("unrelated session controls are never clicked", async () => {
     "Session preferences without your permission",
   ));
   const button = panel.appendChild(new FakeElement("button", "Hide from this session"));
+  const iconButton = panel.appendChild(new FakeElement("button", ""));
+  iconButton.setAttribute("aria-label", "Dismiss Full access warning for this session");
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
   assert.equal(button.clicks, 0);
+  assert.equal(iconButton.clicks, 0);
+});
+
+test("config changes publish the shield's current injection status", async () => {
+  const runtime = createRuntime({ hideFullAccessWarning: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  const configListener = runtime.listeners.get("codey:config-changed");
+  configListener({ detail: { config: { hideFullAccessWarning: true } } });
+
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["security-warning-shield"].status,
+    "effective",
+  );
+  assert.deepEqual(
+    { ...runtime.statusEvents.at(-1).detail },
+    { id: "security-warning-shield", status: "effective" },
+  );
 });

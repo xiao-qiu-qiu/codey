@@ -3,34 +3,62 @@
   window.__codeySecurityWarningShieldInstalled = true;
 
   const configEventName = "codey:config-changed";
+  const injectionStatusId = "security-warning-shield";
+  const injectionStatusChangedEvent = "codey-injection-status-changed";
   const dismissedAttribute = "data-codey-security-warning-dismissed";
   const actionPatterns = [
     /^hide from this session$/i,
+    /^dismiss full access warning for this session$/i,
     /^don['’]t show again$/i,
     /^(?:在|于)?本次会话(?:中)?(?:隐藏|不再显示)$/,
     /^(?:隐藏|不再显示)(?:本次会话)?$/,
   ];
   const titlePatterns = [
     /full access is on/i,
-    /完全访问权限.*(?:已开启|开启中|已打开)/,
+    /完(?:全|整)访问权限.*(?:已开启|开启中|已打开)/,
   ];
   const riskPatterns = [
     /without your permission/i,
     /without your approval/i,
     /risk of data loss/i,
     /prompt injection/i,
-    /未经(?:你|您)的许可/,
+    /未经(?:你|您)(?:的)?(?:许可|批准)/,
+    /数据丢失/,
     /提示词?注入/,
   ];
   let enabled = false;
   let scanTimer = 0;
   let unsubscribeMutations = null;
 
-  // innerText forces a layout flush; the action labels this shield matches are
-  // plain text nodes, so textContent is both sufficient and layout-free.
-  const normalizedText = (element) => String(
-    element?.textContent || "",
-  ).replace(/\s+/g, " ").trim();
+  const publishInjectionStatus = () => {
+    const entry = window.__codeyInjectionStatus?.[injectionStatusId];
+    if (!entry || entry.status === "pending") return;
+    const status = enabled ? "effective" : "inactive";
+    const detail = enabled
+      ? "安全提示屏蔽已启用"
+      : "控制器已就绪，当前屏蔽策略关闭";
+    if (entry.status === status && entry.detail === detail && !entry.error) return;
+    entry.status = status;
+    entry.detail = detail;
+    entry.error = null;
+    if (
+      typeof window.dispatchEvent === "function"
+      && typeof window.CustomEvent === "function"
+    ) {
+      window.dispatchEvent(new window.CustomEvent(injectionStatusChangedEvent, {
+        detail: { id: injectionStatusId, status },
+      }));
+    }
+  };
+
+  // innerText forces a layout flush. Read visible text and accessible labels
+  // directly so icon-only controls remain layout-free as well.
+  const normalizedValue = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const normalizedText = (element) => normalizedValue(element?.textContent);
+  const normalizedControlLabels = (control) => [
+    control?.getAttribute?.("aria-label"),
+    control?.textContent,
+  ].map(normalizedValue).filter(Boolean);
 
   const matchesAny = (value, patterns) => patterns.some((pattern) => pattern.test(value));
 
@@ -65,7 +93,7 @@
       if (
         control.disabled
         || control.getAttribute?.(dismissedAttribute) === "true"
-        || !matchesAny(normalizedText(control), actionPatterns)
+        || !normalizedControlLabels(control).some((label) => matchesAny(label, actionPatterns))
       ) {
         continue;
       }
@@ -96,6 +124,7 @@
       unsubscribeMutations?.();
       unsubscribeMutations = null;
     }
+    publishInjectionStatus();
     return enabled;
   };
 

@@ -6,6 +6,7 @@ pub(crate) mod codex_home;
 pub(crate) mod codex_local_storage;
 pub mod codex_sqlite;
 mod computer_use_guard;
+pub mod config_manager;
 pub mod diagnostic_log;
 pub(crate) mod http_client;
 pub mod install;
@@ -17,10 +18,7 @@ pub(crate) mod native_menu;
 pub mod paths;
 pub mod plugin_marketplace;
 pub mod ports;
-pub mod protocol_proxy;
 pub mod relay_config;
-pub mod relay_rotation;
-pub mod relay_switch;
 pub mod routes;
 pub mod script_market;
 pub mod settings;
@@ -79,4 +77,12 @@ pub fn windows_terminate_process_if_matches(
         expected_path,
         expected_creation_time,
     )
+}
+
+#[cfg(windows)]
+pub fn windows_terminate_process_if_creation_matches(
+    process_id: u32,
+    expected_creation_time: u64,
+) -> bool {
+    windows_integration::terminate_process_if_creation_matches(process_id, expected_creation_time)
 }

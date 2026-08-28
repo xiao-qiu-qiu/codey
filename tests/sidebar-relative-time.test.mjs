@@ -3,118 +3,35 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const source = readFileSync(new URL("../public/codey-inject.js", import.meta.url), "utf8");
 const vendorSource = readFileSync(
   new URL("../vendor/CodeyRuntime/assets/inject/renderer-inject.js", import.meta.url),
   "utf8",
 );
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(tagName = "div") {
-    this.attributes = new Map();
-    this.children = [];
+    super(tagName);
+    delete this.isConnected;
     this.className = "";
-    this.parentElement = null;
-    this.tagName = String(tagName).toUpperCase();
-    this.textContent = "";
     this.title = "";
     this.attributeWrites = 0;
-    const styleValues = new Map();
-    this.style = {
-      getPropertyValue: (name) => styleValues.get(name) || "",
-      removeProperty: (name) => styleValues.delete(name),
-      setProperty: (name, value) => styleValues.set(name, String(value)),
-    };
-  }
-
-  appendChild(child) {
-    if (child.parentElement) {
-      child.parentElement.children = child.parentElement.children.filter(
-        (candidate) => candidate !== child,
-      );
-    }
-    child.parentElement = this;
-    this.children.push(child);
-    return child;
-  }
-
-  insertBefore(child, reference) {
-    if (child.parentElement) {
-      child.parentElement.children = child.parentElement.children.filter(
-        (candidate) => candidate !== child,
-      );
-    }
-    const referenceIndex = this.children.indexOf(reference);
-    if (referenceIndex < 0) return this.appendChild(child);
-    child.parentElement = this;
-    this.children.splice(referenceIndex, 0, child);
-    return child;
-  }
-
-  getAttribute(name) {
-    return this.attributes.get(name) ?? null;
-  }
-
-  hasAttribute(name) {
-    return this.attributes.has(name);
-  }
-
-  matches(selector) {
-    if (/^[a-z]+$/i.test(selector)) return this.tagName.toLowerCase() === selector.toLowerCase();
-    const classContains = selector.match(/^\[class\*=(['"]?)([^\]'"]+)\1\]$/)?.[2];
-    if (classContains) return String(this.className || "").includes(classContains);
-    const attributeEquals = selector.match(/^\[([^=\]]+)=(['"]?)([^\]'" ]+)\2\]$/);
-    if (attributeEquals) return this.getAttribute(attributeEquals[1]) === attributeEquals[3];
-    const attribute = selector.match(/^\[([^\]]+)\]$/)?.[1];
-    return attribute ? this.hasAttribute(attribute) : false;
-  }
-
-  querySelector(selector) {
-    return this.querySelectorAll(selector)[0] || null;
-  }
-
-  querySelectorAll(selector) {
-    const selectors = selector.split(",").map((candidate) => candidate.trim());
-    const matches = [];
-    const visit = (node) => {
-      node.children.forEach((child) => {
-        if (selectors.some((candidate) => child.matches(candidate))) matches.push(child);
-        visit(child);
-      });
-    };
-    visit(this);
-    return matches;
-  }
-
-  closest(selector) {
-    const selectors = selector.split(",").map((candidate) => candidate.trim());
-    let current = this;
-    while (current) {
-      if (selectors.some((candidate) => current.matches(candidate))) return current;
-      current = current.parentElement;
-    }
-    return null;
-  }
-
-  remove() {
-    if (!this.parentElement) return;
-    this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
-    this.parentElement = null;
-  }
-
-  removeAttribute(name) {
-    this.attributes.delete(name);
   }
 
   setAttribute(name, value) {
     this.attributeWrites += 1;
-    this.attributes.set(name, String(value));
+    super.setAttribute(name, value);
   }
 }
 
 function loadInjection({
   advanceTimeoutClock = false,
+  assetModules = new Map(),
   bridgeHandler,
+  entryScriptUrls = [],
+  fetchHandler,
   now,
   rows = [],
   signalDispatcher,
@@ -137,6 +54,7 @@ function loadInjection({
   const document = {
     body: new FakeElement("body"),
     documentElement: new FakeElement("html"),
+    scripts: entryScriptUrls.map((src) => ({ src })),
     visibilityState: "visible",
     addEventListener() {},
     createElement: (tagName) => new FakeElement(tagName),
@@ -152,12 +70,17 @@ function loadInjection({
   const window = {
     __codexSessionDeleteBridge: bridgeHandler,
     __codeyCodexSignalDispatcher: signalDispatcher,
+    __codeyImportCodexAsset: async (url) => assetModules.get(url),
     addEventListener() {},
     clearTimeout(timeoutId) {
       canceledTimeouts.add(timeoutId);
     },
     dispatchEvent() {},
     localStorage: { length: 0, key: () => null, getItem: () => null, setItem() {} },
+    requestIdleCallback(callback) {
+      callback({ didTimeout: false, timeRemaining: () => 50 });
+      return 1;
+    },
     setInterval: (callback) => {
       intervalCallbacks.push(callback);
       return intervalCallbacks.length;
@@ -173,6 +96,7 @@ function loadInjection({
       return timeoutId;
     },
   };
+  if (fetchHandler) window.fetch = fetchHandler;
   window.window = window;
   const context = {
     console,
@@ -185,6 +109,8 @@ function loadInjection({
       }
       observe() {}
     },
+    performance: { getEntriesByType: () => [] },
+    URL,
     URLSearchParams,
     window,
   };
@@ -198,6 +124,16 @@ function loadInjection({
     notifyMutations: (mutations) => mutationCallback?.(mutations),
     runIntervals: () => intervalCallbacks.forEach((callback) => callback()),
     window,
+  };
+}
+
+function timestampBridge(handler) {
+  return async (path, payload) => {
+    if (path !== "/session/timestamps") return { status: "ok" };
+    return {
+      status: "ok",
+      timestamps: await handler(payload),
+    };
   };
 }
 
@@ -631,18 +567,12 @@ test("refreshes the official timestamp when a running thread completes", async (
   const { window } = loadInjection({
     advanceTimeoutClock: true,
     rows: [running.row],
-    signalDispatcher: async () => {
+    bridgeHandler: timestampBridge(async () => {
       dispatcherCalls += 1;
       return {
-        data: [{
-          id: "thread-running",
-          recencyAt: (
-            dispatcherCalls === 1 ? firstTimestamp : completedTimestamp
-          ) / 1_000,
-        }],
-        nextCursor: null,
+        "thread-running": dispatcherCalls === 1 ? firstTimestamp : completedTimestamp,
       };
-    },
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -679,13 +609,10 @@ test("coalesces sidebar mutations before recomputing React status", async () => 
   });
   const { notifyMutations } = loadInjection({
     rows: [entry.row],
-    signalDispatcher: async () => {
+    bridgeHandler: timestampBridge(async () => {
       dispatcherCalls += 1;
-      return {
-        data: [{ id: "thread-1", updatedAt: 60 }],
-        nextCursor: null,
-      };
-    },
+      return { "thread-1": 60_000 };
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(dispatcherCalls, 1);
@@ -793,10 +720,7 @@ test("keeps an existing thread time when a native completion marker appears", as
   const { window } = loadInjection({
     advanceTimeoutClock: true,
     rows: [row],
-    signalDispatcher: async () => ({
-      data: [{ id: "thread-1", recencyAt: timestamp / 1_000 }],
-      nextCursor: null,
-    }),
+    bridgeHandler: timestampBridge(async () => ({ "thread-1": timestamp })),
   });
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -882,7 +806,7 @@ test("moves a previously appended time before the native trailing rail", () => {
   assert.equal(duplicateLabel.parentElement, null);
 });
 
-test("loads visible thread timestamps through the official app-server list", async () => {
+test("loads visible thread timestamps through the Codey bridge", async () => {
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
   row.setAttribute("data-app-action-sidebar-thread-id", "local:thread-1");
@@ -895,34 +819,16 @@ test("loads visible thread timestamps through the official app-server list", asy
 
   const { document } = loadInjection({
     rows: [row],
-    signalDispatcher: async (signal, request) => {
-      calls.push({ signal, request });
-      return {
-        data: [{
-          id: "thread-1",
-          recencyAt: timestamp / 1_000,
-          updatedAt: Date.now() / 1_000,
-        }],
-        nextCursor: null,
-      };
-    },
+    bridgeHandler: timestampBridge(async (payload) => {
+      calls.push(payload);
+      return { "thread-1": timestamp };
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].signal, "send-cli-request-for-host");
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].request)), {
-    hostId: "local",
-    method: "thread/list",
-    params: {
-      archived: false,
-      cursor: null,
-      limit: 100,
-      modelProviders: null,
-      useStateDbOnly: true,
-    },
-    priority: "background",
-    source: "thread_list",
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0])), {
+    sessionIds: ["thread-1"],
   });
   assert.equal(
     content.querySelector("[data-codey-thread-updated-at]")?.textContent,
@@ -931,7 +837,7 @@ test("loads visible thread timestamps through the official app-server list", asy
   assert.equal(document.threadRowQueries, 1);
 });
 
-test("reads a remote task timestamp from the official React row without a local request", async () => {
+test("reads a remote task timestamp from the official React row without a bridge request", async () => {
   const now = Date.UTC(2026, 7, 10, 12);
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
@@ -957,9 +863,9 @@ test("reads a remote task timestamp from the official React row without a local 
   loadInjection({
     now,
     rows: [row],
-    signalDispatcher: async () => {
+    bridgeHandler: async () => {
       dispatcherCalls += 1;
-      throw new Error("remote tasks must not use the local app-server");
+      throw new Error("remote tasks must not use the local timestamp bridge");
     },
   });
   await new Promise((resolve) => setImmediate(resolve));
@@ -971,7 +877,7 @@ test("reads a remote task timestamp from the official React row without a local 
   );
 });
 
-test("refreshes official metadata on the visible one-minute tick", async () => {
+test("refreshes bridge metadata on the visible one-minute tick", async () => {
   const now = Date.UTC(2026, 7, 10, 12);
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
@@ -984,13 +890,10 @@ test("refreshes official metadata on the visible one-minute tick", async () => {
   const fixture = loadInjection({
     now,
     rows: [row],
-    signalDispatcher: async () => {
+    bridgeHandler: timestampBridge(async () => {
       listCalls += 1;
-      return {
-        data: [{ id: "thread-refresh", recencyAt: timestamp / 1_000 }],
-        nextCursor: null,
-      };
-    },
+      return { "thread-refresh": timestamp };
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(listCalls, 1);
@@ -1026,16 +929,10 @@ test("tracks virtualized sidebar rows discovered after the initial scan", async 
   const fixture = loadInjection({
     now,
     rows,
-    signalDispatcher: async () => {
+    bridgeHandler: timestampBridge(async ({ sessionIds }) => {
       listCalls += 1;
-      return {
-        data: rows.map((row) => {
-          const id = row.getAttribute("data-app-action-sidebar-thread-id");
-          return { id, recencyAt: timestamps.get(id) / 1_000 };
-        }),
-        nextCursor: null,
-      };
-    },
+      return Object.fromEntries(sessionIds.map((id) => [id, timestamps.get(id)]));
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(listCalls, 1);
@@ -1070,166 +967,56 @@ test("tracks virtualized sidebar rows discovered after the initial scan", async 
   assert.equal(fixture.document.threadRowQueries, fullScanQueries);
 });
 
-test("follows official thread list cursors until a visible thread is found", async () => {
-  const row = new FakeElement();
-  row.setAttribute("data-app-action-sidebar-thread-row", "");
-  row.setAttribute("data-app-action-sidebar-thread-id", "thread-older");
-  const content = new FakeElement();
-  content.className = "flex h-full w-full items-center";
-  row.appendChild(content);
-  const cursors = [];
-  const timestamp = Date.now() - 4 * 60 * 60_000;
+for (const { name, visible, batches, minutes } of [
+  {
+    name: "loads forty visible timestamps in one bridge batch",
+    visible: 40,
+    batches: [40],
+    minutes: 9,
+  },
+  {
+    name: "continues timestamp work after the first 200 visible refs",
+    visible: 201,
+    batches: [200, 1],
+    minutes: 11,
+  },
+]) {
+  test(name, async () => {
+    const now = Date.UTC(2026, 7, 10, 12);
+    const entries = Array.from({ length: visible }, (_, index) => {
+      const row = new FakeElement();
+      row.setAttribute("data-app-action-sidebar-thread-row", "");
+      row.setAttribute("data-app-action-sidebar-thread-id", `thread-${index}`);
+      const content = new FakeElement();
+      content.className = "flex h-full w-full items-center";
+      row.appendChild(content);
+      return { content, row };
+    });
+    const requestSizes = [];
 
-  loadInjection({
-    rows: [row],
-    signalDispatcher: async (_signal, request) => {
-      cursors.push(request.params.cursor);
-      if (request.params.cursor == null) {
-        return {
-          data: [{ id: "thread-newer", recencyAt: Date.now() / 1_000 }],
-          nextCursor: "page-2",
-        };
-      }
-      return {
-        data: [{ id: "thread-older", recencyAt: timestamp / 1_000 }],
-        nextCursor: null,
-      };
-    },
+    loadInjection({
+      now,
+      rows: entries.map(({ row }) => row),
+      bridgeHandler: timestampBridge(async ({ sessionIds }) => {
+        requestSizes.push(sessionIds.length);
+        return Object.fromEntries(sessionIds.map((sessionId) => (
+          [sessionId, now - minutes * 60_000]
+        )));
+      }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(requestSizes, batches);
+    entries.forEach(({ content }) => {
+      assert.equal(
+        content.querySelector("[data-codey-thread-updated-at]")?.textContent,
+        `${minutes} 分`,
+      );
+    });
   });
-  await new Promise((resolve) => setImmediate(resolve));
+}
 
-  assert.deepEqual(cursors, [null, "page-2"]);
-  assert.equal(
-    content.querySelector("[data-codey-thread-updated-at]")?.textContent,
-    "4 小时",
-  );
-});
-
-test("bounds thread list pagination and falls back to an exact thread read", async () => {
-  const row = new FakeElement();
-  row.setAttribute("data-app-action-sidebar-thread-row", "");
-  row.setAttribute("data-app-action-sidebar-thread-id", "thread-manual");
-  const content = new FakeElement();
-  content.className = "flex h-full w-full items-center";
-  row.appendChild(content);
-  const timestamp = Date.now() - 5 * 60 * 60_000;
-  let listCalls = 0;
-  let readCalls = 0;
-
-  loadInjection({
-    rows: [row],
-    signalDispatcher: async (_signal, request) => {
-      if (request.method === "thread/read") {
-        readCalls += 1;
-        return {
-          thread: {
-            id: "thread-manual",
-            recencyAt: timestamp / 1_000,
-          },
-        };
-      }
-      listCalls += 1;
-      return {
-        data: [{ id: `unrelated-${listCalls}`, recencyAt: Date.now() / 1_000 }],
-        nextCursor: `page-${listCalls + 1}`,
-      };
-    },
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(listCalls, 5);
-  assert.equal(readCalls, 1);
-  assert.equal(
-    content.querySelector("[data-codey-thread-updated-at]")?.textContent,
-    "5 小时",
-  );
-});
-
-test("drains exact timestamp reads beyond the 32-item batch size", async () => {
-  const now = Date.UTC(2026, 7, 10, 12);
-  const entries = Array.from({ length: 40 }, (_, index) => {
-    const row = new FakeElement();
-    row.setAttribute("data-app-action-sidebar-thread-row", "");
-    row.setAttribute("data-app-action-sidebar-thread-id", `thread-old-${index}`);
-    const content = new FakeElement();
-    content.className = "flex h-full w-full items-center";
-    row.appendChild(content);
-    return { content, row };
-  });
-  let listCalls = 0;
-  let readCalls = 0;
-
-  loadInjection({
-    now,
-    rows: entries.map(({ row }) => row),
-    signalDispatcher: async (_signal, request) => {
-      if (request.method === "thread/read") {
-        readCalls += 1;
-        return {
-          thread: {
-            id: request.params.threadId,
-            recencyAt: (now - 9 * 60_000) / 1_000,
-          },
-        };
-      }
-      listCalls += 1;
-      return {
-        data: [{ id: `unrelated-${listCalls}`, recencyAt: now / 1_000 }],
-        nextCursor: `page-${listCalls + 1}`,
-      };
-    },
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(listCalls, 5);
-  assert.equal(readCalls, 40);
-  entries.forEach(({ content }) => {
-    assert.equal(
-      content.querySelector("[data-codey-thread-updated-at]")?.textContent,
-      "9 分",
-    );
-  });
-});
-
-test("continues timestamp work after the first 200 visible refs", async () => {
-  const now = Date.UTC(2026, 7, 10, 12);
-  const entries = Array.from({ length: 201 }, (_, index) => {
-    const row = new FakeElement();
-    row.setAttribute("data-app-action-sidebar-thread-row", "");
-    row.setAttribute("data-app-action-sidebar-thread-id", `thread-${index}`);
-    const content = new FakeElement();
-    content.className = "flex h-full w-full items-center";
-    row.appendChild(content);
-    return { content, row };
-  });
-  let listCalls = 0;
-
-  loadInjection({
-    now,
-    rows: entries.map(({ row }) => row),
-    signalDispatcher: async () => {
-      listCalls += 1;
-      return {
-        data: entries.map((_, index) => ({
-          id: `thread-${index}`,
-          recencyAt: (now - 11 * 60_000) / 1_000,
-        })),
-        nextCursor: null,
-      };
-    },
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(listCalls, 2);
-  entries.forEach(({ content }) => {
-    assert.equal(
-      content.querySelector("[data-codey-thread-updated-at]")?.textContent,
-      "11 分",
-    );
-  });
-});
-
-test("retries only a failed exact timestamp read", async () => {
+test("does not tight-loop retry a failed timestamp bridge request", async () => {
   const now = Date.UTC(2026, 7, 10, 12);
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
@@ -1237,41 +1024,41 @@ test("retries only a failed exact timestamp read", async () => {
   const content = new FakeElement();
   content.className = "flex h-full w-full items-center";
   row.appendChild(content);
-  let listCalls = 0;
-  let readCalls = 0;
+  let bridgeCalls = 0;
+  let dispatcherCalls = 0;
 
-  loadInjection({
+  const fixture = loadInjection({
     now,
     rows: [row],
-    signalDispatcher: async (_signal, request) => {
-      if (request.method === "thread/read") {
-        readCalls += 1;
-        if (readCalls === 1) throw new Error("temporary exact-read failure");
-        return {
-          thread: {
-            id: "thread-read-retry",
-            recencyAt: (now - 13 * 60_000) / 1_000,
-          },
-        };
-      }
-      listCalls += 1;
-      return {
-        data: [],
-        nextCursor: null,
-      };
+    bridgeHandler: timestampBridge(async () => {
+      bridgeCalls += 1;
+      if (bridgeCalls === 1) throw new Error("temporary bridge failure");
+      return { "thread-read-retry": now - 13 * 60_000 };
+    }),
+    signalDispatcher: async () => {
+      dispatcherCalls += 1;
+      throw new Error("timestamp reads must not discover Codex internals");
     },
   });
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(listCalls, 1);
-  assert.equal(readCalls, 2);
+  assert.equal(bridgeCalls, 1);
+  assert.equal(dispatcherCalls, 0);
+  assert.equal(content.querySelector("[data-codey-thread-updated-at]"), null);
+
+  fixture.advanceTime(60_000);
+  fixture.runIntervals();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(bridgeCalls, 2);
+  assert.equal(dispatcherCalls, 0);
   assert.equal(
     content.querySelector("[data-codey-thread-updated-at]")?.textContent,
-    "13 分",
+    "14 分",
   );
 });
 
-test("retries a transient official timestamp request failure", async () => {
+test("keeps the cached time when a forced bridge refresh fails", async () => {
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
   row.setAttribute("data-app-action-sidebar-thread-id", "thread-retry");
@@ -1281,17 +1068,23 @@ test("retries a transient official timestamp request failure", async () => {
   const timestamp = Date.now() - 7 * 60_000;
   let calls = 0;
 
-  loadInjection({
+  const { window } = loadInjection({
     rows: [row],
-    signalDispatcher: async () => {
+    bridgeHandler: timestampBridge(async () => {
       calls += 1;
-      if (calls === 1) throw new Error("temporary failure");
-      return {
-        data: [{ id: "thread-retry", recencyAt: timestamp / 1_000 }],
-        nextCursor: null,
-      };
-    },
+      if (calls > 1) throw new Error("temporary failure");
+      return { "thread-retry": timestamp };
+    }),
   });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(calls, 1);
+  assert.equal(
+    content.querySelector("[data-codey-thread-updated-at]")?.textContent,
+    "7 分",
+  );
+
+  window.__codeyInstallThreadUpdatedTimes(row, true);
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(calls, 2);
@@ -1301,7 +1094,7 @@ test("retries a transient official timestamp request failure", async () => {
   );
 });
 
-test("clears a cached timestamp when official metadata no longer has one", async () => {
+test("clears a cached timestamp when bridge metadata no longer has one", async () => {
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
   row.setAttribute("data-app-action-sidebar-thread-id", "thread-cleared");
@@ -1313,15 +1106,9 @@ test("clears a cached timestamp when official metadata no longer has one", async
 
   const { window } = loadInjection({
     rows: [row],
-    signalDispatcher: async () => ({
-      data: [{
-        id: "thread-cleared",
-        recencyAt: includeTimestamp ? timestamp / 1_000 : null,
-        updatedAt: null,
-        createdAt: null,
-      }],
-      nextCursor: null,
-    }),
+    bridgeHandler: timestampBridge(async () => (
+      includeTimestamp ? { "thread-cleared": timestamp } : {}
+    )),
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(
@@ -1374,33 +1161,88 @@ test("accepts only a unique direct app-server request wrapper", () => {
   );
 });
 
-test("injects time styles that coexist with native statuses and yield to sidebar actions", () => {
-  assert.match(source, /threadUpdatedAtAttribute = "data-codey-thread-updated-at"/);
-  assert.match(source, /threadRunningAttribute = "data-codey-thread-running"/);
-  assert.match(source, /threadRunningLossGraceMs = 2_000/);
-  assert.match(source, /sidebarProjectShowAllAttribute = "data-app-action-sidebar-project-show-all"/);
-  assert.match(source, /projectThreadSessionIdsFromReact/);
-  assert.match(source, /recoverHiddenRunningThreads\(root\)/);
-  assert.doesNotMatch(source, /threadSortOrderAttribute|data-codey-thread-sort-order/);
-  assert.doesNotMatch(source, /--codey-thread-sort-order|thread-sort-keys/);
-  assert.match(source, /threadRunningAttribute\}="true"\].*order: -1 !important/s);
-  assert.match(source, /updateThreadRunningPriority\(row, workInProgress\)/);
-  assert.doesNotMatch(source, /sortKey:\s*"updated_at"/);
-  assert.match(source, /threadTimestampRefreshIntervalMs = 60_000/);
-  assert.match(source, /threadTimestampReadBatchSize = 32/);
-  assert.match(source, /dispatcher\("send-cli-request-for-host"/);
-  assert.match(source, /method: "thread\/list"/);
-  assert.match(source, /refreshThreadUpdatedTimes\(false\)/);
-  assert.match(source, /"data-app-action-sidebar-thread-kind"/);
-  assert.match(source, /isDeletedSidebarSession\(sessionId\) \|\| !timestamp/);
-  assert.match(source, /font-variant-numeric: tabular-nums/);
-  assert.match(source, /placeThreadUpdatedAt\(row, label\)/);
-  assert.match(source, /mount\.insertBefore\(label, before\)/);
-  assert.match(source, /"aria-hidden",/);
-  assert.match(source, /"aria-expanded",/);
-  assert.match(source, /"disabled",\s*"hidden",\s*"class",/);
-  assert.doesNotMatch(source, /"class",\s*"style",/);
-  assert.match(source, /sidebar-thread-row\]:hover \[\$\{threadUpdatedAtAttribute\}\].*opacity: 0/s);
+test("discovers the current app-initial asset and resolves AppServerManager from React scope", async () => {
+  const entryUrl = "app://-/assets/index-BZNttYfb.js";
+  const appInitialUrl = "app://-/assets/app-initial-BCLYDefw.js";
+  const appServerRequests = [];
+  const manager = {
+    discardConversationFromCache() {},
+    handleThreadDeletion() {},
+    refreshRecentConversations() {},
+    resumeConversation() {},
+    sendRequest(...args) {
+      appServerRequests.push(args);
+      return { rateLimits: { limitId: "codex" } };
+    },
+  };
+  const AppServerManagerRpc = Symbol("AppServerManagerRpc");
+  const managerRpc = { forHost: (hostId) => (hostId === "local" ? manager : null) };
+  const scope = {
+    get: () => managerRpc,
+    query: {},
+    set() {},
+    watch() {},
+    when() {},
+  };
+  const row = new FakeElement();
+  row.__reactFiber$codeyTest = {
+    memoizedState: { current: scope },
+    return: null,
+  };
+  const resolver = function appServerManagerForHost(runtimeScope, hostId) {
+    const rpc = runtimeScope.get(AppServerManagerRpc);
+    if (rpc == null) throw new Error("AppServerManager RPC is not connected");
+    return rpc.forHost(hostId);
+  };
+  const { window } = loadInjection({
+    assetModules: new Map([[appInitialUrl, { arbitraryExport: resolver }]]),
+    entryScriptUrls: [entryUrl],
+    fetchHandler: async (url) => ({
+      ok: url === entryUrl,
+      text: async () => 'import "./app-initial-BCLYDefw.js";',
+    }),
+    rows: [row],
+  });
+
+  const controller = await window.__codeyLoadCodexSessionController();
+
+  assert.equal(controller.kind, "manager");
+  assert.equal(controller.manager, manager);
+  assert.deepEqual(
+    await window.__codeyReadAccountRateLimits(),
+    { rateLimits: { limitId: "codex" } },
+  );
+  assert.deepEqual(appServerRequests, [["account/rateLimits/read"]]);
+});
+
+test("accepts only a unique semantic AppServerManager resolver", () => {
+  const { window } = loadInjection();
+  const direct = function appServerManagerForHost(scope, hostId) {
+    const rpc = scope.get(AppServerManagerRpc);
+    if (rpc == null) throw new Error("AppServerManager RPC is not connected");
+    return rpc.forHost(hostId);
+  };
+  const second = function anotherAppServerManagerForHost(scope, hostId) {
+    const rpc = scope.get(AnotherAppServerManagerRpc);
+    if (rpc == null) throw new Error("AppServerManager RPC is not connected");
+    return rpc.forHost(hostId);
+  };
+
+  assert.equal(
+    window.__codeyAppServerManagerResolverFromModule({ arbitrary: direct }),
+    direct,
+  );
+  assert.equal(
+    window.__codeyAppServerManagerResolverFromModule({ direct, second }),
+    null,
+  );
+});
+
+test("timestamp metadata uses only the bounded bridge route", () => {
+  assert.match(source, /threadTimestampBridgePath = "\/session\/timestamps"/);
+  assert.match(source, /callBridge\(threadTimestampBridgePath, \{ sessionIds \}\)/);
+  assert.doesNotMatch(source, /method: "thread\/(?:list|read)"/);
+  assert.doesNotMatch(source, /fetch\(url\)/);
 });
 
 test("vendor project moves preserve Codex-owned thread ordering", () => {

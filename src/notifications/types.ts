@@ -1,4 +1,5 @@
-export type NotificationChannelKind = "feishu" | "telegram";
+export type NotificationChannelKind = "feishu" | "wecom" | "telegram" | "wechatClaw";
+export type NotificationChannelSessionStatus = "active" | "expired";
 
 export const MAX_NOTIFICATION_CHANNELS = 32;
 
@@ -12,12 +13,16 @@ export type NotificationChannel = {
   botToken: string;
   botTokenConfigured: boolean;
   clearBotToken?: boolean;
+  contextToken: string;
+  contextTokenConfigured: boolean;
+  clearContextToken?: boolean;
+  getUpdatesBuf?: string;
   chatId: string;
+  sessionStatus?: NotificationChannelSessionStatus;
 };
 
 export type NotificationChannelEditorProps = {
   channel: NotificationChannel;
   disabled: boolean;
-  revealSecrets?: boolean;
   onChange: (patch: Partial<NotificationChannel>) => void;
 };

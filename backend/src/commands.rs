@@ -17,6 +17,7 @@ mod prompt_optimization;
 mod runtime;
 mod updates;
 mod webhooks;
+mod wechat_claw;
 
 #[cfg(windows)]
 use codey_runtime_core::app_paths::{
@@ -27,39 +28,36 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock, oneshot, watch};
 
 use diagnostics::{
-    clear_codex_trace_logs, clear_diagnostic_storage, refresh_diagnostic_storage_stats,
-    refresh_trace_log_stats,
+    clear_diagnostic_storage, refresh_diagnostic_storage_stats, refresh_trace_log_stats,
 };
 #[cfg(test)]
 use models::{
     config_with_current_provider_models, preserve_selected_third_party_models,
     preserve_selected_third_party_models_except, renderer_model_catalog_value,
-    should_refresh_model_catalog, startup_model_sync_models_or_fallback, sync_cc_switch_state_with,
+    should_refresh_model_catalog, startup_model_sync_models_or_fallback, sync_provider_state_with,
     validate_deleted_third_party_models, validate_manual_model_selection,
 };
 use models::{
-    current_model_state_async, current_renderer_model_catalog_async,
-    provider_route_requires_restart, sync_provider_models_for_launch,
+    current_model_state_async, current_renderer_model_catalog_async, hot_reload_runtime_models,
+    official_route_snapshots, provider_route_requires_restart,
+    remote_compaction_transport_requires_restart, sync_current_third_party_provider_state,
+    sync_provider_models_for_launch, websocket_transport_requires_restart,
 };
 pub use models::{
-    fetch_current_provider_models, save_default_model, save_selected_models, sync_cc_switch_state,
-    sync_current_provider_command,
+    delete_route, fetch_route_models, save_default_model, save_official_route_models,
+    save_selected_models, sync_current_provider_command,
 };
 use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
 use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
-    sync_prompt_optimization_current_provider_command, test_prompt_optimization_command,
+    test_prompt_optimization_command,
 };
-pub(crate) use runtime::{
-    CC_SWITCH_ROUTE_RECOVERY_INTERVAL, CC_SWITCH_ROUTE_RECOVERY_STABLE_READS,
-    cc_switch_route_ready_for_recovery, is_cc_switch_route_recovery_error,
-};
+use runtime::runtime_status_with_options;
 #[cfg(test)]
 use runtime::{begin_shutdown, launch_codey_inner};
 pub use runtime::{
     launch_codey_runtime, runtime_status, schedule_restart_codey_runtime, stop_codey_runtime,
 };
-use runtime::{refresh_injection_status, runtime_status_with_options};
 use updates::current_update_platform;
 #[cfg(test)]
 pub(crate) use updates::{UpdateAssetInfo, UpdateCheck};
@@ -72,18 +70,26 @@ use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 pub use updates::{check_for_updates, download_update, install_downloaded_update};
 use webhooks::{
     WaitingLedgerState, WebhookNotificationState, initial_waiting_notifications,
-    sync_waiting_webhook_watcher, test_notification_channel, test_webhook,
+    sync_waiting_webhook_watcher, test_notification_channel,
+};
+use wechat_claw::{
+    WechatClawLoginState, WechatClawSessionGuard, WechatClawSyncHandle,
+    pause_wechat_claw_notification_channel, poll_wechat_claw_login,
+    refresh_wechat_claw_channel_context, start_wechat_claw_login, stop_wechat_claw_service,
+    sync_wechat_claw_service, wechat_claw_login_http_client,
+    wechat_claw_notification_cooldown_remaining,
 };
 
 use crate::account_usage;
-use crate::cc_switch;
 use crate::cdp;
 use crate::codex_config::{
-    FastContextToolsStatus, codex_home, fast_context_tools_status, refresh_runtime_subagent_roles,
+    FastContextToolsStatus, codex_home, fast_context_tools_status, reconcile_runtime_subagent_roles,
 };
+use crate::codex_provider;
+use crate::codex_provider::OfficialAccountProfileStatus;
 use crate::config::{
-    CodeyConfig, ConfigStore, PromptOptimizationConfig, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
-    SubagentRoleConfig, default_subagent_guidance, validate_subagent_guidance,
+    CodeyConfig, ConfigStore, LaunchOfficialAccountStatus, PromptOptimizationConfig,
+    SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SubagentRoleConfig, validate_provider_profiles,
 };
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
@@ -95,6 +101,7 @@ use crate::launcher::{CodeyRuntime, RuntimeModelConfig, RuntimeSubagentConfig};
 use crate::message_delete::delete_messages_persistently;
 #[cfg(test)]
 use crate::model_catalog;
+use crate::model_id;
 use crate::notifications::NotificationChannelConfig;
 use crate::pending_approval;
 use crate::plugin_marketplace;
@@ -106,6 +113,7 @@ use crate::trace_log_guard;
 use crate::trace_log_stats::TraceLogStatsHandle;
 
 const STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_VISIBLE_SESSION_TIMESTAMPS: usize = 200;
 
 pub struct AppState {
     pub store: ConfigStore,
@@ -113,12 +121,15 @@ pub struct AppState {
     config_write_lock: Mutex<()>,
     provider_model_sync_lock: Mutex<()>,
     pub http_client: reqwest::Client,
-    pub webhook_http_client: reqwest::Client,
+    #[cfg(test)]
+    pub webhook_http_client_override: Option<reqwest::Client>,
+    wechat_claw_login_http_client: reqwest::Client,
     account_usage_cache: Mutex<account_usage::AccountUsageCache>,
     pub runtime: Mutex<Option<Arc<CodeyRuntime>>>,
     runtime_operation: Mutex<()>,
     diagnostic_storage_operation: Mutex<()>,
     pub trace_log_stats: TraceLogStatsHandle,
+    trace_log_write_protection_active: AtomicBool,
     pub crashpad_pending_stats: CrashpadPendingStatsHandle,
     pub startup_error: RwLock<Option<String>>,
     available_update: RwLock<Option<updates::UpdateCheck>>,
@@ -130,14 +141,23 @@ pub struct AppState {
     runtime_generation: AtomicU64,
     session_titles: RwLock<HashMap<String, String>>,
     session_metadata_cache: BlockingMutex<session_metadata::SessionMetadataCache>,
+    completion_probe_cache: BlockingMutex<pending_approval::RecentSessionEventCache>,
+    #[cfg(test)]
+    session_metadata_cache_contended: Notify,
     webhook_notifications: Mutex<WebhookNotificationState>,
     persisted_waiting_notifications: Mutex<WaitingLedgerState>,
     recent_session_event_cache: Mutex<Option<pending_approval::RecentSessionEventCache>>,
+    wechat_claw_logins: Mutex<WechatClawLoginState>,
+    wechat_claw_sync: Mutex<Option<WechatClawSyncHandle>>,
+    wechat_claw_sync_update: Mutex<()>,
+    wechat_claw_session_guard: Mutex<WechatClawSessionGuard>,
     waiting_watcher_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     waiting_watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     waiting_watcher_sync: Mutex<()>,
     session_scan_wake: Notify,
     restart_settled: Notify,
+    #[cfg(test)]
+    restart_operation_pending: Notify,
     shutdown_reason: watch::Sender<Option<AppShutdownReason>>,
 }
 
@@ -168,7 +188,15 @@ pub enum AppShutdownReason {
 impl Default for AppState {
     fn default() -> Self {
         let store = ConfigStore::default();
-        let config = store.load().unwrap_or_default();
+        let (config, config_load_error) = match store.load() {
+            Ok(config) => (config, None),
+            Err(error) => (
+                CodeyConfig::default(),
+                Some(format!(
+                    "Codey 配置无法读取，已使用安全默认值启动；请先检查或恢复配置文件：{error:#}"
+                )),
+            ),
+        };
         let protect_crashpad_pending = config.protect_crashpad_pending;
         let persisted_waiting_notifications = initial_waiting_notifications(&store, &[]);
         let (shutdown_reason, _) = watch::channel(None);
@@ -182,15 +210,17 @@ impl Default for AppState {
                 .connect_timeout(Duration::from_secs(5))
                 .build()
                 .expect("shared Codey HTTP client should be constructible"),
-            webhook_http_client: crate::notifications::notification_http_client()
-                .expect("notification HTTP client should be constructible"),
+            #[cfg(test)]
+            webhook_http_client_override: None,
+            wechat_claw_login_http_client: wechat_claw_login_http_client(),
             account_usage_cache: Mutex::new(account_usage::AccountUsageCache::default()),
             runtime: Mutex::new(None),
             runtime_operation: Mutex::new(()),
             diagnostic_storage_operation: Mutex::new(()),
             trace_log_stats: TraceLogStatsHandle::idle(),
+            trace_log_write_protection_active: AtomicBool::new(false),
             crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
-            startup_error: RwLock::new(None),
+            startup_error: RwLock::new(config_load_error),
             available_update: RwLock::new(None),
             update_candidate_cache: Mutex::new(None),
             codex_app_version_cache: Mutex::new(None),
@@ -202,6 +232,11 @@ impl Default for AppState {
             session_metadata_cache: BlockingMutex::new(
                 session_metadata::SessionMetadataCache::default(),
             ),
+            completion_probe_cache: BlockingMutex::new(
+                pending_approval::RecentSessionEventCache::default(),
+            ),
+            #[cfg(test)]
+            session_metadata_cache_contended: Notify::new(),
             webhook_notifications: Mutex::new(WebhookNotificationState::from_settled(
                 persisted_waiting_notifications.iter().cloned(),
             )),
@@ -209,11 +244,17 @@ impl Default for AppState {
             recent_session_event_cache: Mutex::new(Some(
                 pending_approval::RecentSessionEventCache::default(),
             )),
+            wechat_claw_logins: Mutex::new(WechatClawLoginState::default()),
+            wechat_claw_sync: Mutex::new(None),
+            wechat_claw_sync_update: Mutex::new(()),
+            wechat_claw_session_guard: Mutex::new(WechatClawSessionGuard::default()),
             waiting_watcher_shutdown: Mutex::new(None),
             waiting_watcher_task: Mutex::new(None),
             waiting_watcher_sync: Mutex::new(()),
             session_scan_wake: Notify::new(),
             restart_settled: Notify::new(),
+            #[cfg(test)]
+            restart_operation_pending: Notify::new(),
             shutdown_reason,
         }
     }
@@ -229,6 +270,20 @@ fn bridge_string(payload: &Value, name: &str) -> String {
 
 fn bridge_u64(payload: &Value, name: &str) -> Option<u64> {
     payload.get(name).and_then(Value::as_u64)
+}
+
+fn bridge_string_array(payload: &Value, name: &str, limit: usize) -> Vec<String> {
+    payload
+        .get(name)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .take(limit)
+        .map(ToString::to_string)
+        .collect()
 }
 
 impl AppState {
@@ -275,17 +330,18 @@ impl AppState {
             "/settings/get" => {
                 let config = self.config.read().await;
                 serde_json::to_value(redacted_config(&config))
-                    .unwrap_or_else(|_| json!({"status":"failed"}))
+                    .expect("CodeyConfig must be JSON-serializable")
             }
             "/codex-model-catalog" => {
                 let current_config = self.config.read().await.clone();
                 let runtime = self.runtime.lock().await.clone();
-                let catalog_config = model_catalog_config_for_runtime(
-                    &current_config,
-                    runtime.as_ref().map(|runtime| &runtime.applied_config),
-                )
-                .clone();
-                current_renderer_model_catalog_async(&catalog_config)
+                let catalog_config = runtime
+                    .as_ref()
+                    .map(|runtime| &runtime.applied_config)
+                    .filter(|applied| provider_route_requires_restart(applied, &current_config))
+                    .cloned()
+                    .unwrap_or(current_config);
+                current_renderer_model_catalog_async(catalog_config)
                     .await
                     .unwrap_or_else(api_error_message)
             }
@@ -296,12 +352,42 @@ impl AppState {
                 }
                 value
             }
+            "/backend/health" => json!({"status":"ok"}),
             "/account/usage" => account_usage_snapshot(self).await,
             "/session/wake-watcher" => {
                 self.session_scan_wake.notify_one();
                 json!({"status":"ok"})
             }
+            "/session/completion-state" => {
+                let session_id = bridge_string(&payload, "sessionId").trim().to_string();
+                let turn_id = bridge_string(&payload, "turnId").trim().to_string();
+                if session_id.is_empty() || turn_id.is_empty() {
+                    return api_error_message("缺少会话或轮次 ID");
+                }
+                if session_id.len() > 256 || turn_id.len() > 256 {
+                    return api_error_message("会话或轮次 ID 过长");
+                }
+                match with_completion_probe_cache(self, session_id, turn_id).await {
+                    Ok(result) => result,
+                    Err(error) => api_error_message(error),
+                }
+            }
             "/session/titles" => cache_session_titles(self, &payload).await,
+            "/session/timestamps" => {
+                let session_ids =
+                    bridge_string_array(&payload, "sessionIds", MAX_VISIBLE_SESSION_TIMESTAMPS);
+                let home = codex_home();
+                match with_session_metadata_cache(
+                    self,
+                    "读取侧边栏会话时间",
+                    move |cache| cache.resolve_session_timestamps(home, &session_ids),
+                )
+                .await
+                {
+                    Ok(timestamps) => json!({"status":"ok", "timestamps": timestamps}),
+                    Err(error) => api_error_message(error),
+                }
+            }
             "/session/delete" => {
                 let session_id = bridge_string(&payload, "sessionId");
                 let title = bridge_string(&payload, "title");
@@ -313,7 +399,7 @@ impl AppState {
                 let session_id = bridge_string(&payload, "sessionId");
                 let home = codex_home();
                 blocking_value("准备会话导出", move || {
-                    session_transfer::start_export_transfer(&home, &session_id)
+                    session_transfer::start_export_transfer(home, &session_id)
                 })
                 .await
             }
@@ -324,7 +410,7 @@ impl AppState {
                 };
                 let home = codex_home();
                 blocking_value("读取会话导出分块", move || {
-                    session_transfer::read_export_transfer_chunk(&home, &transfer_id, offset)
+                    session_transfer::read_export_transfer_chunk(home, &transfer_id, offset)
                 })
                 .await
             }
@@ -332,7 +418,7 @@ impl AppState {
                 let transfer_id = bridge_string(&payload, "transferId");
                 let home = codex_home();
                 blocking_value("清理会话导出", move || {
-                    session_transfer::finish_export_transfer(&home, &transfer_id)?;
+                    session_transfer::finish_export_transfer(home, &transfer_id)?;
                     Ok(json!({"status": "ok"}))
                 })
                 .await
@@ -340,7 +426,7 @@ impl AppState {
             "/session/import/start" => {
                 let home = codex_home();
                 blocking_value("准备会话导入", move || {
-                    session_transfer::start_import_transfer(&home)
+                    session_transfer::start_import_transfer(home)
                 })
                 .await
             }
@@ -353,7 +439,7 @@ impl AppState {
                 let home = codex_home();
                 blocking_value("写入会话导入分块", move || {
                     session_transfer::append_import_transfer_chunk(
-                        &home,
+                        home,
                         &transfer_id,
                         offset,
                         &data,
@@ -366,7 +452,7 @@ impl AppState {
                 let project_path = bridge_string(&payload, "projectPath");
                 let home = codex_home();
                 blocking_value("完成会话导入", move || {
-                    session_transfer::finish_import_transfer(&home, &project_path, &transfer_id)
+                    session_transfer::finish_import_transfer(home, &project_path, &transfer_id)
                 })
                 .await
             }
@@ -374,7 +460,7 @@ impl AppState {
                 let transfer_id = bridge_string(&payload, "transferId");
                 let home = codex_home();
                 blocking_value("清理会话导入", move || {
-                    session_transfer::abort_import_transfer(&home, &transfer_id)?;
+                    session_transfer::abort_import_transfer(home, &transfer_id)?;
                     Ok(json!({"status": "ok"}))
                 })
                 .await
@@ -398,9 +484,9 @@ impl AppState {
             }
             "/plugins/list" => {
                 let home = codex_home();
-                let plugins_home = home.clone();
+                let plugins_home = home;
                 match tokio::task::spawn_blocking(move || {
-                    plugin_marketplace::list_plugins(&plugins_home)
+                    plugin_marketplace::list_plugins(plugins_home)
                 })
                 .await
                 {
@@ -454,6 +540,19 @@ where
 {
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let mut cache = match state.session_metadata_cache.try_lock() {
+            Ok(cache) => cache,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                state.session_metadata_cache_contended.notify_one();
+                state
+                    .session_metadata_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        #[cfg(not(test))]
         let mut cache = state
             .session_metadata_cache
             .lock()
@@ -464,6 +563,87 @@ where
     .map_err(|error| format!("{operation}任务异常退出：{error}"))
 }
 
+async fn with_completion_probe_cache(
+    state: &Arc<AppState>,
+    session_id: String,
+    turn_id: String,
+) -> Result<Value, String> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let mut cache = state
+            .completion_probe_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let events = cache.refresh_session(codex_home(), &session_id);
+        completion_state_response(&events, &session_id, &turn_id)
+    })
+    .await
+    .map_err(|error| format!("确认会话完成状态任务异常退出：{error}"))
+}
+
+fn completion_state_response(
+    events: &pending_approval::RecentSessionEvents,
+    session_id: &str,
+    turn_id: &str,
+) -> Value {
+    let lifecycle = match events.session_statuses.get(session_id) {
+        Some(pending_approval::SessionLifecycleStatus::Idle) => "idle",
+        Some(pending_approval::SessionLifecycleStatus::Running) => "running",
+        Some(pending_approval::SessionLifecycleStatus::Error) => "error",
+        Some(pending_approval::SessionLifecycleStatus::Waiting) => "waiting",
+        None => "unknown",
+    };
+    let completed = events.completed_turns.iter().find(|completed| {
+        completed.session_id == session_id
+            && completed.turn_id == turn_id
+            && !completed.is_snapshot_replay
+    });
+    let aborted = events.aborted_turns.iter().find(|aborted| {
+        aborted.session_id == session_id
+            && aborted.turn_id == turn_id
+            && !aborted.is_snapshot_replay
+    });
+    let terminal_kind = if completed.is_some() {
+        Some("completed")
+    } else if aborted.is_some() {
+        Some("aborted")
+    } else {
+        None
+    };
+    let turn_known = events
+        .started_turns
+        .iter()
+        .any(|started| started.session_id == session_id && started.turn_id == turn_id)
+        || events
+            .completed_turns
+            .iter()
+            .any(|completed| completed.session_id == session_id && completed.turn_id == turn_id)
+        || events
+            .aborted_turns
+            .iter()
+            .any(|aborted| aborted.session_id == session_id && aborted.turn_id == turn_id)
+        || events
+            .pending_approvals
+            .iter()
+            .any(|pending| pending.session_id == session_id && pending.turn_id == turn_id)
+        || events
+            .turn_configurations
+            .get(session_id)
+            .is_some_and(|configurations| configurations.contains_key(turn_id));
+
+    json!({
+        "status": "ok",
+        "sessionId": session_id,
+        "turnId": turn_id,
+        "sessionKnown": events.session_statuses.contains_key(session_id),
+        "turnKnown": turn_known,
+        "lifecycle": lifecycle,
+        "terminal": terminal_kind.is_some(),
+        "terminalKind": terminal_kind,
+        "completedAt": completed.and_then(|completed| completed.completed_at),
+    })
+}
+
 async fn save_config_to_store(state: &AppState, config: &CodeyConfig) -> Result<(), String> {
     let store = state.store.clone();
     let config = config.clone();
@@ -471,6 +651,235 @@ async fn save_config_to_store(state: &AppState, config: &CodeyConfig) -> Result<
         .await
         .map_err(|error| format!("保存 Codey 配置任务异常退出：{error}"))?
         .map_err(|error| error.to_string())
+}
+
+pub(super) fn validate_official_account_config_change(
+    previous: &CodeyConfig,
+    next: &CodeyConfig,
+) -> Result<(), String> {
+    if previous.official_account_available_this_launch {
+        return Ok(());
+    }
+    if next
+        .active_profile()
+        .is_some_and(|profile| profile.official_account)
+    {
+        return Err(
+            "本次 Codex 由 API Key 线路启动，不能启用官方账号线路；请先在 Codex 中完成官方账号登录并重新启动 Codey"
+                .to_string(),
+        );
+    }
+    if next.profiles.iter().any(|profile| {
+        profile.official_account
+            && !previous.profiles.iter().any(|previous_profile| {
+                previous_profile.id == profile.id && previous_profile.official_account
+            })
+    }) {
+        return Err(
+            "本次 Codex 由 API Key 线路启动，不能新增官方账号线路；请先在 Codex 中完成官方账号登录并重新启动 Codey"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> Result<(), String> {
+    let home = codex_home().to_path_buf();
+    let configured_codex_app_path = state.config.read().await.codex_app_path.clone();
+    let official_status = tokio::task::spawn_blocking(move || {
+        crate::codex_provider::current_official_account_profile_status_for_launch(
+            &home,
+            &configured_codex_app_path,
+        )
+    })
+    .await
+    .map_err(|error| format!("检测 Codex 官方账号登录状态的任务异常退出：{error}"))?
+    .map_err(|error| format!("检测 Codex 官方账号登录状态失败：{error:#}"))?;
+
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let previous = state.config.read().await.clone();
+    let mut next = route_config_for_official_probe(&previous, official_status)?;
+
+    if persisted_config_changed(&previous, &next) {
+        if next.settings_revision == previous.settings_revision {
+            next.settings_revision = previous.settings_revision.saturating_add(1);
+        }
+        save_config_to_store(state, &next)
+            .await
+            .map_err(|error| format!("保存启动线路准备结果失败：{error}"))?;
+    }
+    *state.config.write().await = next;
+    Ok(())
+}
+
+fn route_config_for_official_probe(
+    previous: &CodeyConfig,
+    official_status: OfficialAccountProfileStatus,
+) -> Result<CodeyConfig, String> {
+    let mut next = previous.clone();
+    match official_status {
+        OfficialAccountProfileStatus::Available(official_profile) => {
+            next.apply_launch_official_profile(Some(official_profile));
+            next.initial_route_import_completed = true;
+            next = next.normalize();
+            next.official_account_available_this_launch = true;
+            next.official_account_status_this_launch = LaunchOfficialAccountStatus::Authenticated;
+        }
+        OfficialAccountProfileStatus::Unavailable { reason } => {
+            next = apply_unavailable_official_probe(next, reason)?;
+        }
+        OfficialAccountProfileStatus::Unknown { profile, reason } => {
+            if should_attempt_official_launch_when_auth_unknown(previous) {
+                next.apply_launch_official_profile(Some(profile));
+                next.initial_route_import_completed = true;
+                next = next.normalize();
+                next.official_account_available_this_launch = true;
+                next.official_account_status_this_launch = LaunchOfficialAccountStatus::Unknown;
+                error_log::record_failure_with_metadata(
+                    "official_auth_probe_inconclusive",
+                    "prepare_routes_for_current_launch",
+                    reason,
+                    error_log::FailureMetadata {
+                        stage: Some("startup.auth_probe".to_string()),
+                        recoverable: Some(true),
+                    },
+                    official_auth_route_diagnostics(
+                        previous,
+                        "unknown",
+                        "launch_with_official_auth",
+                    ),
+                );
+            } else {
+                next.official_account_available_this_launch = false;
+                next.official_account_status_this_launch = LaunchOfficialAccountStatus::Unknown;
+                error_log::record_failure_with_metadata(
+                    "official_auth_probe_inconclusive",
+                    "prepare_routes_for_current_launch",
+                    reason,
+                    error_log::FailureMetadata {
+                        stage: Some("startup.auth_probe".to_string()),
+                        recoverable: Some(true),
+                    },
+                    official_auth_route_diagnostics(previous, "unknown", "third_party_route"),
+                );
+            }
+        }
+    }
+    Ok(next)
+}
+
+fn apply_unavailable_official_probe(
+    mut next: CodeyConfig,
+    reason: String,
+) -> Result<CodeyConfig, String> {
+    let has_official_route = next.profiles.iter().any(|profile| profile.official_account);
+    let fallback = if next.has_third_party_route() {
+        "third_party_route"
+    } else if has_official_route {
+        "startup_blocked"
+    } else {
+        "no_official_route_configured"
+    };
+    let diagnostics = official_auth_route_diagnostics(&next, "unauthenticated", fallback);
+    if has_official_route {
+        if !next.has_third_party_route() {
+            let error = format!(
+                "当前 Codex 没有可用的官方账号登录，也没有已保存的 API Key 线路；请先在 Codex 中完成官方账号登录，或在 Codey 中添加第三方 API 线路。认证诊断：{reason}"
+            );
+            error_log::record_failure_with_metadata(
+                "official_auth_unavailable",
+                "prepare_routes_for_current_launch",
+                error.clone(),
+                error_log::FailureMetadata {
+                    stage: Some("startup.auth_probe".to_string()),
+                    recoverable: Some(true),
+                },
+                diagnostics,
+            );
+            return Err(error);
+        }
+        next.apply_launch_official_profile(None);
+        next = next.normalize();
+    }
+    error_log::record_failure_with_metadata(
+        "official_auth_unavailable",
+        "prepare_routes_for_current_launch",
+        reason,
+        error_log::FailureMetadata {
+            stage: Some("startup.auth_probe".to_string()),
+            recoverable: Some(true),
+        },
+        diagnostics,
+    );
+    next.official_account_available_this_launch = false;
+    next.official_account_status_this_launch = LaunchOfficialAccountStatus::Unauthenticated;
+    Ok(next)
+}
+
+fn official_auth_route_diagnostics(
+    config: &CodeyConfig,
+    probe_status: &str,
+    fallback: &str,
+) -> serde_json::Value {
+    let active_profile = config.active_profile();
+    let official_profile_count = config
+        .profiles
+        .iter()
+        .filter(|profile| profile.official_account)
+        .count();
+    let third_party_profile_count = config
+        .profiles
+        .iter()
+        .filter(|profile| !profile.official_account && !profile.is_unconfigured_default())
+        .count();
+    serde_json::json!({
+        "probeStatus": probe_status,
+        "fallback": fallback,
+        "activeProfileId": active_profile.as_ref().map(|profile| profile.id.clone()),
+        "activeProfileOfficial": active_profile.as_ref().map(|profile| profile.official_account),
+        "profileCount": config.profiles.len(),
+        "officialProfileCount": official_profile_count,
+        "thirdPartyProfileCount": third_party_profile_count,
+        "hasThirdPartyRoute": config.has_third_party_route(),
+        "routerRequiresOpenaiAuth": config.router_requires_openai_auth(),
+        "initialRouteImportCompleted": config.initial_route_import_completed,
+        "officialAccountAvailableBeforeProbe": config.official_account_available_this_launch,
+        "officialAccountStatusBeforeProbe": config.official_account_status_this_launch,
+        "credentialsIncluded": false,
+    })
+}
+
+fn should_attempt_official_launch_when_auth_unknown(config: &CodeyConfig) -> bool {
+    if config.looks_like_empty_default_route() {
+        return true;
+    }
+    if config
+        .active_profile()
+        .is_some_and(|profile| profile.official_account)
+    {
+        return true;
+    }
+    if !config.has_third_party_route() {
+        return true;
+    }
+    let Some(default_model) = config.default_model() else {
+        return false;
+    };
+    config.profiles.iter().any(|profile| {
+        profile.official_account
+            && default_model
+                .starts_with(&crate::local_router::model_alias(profile.provider_id(), ""))
+    })
+}
+
+fn persisted_config_changed(previous: &CodeyConfig, next: &CodeyConfig) -> bool {
+    let mut previous = previous.clone();
+    let mut next = next.clone();
+    previous.official_account_available_this_launch = false;
+    next.official_account_available_this_launch = false;
+    previous.official_account_status_this_launch = LaunchOfficialAccountStatus::Unauthenticated;
+    next.official_account_status_this_launch = LaunchOfficialAccountStatus::Unauthenticated;
+    previous != next
 }
 
 async fn resolve_session_name_cached(
@@ -493,24 +902,39 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Err(error) => Err(error),
         },
         "sync_current_provider" => sync_current_provider_command(state).await,
-        "sync_prompt_optimization_current_provider" => {
-            match optional_argument::<PromptOptimizationConfig>(&args, "config") {
-                Ok(draft) => sync_prompt_optimization_current_provider_command(state, draft).await,
-                Err(error) => Err(error),
+        "delete_route" => match (
+            string_argument(&args, "routeId"),
+            argument::<u64>(&args, "expectedRevision"),
+        ) {
+            (Ok(route_id), Ok(expected_revision)) => {
+                delete_route(state, route_id, expected_revision).await
             }
-        }
-        "fetch_current_provider_models" => fetch_current_provider_models(state).await,
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
+        "fetch_route_models" => match (
+            string_argument(&args, "routeId"),
+            argument::<u64>(&args, "expectedRevision"),
+        ) {
+            (Ok(route_id), Ok(expected_revision)) => {
+                fetch_route_models(state, route_id, expected_revision).await
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
         "save_selected_models" => match (
             argument::<Vec<String>>(&args, "officialModels"),
             argument::<Vec<String>>(&args, "thirdPartyModels"),
             optional_argument::<Vec<String>>(&args, "manualThirdPartyModels"),
             optional_argument::<Vec<String>>(&args, "deletedThirdPartyModels"),
+            optional_argument::<bool>(&args, "supportsAutoReview"),
+            optional_argument::<String>(&args, "routeId"),
         ) {
             (
                 Ok(official_models),
                 Ok(third_party_models),
                 Ok(manual_third_party_models),
                 Ok(deleted_third_party_models),
+                Ok(supports_auto_review),
+                Ok(route_id),
             ) => {
                 save_selected_models(
                     state,
@@ -518,17 +942,31 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                     third_party_models,
                     manual_third_party_models.unwrap_or_default(),
                     deleted_third_party_models.unwrap_or_default(),
+                    supports_auto_review,
+                    route_id,
                 )
                 .await
             }
-            (Err(error), _, _, _)
-            | (_, Err(error), _, _)
-            | (_, _, Err(error), _)
-            | (_, _, _, Err(error)) => Err(error),
+            (Err(error), _, _, _, _, _)
+            | (_, Err(error), _, _, _, _)
+            | (_, _, Err(error), _, _, _)
+            | (_, _, _, Err(error), _, _)
+            | (_, _, _, _, Err(error), _)
+            | (_, _, _, _, _, Err(error)) => Err(error),
         },
-        "save_default_model" => match string_argument(&args, "model") {
-            Ok(model) => save_default_model(state, model).await,
-            Err(error) => Err(error),
+        "save_default_model" => match (
+            string_argument(&args, "model"),
+            optional_argument::<String>(&args, "routeId"),
+        ) {
+            (Ok(model), Ok(route_id)) => save_default_model(state, model, route_id).await,
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
+        "save_official_route_models" => match (
+            string_argument(&args, "routeId"),
+            argument::<Vec<String>>(&args, "models"),
+        ) {
+            (Ok(route_id), Ok(models)) => save_official_route_models(state, route_id, models).await,
+            (Err(error), _) | (_, Err(error)) => Err(error),
         },
         "runtime_status" => {
             let refresh_injection_status = args
@@ -537,31 +975,21 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 .unwrap_or(false);
             runtime_status_with_options(state, refresh_injection_status).await
         }
-        "refresh_injection_status" => refresh_injection_status(state).await,
         "refresh_diagnostic_storage_stats" => refresh_diagnostic_storage_stats(state).await,
         "refresh_trace_log_stats" => refresh_trace_log_stats(state).await,
-        "launch_codey" => launch_codey_runtime(state).await,
         "restart_codey" => schedule_restart_codey_runtime(state).await,
         "clear_diagnostic_storage" => clear_diagnostic_storage(state).await,
-        "clear_codex_trace_logs" => clear_codex_trace_logs(state).await,
-        "test_webhook" => {
-            let channel_id = args
-                .get("channelId")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            test_webhook(state, channel_id).await
-        }
         "test_notification_channel" => {
             match argument::<NotificationChannelConfig>(&args, "channel") {
                 Ok(channel) => test_notification_channel(state, channel).await,
                 Err(error) => Err(error),
             }
         }
-        "reveal_notification_channel" => match string_argument(&args, "channelId") {
-            Ok(channel_id) => reveal_notification_channel(state, channel_id).await,
+        "start_wechat_claw_login" => start_wechat_claw_login(state).await,
+        "poll_wechat_claw_login" => match string_argument(&args, "loginId") {
+            Ok(login_id) => poll_wechat_claw_login(state, login_id).await,
             Err(error) => Err(error),
         },
-        "reveal_prompt_optimization_api_key" => reveal_prompt_optimization_api_key(state).await,
         "optimize_prompt" => match string_argument(&args, "text") {
             Ok(text) => optimize_prompt_command(state, text).await,
             Err(error) => Err(error),
@@ -592,9 +1020,23 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
 }
 
 pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
-    let config = state.config.read().await.clone();
+    let runtime_running = state.runtime.lock().await.is_some();
+    if !runtime_running && let Err(error) = prepare_routes_for_current_launch(state).await {
+        error_log::record_failure(
+            "route_prepare_failed",
+            "load_codey_config",
+            error,
+            json!({}),
+        );
+    }
+    let imported = ensure_default_route_imported(state).await;
+    let config = if imported {
+        sync_provider_models_for_launch(state, true).await
+    } else {
+        state.config.read().await.clone()
+    };
     let startup_error = state.startup_error.read().await.clone();
-    let cc_switch = cc_switch::status_from_config(&config);
+    let provider_status = codex_provider::status_from_config(&config);
     let model_state = current_model_state_async(&config).await?;
     let fast_context_tools_status = current_fast_context_tools_status();
     let mut public_config = redacted_config(&config);
@@ -606,43 +1048,80 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
         "config": public_config,
         "path": state.store.path().to_string_lossy(),
         "startupError": startup_error,
-        "ccSwitch": cc_switch,
+        "officialAccountAvailable": config.official_account_available_this_launch,
+        "officialAccountStatus": config.official_account_status_this_launch,
+        "providerStatus": provider_status,
         "modelState": model_state,
         "fastContextToolsStatus": fast_context_tools_status,
         "defaultSubagentGuidance": default_subagent_guidance(),
     }))
 }
 
-async fn reveal_notification_channel(
-    state: &Arc<AppState>,
-    channel_id: String,
-) -> Result<Value, String> {
-    let channel_id = channel_id.trim();
-    let channel = state
-        .config
-        .read()
-        .await
-        .webhook
-        .channels
-        .iter()
-        .find(|channel| channel.id == channel_id)
-        .cloned()
-        .ok_or_else(|| "找不到要编辑的通知渠道".to_string())?;
-    Ok(json!({"channel": channel}))
+pub(super) async fn ensure_default_route_imported(state: &Arc<AppState>) -> bool {
+    let config = state.config.read().await.clone();
+    if !config.needs_initial_route_import() || config.official_account_available_this_launch {
+        return false;
+    }
+    let current_provider = match current_codex_provider_for_initial_import().await {
+        Ok(provider) => provider,
+        Err(error) => {
+            error_log::record_failure(
+                "route_import_failed",
+                "ensure_default_route_imported",
+                error,
+                json!({}),
+            );
+            return false;
+        }
+    };
+    if current_provider.official {
+        return false;
+    }
+    match sync_current_third_party_provider_state(state).await {
+        Ok(status) => {
+            if !status.changed {
+                let _ = mark_initial_route_import_completed(state).await;
+            }
+            status.changed
+        }
+        Err(error) => {
+            error_log::record_failure(
+                "route_import_failed",
+                "ensure_default_route_imported",
+                error,
+                json!({
+                    "providerId": current_provider.id,
+                    "providerName": current_provider.name,
+                }),
+            );
+            false
+        }
+    }
 }
 
-async fn reveal_prompt_optimization_api_key(state: &Arc<AppState>) -> Result<Value, String> {
-    let api_key = state
-        .config
-        .read()
+async fn current_codex_provider_for_initial_import()
+-> Result<codex_provider::CurrentProvider, String> {
+    let home = codex_home().to_path_buf();
+    tokio::task::spawn_blocking(move || codex_provider::current_provider(&home))
         .await
-        .prompt_optimization
-        .api_key
-        .clone();
-    if api_key.trim().is_empty() {
-        return Err("提示词优化 API Key 尚未保存".to_string());
+        .map_err(|error| format!("读取当前 Codex 线路任务异常退出：{error}"))?
+        .map_err(|error| format!("读取当前 Codex 线路失败：{error:#}"))
+}
+
+async fn mark_initial_route_import_completed(state: &Arc<AppState>) -> Result<bool, String> {
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let previous = state.config.read().await.clone();
+    if previous.initial_route_import_completed {
+        return Ok(false);
     }
-    Ok(json!({"apiKey": api_key}))
+    let mut next = previous.clone();
+    next.initial_route_import_completed = true;
+    next.settings_revision = previous.settings_revision.saturating_add(1);
+    save_config_to_store(state, &next)
+        .await
+        .map_err(|error| format!("保存首次线路导入标记失败：{error}"))?;
+    *state.config.write().await = next;
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -775,8 +1254,7 @@ async fn save_codey_config_input(
 
 struct SavedCodeyConfig {
     config: CodeyConfig,
-    restart_required: bool,
-    refresh_subagent_config: bool,
+    reconcile_subagent_config: bool,
     fast_context_tools_status: FastContextToolsStatus,
 }
 
@@ -795,9 +1273,10 @@ async fn save_codey_config_locked(
     if config_input.settings_revision != previous.settings_revision {
         return Err("Codey 设置已被其他操作更新，请关闭后重新打开设置页面再保存".to_string());
     }
-    // Provider records, credentials and model-selection caches are read-only
-    // through this general settings endpoint.
     let mut config = previous.clone();
+    config.profiles = merge_profile_secrets(config_input.profiles, &previous)?;
+    config.active_profile_id = config_input.active_profile_id;
+    retain_route_scoped_config(&mut config);
     config_input
         .webhook
         .merge_redacted_secrets(&previous.webhook);
@@ -819,12 +1298,8 @@ async fn save_codey_config_locked(
         config_input.fast_context_tools,
         &fast_context_tools_status,
     );
-    config.fast_codex_startup = config_input.fast_codex_startup;
     config.subagent_optimization = config_input.subagent_optimization;
-    if subagent_guidance_present {
-        validate_subagent_guidance(&config_input.subagent_guidance)?;
-        config.subagent_guidance = config_input.subagent_guidance;
-    }
+    let mut explicitly_configured_subagent_models = Vec::new();
     let default_role_supplied = subagent_roles_present
         && !config_input.subagent_roles.is_empty()
         && config_input
@@ -833,6 +1308,17 @@ async fn save_codey_config_locked(
     if subagent_roles_present && !config_input.subagent_roles.is_empty() {
         for (role, selection) in config_input.subagent_roles {
             if SUBAGENT_ROLE_IDS.contains(&role.as_str()) {
+                let selection_changed = config.subagent_roles.get(&role).is_none_or(|previous| {
+                    previous.enabled != selection.enabled
+                        || !model_id::equal(&previous.model, &selection.model)
+                        || !previous
+                            .reasoning_effort
+                            .trim()
+                            .eq_ignore_ascii_case(selection.reasoning_effort.trim())
+                });
+                if selection_changed {
+                    explicitly_configured_subagent_models.push(selection.model.clone());
+                }
                 config.subagent_roles.insert(role, selection);
             }
         }
@@ -843,80 +1329,176 @@ async fn save_codey_config_locked(
         let default_role = config
             .subagent_roles
             .entry(SUBAGENT_ROLE_DEFAULT.to_string())
-            .or_insert_with(|| SubagentRoleConfig::new(fallback_model, fallback_effort));
+            .or_insert_with(|| {
+                SubagentRoleConfig::new(fallback_model.clone(), fallback_effort.clone())
+            });
         if subagent_model_present {
             default_role.model = config_input.subagent_model;
         }
         if subagent_reasoning_effort_present {
             default_role.reasoning_effort = config_input.subagent_reasoning_effort;
         }
+        let default_changed = !model_id::equal(&fallback_model, &default_role.model)
+            || !fallback_effort
+                .trim()
+                .eq_ignore_ascii_case(default_role.reasoning_effort.trim());
+        if default_changed {
+            explicitly_configured_subagent_models.push(default_role.model.clone());
+        }
     }
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     let mut config = config.normalize();
+    validate_official_account_config_change(&previous, &config)?;
+    config.remember_current_provider_official_model_support(explicitly_configured_subagent_models);
+    config = config.normalize();
     if config.subagent_optimization
         && let Ok(model_state) = current_model_state_async(&config).await
     {
         subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
+        config = config.normalize();
     }
-    // Codex resolves role declarations at startup but reads each registered
-    // config_file again when spawning a child. Rebuild the stable runtime files
-    // only when an already-enabled policy changed; enabling or disabling the
-    // feature itself still requires a restart to register/unregister tools and
-    // hooks.
-    let refresh_subagent_config = previous.subagent_optimization
-        && config.subagent_optimization
-        && RuntimeSubagentConfig::from_config(&previous)
-            != RuntimeSubagentConfig::from_config(&config);
+    // Codex reads each registered role config_file again when spawning a child.
+    // Check the Codey-owned runtime files on every save while the policy stays
+    // enabled, even when the in-memory role summary did not change. Enabling or
+    // disabling still requires a restart to register/unregister tools and hooks.
+    let reconcile_subagent_config = should_reconcile_runtime_subagent_config(&previous, &config);
     config.settings_revision = previous.settings_revision.saturating_add(1);
-    let restart_required = runtime_config_requires_restart(state, &config).await;
     let trace_guard_changed = config.disable_trace_log_writes != previous.disable_trace_log_writes;
     let _diagnostic_operation = if trace_guard_changed {
         Some(state.diagnostic_storage_operation.lock().await)
     } else {
         None
     };
-    if trace_guard_changed {
-        let home = codex_home();
+    let trace_guard_report = if trace_guard_changed {
+        let home = codex_home().to_path_buf();
         let disable_writes = config.disable_trace_log_writes;
-        let result = configure_trace_log_guard(home.clone(), disable_writes).await;
-        if let Err(error) = result {
-            let error =
-                rollback_trace_log_guard(home, previous.disable_trace_log_writes, error).await;
-            error_log::record_failure(
-                "patch_failed",
-                "configure_trace_log_guard",
-                error.clone(),
-                json!({
-                    "disabled": disable_writes,
-                    "source": "save_codey_config",
-                }),
-            );
-            return Err(error);
+        match configure_trace_log_guard(home.clone(), disable_writes).await {
+            Ok(report) => Some(report),
+            Err(error) => {
+                let error =
+                    rollback_trace_log_guard(home, previous.disable_trace_log_writes, error).await;
+                state
+                    .trace_log_write_protection_active
+                    .store(false, Ordering::Release);
+                error_log::record_failure(
+                    "patch_failed",
+                    "configure_trace_log_guard",
+                    error.clone(),
+                    json!({
+                        "disabled": disable_writes,
+                        "source": "save_codey_config",
+                    }),
+                );
+                return Err(error);
+            }
         }
-    }
+    } else {
+        None
+    };
     if let Err(error) = save_config_to_store(state, &config).await {
         if trace_guard_changed {
-            return Err(rollback_trace_log_guard(
-                codex_home(),
+            let error = rollback_trace_log_guard(
+                codex_home().to_path_buf(),
                 previous.disable_trace_log_writes,
                 error,
             )
-            .await);
+            .await;
+            state
+                .trace_log_write_protection_active
+                .store(false, Ordering::Release);
+            return Err(error);
         }
         return Err(error);
     }
     *state.config.write().await = config.clone();
+    if let Some(report) = trace_guard_report {
+        state.trace_log_write_protection_active.store(
+            report.protection_active(config.disable_trace_log_writes),
+            Ordering::Release,
+        );
+    }
     Ok(SavedCodeyConfig {
         config,
-        restart_required,
-        refresh_subagent_config,
+        reconcile_subagent_config,
         fast_context_tools_status,
     })
 }
 
+fn merge_profile_secrets(
+    mut profiles: Vec<crate::config::ProviderProfile>,
+    previous: &CodeyConfig,
+) -> Result<Vec<crate::config::ProviderProfile>, String> {
+    let previous_by_id = previous
+        .profiles
+        .iter()
+        .map(|profile| (profile.id.as_str(), profile))
+        .collect::<std::collections::HashMap<_, _>>();
+    for profile in &mut profiles {
+        let previous_profile = previous_by_id.get(profile.id.as_str()).copied();
+        profile.merge_redacted_secret(previous_profile);
+        if let Some(previous_profile) = previous_profile {
+            let auth_mode_changed = !profile
+                .auth_mode
+                .trim()
+                .eq_ignore_ascii_case(previous_profile.auth_mode.trim());
+            if auth_mode_changed {
+                profile.model_request_headers.clear();
+                profile.source_provider_id = None;
+                profile.supports_remote_compaction = false;
+                // Official routes derive WebSocket support automatically. Do
+                // not carry that derived capability into a newly converted
+                // API-key route; third-party WebSocket remains explicit opt-in.
+                profile.supports_websockets = false;
+                profile.supports_auto_review = false;
+                if profile.auth_mode.trim() == crate::config::AUTH_MODE_API_KEY {
+                    profile.official_account = false;
+                }
+            } else {
+                // These fields are discovered from the trusted Codex source and
+                // are not editable renderer input. Keep them attached
+                // to the saved route even though the renderer receives a redacted
+                // profile and sends the whole form back on save.
+                profile.model_request_headers = previous_profile.model_request_headers.clone();
+                profile.source_provider_id = previous_profile.source_provider_id.clone();
+                profile.official_account = previous_profile.official_account;
+                profile.supports_remote_compaction = previous_profile.supports_remote_compaction;
+            }
+        }
+        profile.normalize();
+    }
+    validate_provider_profiles(&profiles)?;
+    Ok(profiles)
+}
+
+fn retain_route_scoped_config(config: &mut CodeyConfig) {
+    let provider_ids = config
+        .profiles
+        .iter()
+        .map(|profile| {
+            profile
+                .source_provider_id
+                .as_deref()
+                .unwrap_or(profile.id.as_str())
+                .to_string()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    config
+        .selected_models_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
+    config
+        .manual_third_party_models_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
+    config
+        .declared_official_models_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
+    config
+        .upstream_models_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
+}
+
 fn current_fast_context_tools_status() -> FastContextToolsStatus {
-    fast_context_tools_status_or_blocked(fast_context_tools_status(&codex_home()))
+    fast_context_tools_status_or_blocked(fast_context_tools_status(codex_home()))
 }
 
 fn fast_context_tools_status_or_blocked<E>(
@@ -933,11 +1515,13 @@ fn embedded_fast_context_tools_enabled(requested: bool, status: &FastContextTool
     requested && !status.user_configured && !status.detection_failed
 }
 
-async fn configure_trace_log_guard(home: PathBuf, disable_writes: bool) -> Result<(), String> {
+async fn configure_trace_log_guard(
+    home: PathBuf,
+    disable_writes: bool,
+) -> Result<trace_log_guard::TraceLogGuardReport, String> {
     tokio::task::spawn_blocking(move || trace_log_guard::configure(&home, disable_writes))
         .await
         .map_err(|error| format!("Trace 日志保护切换任务异常退出：{error}"))?
-        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
@@ -947,7 +1531,7 @@ async fn rollback_trace_log_guard(
     primary_error: String,
 ) -> String {
     match configure_trace_log_guard(home, previous_disable_writes).await {
-        Ok(()) => primary_error,
+        Ok(_) => primary_error,
         Err(rollback_error) => {
             error_log::record_failure(
                 "restore_failed",
@@ -968,41 +1552,40 @@ async fn finish_codey_config_save(
     saved: SavedCodeyConfig,
 ) -> Result<Value, String> {
     sync_waiting_webhook_watcher(state).await;
+    sync_wechat_claw_service(state).await;
     if let Some(runtime) = state.runtime.lock().await.clone() {
         runtime.set_crashpad_pending_protection(saved.config.protect_crashpad_pending);
     }
     schedule_crashpad_pending_refresh(state, saved.config.protect_crashpad_pending);
-    let mut subagent_config_hot_reloaded = false;
-    let mut subagent_config_hot_reload_error = None;
-    if saved.refresh_subagent_config
-        && let Some(result) = hot_reload_runtime_subagent_config(state, &saved.config).await
-    {
-        match result {
-            Ok(()) => subagent_config_hot_reloaded = true,
-            Err(error) => subagent_config_hot_reload_error = Some(error),
-        }
-    }
-    let restart_required = if saved.refresh_subagent_config {
-        runtime_config_requires_restart(state, &saved.config).await
-    } else {
-        saved.restart_required
-    };
-    let cc_switch = cc_switch::status_from_config(&saved.config);
     let model_state = current_model_state_async(&saved.config).await?;
+    let model_hot_reload = hot_reload_runtime_models(state, &saved.config, &model_state).await;
+    let subagent_hot_reload = if saved.reconcile_subagent_config {
+        hot_reload_runtime_subagent_config(state, &saved.config).await
+    } else {
+        SubagentHotReloadOutcome::default()
+    };
+    let restart_required = subagent_hot_reload.requires_restart()
+        || runtime_config_requires_restart(state, &saved.config).await;
+    let subagent_config_hot_reloaded = subagent_hot_reload.reloaded();
+    let subagent_config_repaired = subagent_hot_reload.repaired();
+    let subagent_config_health = subagent_hot_reload.health();
+    let subagent_config_repair_reasons = subagent_hot_reload.repair_reasons();
+    let subagent_config_hot_reload_error = subagent_hot_reload.error();
+    let provider_status = codex_provider::status_from_config(&saved.config);
     let public_config = redacted_config(&saved.config);
-    Ok(json!({
+    Ok(model_hot_reload.add_to_response(json!({
         "status":"ok",
         "config":public_config,
-        "ccSwitch":cc_switch,
+        "providerStatus":provider_status,
         "modelState":model_state,
         "fastContextToolsStatus":saved.fast_context_tools_status,
         "restartRequired":restart_required,
         "subagentConfigHotReloaded":subagent_config_hot_reloaded,
-        "subagentConfigHotReloadError":subagent_config_hot_reload_error.clone(),
-        // Keep the original response keys for older injected consoles.
-        "subagentDefaultsHotReloaded":subagent_config_hot_reloaded,
-        "subagentDefaultsHotReloadError":subagent_config_hot_reload_error,
-    }))
+        "subagentConfigRepaired":subagent_config_repaired,
+        "subagentConfigHealth":subagent_config_health,
+        "subagentConfigRepairReasons":subagent_config_repair_reasons,
+        "subagentConfigHotReloadError":subagent_config_hot_reload_error,
+    })))
 }
 
 fn schedule_crashpad_pending_refresh(state: &Arc<AppState>, protection_enabled: bool) {
@@ -1076,33 +1659,134 @@ fn subagent_hot_reload_commit_is_current(
         && !has_startup_error
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SubagentHotReloadStatus {
+    #[default]
+    NotApplicable,
+    Unchanged,
+    Applied,
+    Repaired,
+    Superseded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct SubagentHotReloadOutcome {
+    status: SubagentHotReloadStatus,
+    error: Option<String>,
+    repair_reasons: Vec<String>,
+}
+
+impl SubagentHotReloadOutcome {
+    fn unchanged() -> Self {
+        Self {
+            status: SubagentHotReloadStatus::Unchanged,
+            ..Self::default()
+        }
+    }
+
+    fn applied(repaired: bool, repair_reasons: Vec<String>) -> Self {
+        Self {
+            status: if repaired {
+                SubagentHotReloadStatus::Repaired
+            } else {
+                SubagentHotReloadStatus::Applied
+            },
+            repair_reasons,
+            ..Self::default()
+        }
+    }
+
+    fn superseded(error: impl Into<String>) -> Self {
+        Self {
+            status: SubagentHotReloadStatus::Superseded,
+            error: Some(error.into()),
+            ..Self::default()
+        }
+    }
+
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            status: SubagentHotReloadStatus::Failed,
+            error: Some(error.into()),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn reloaded(&self) -> bool {
+        matches!(
+            self.status,
+            SubagentHotReloadStatus::Applied | SubagentHotReloadStatus::Repaired
+        )
+    }
+
+    pub(super) fn repaired(&self) -> bool {
+        self.status == SubagentHotReloadStatus::Repaired
+    }
+
+    pub(super) fn requires_restart(&self) -> bool {
+        self.status == SubagentHotReloadStatus::Failed
+    }
+
+    pub(super) fn health(&self) -> &'static str {
+        match self.status {
+            SubagentHotReloadStatus::NotApplicable => "not_applicable",
+            SubagentHotReloadStatus::Unchanged => "healthy",
+            SubagentHotReloadStatus::Applied => "applied",
+            SubagentHotReloadStatus::Repaired => "repaired",
+            SubagentHotReloadStatus::Superseded => "superseded",
+            SubagentHotReloadStatus::Failed => "restart_required",
+        }
+    }
+
+    pub(super) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub(super) fn repair_reasons(&self) -> &[String] {
+        &self.repair_reasons
+    }
+}
+
+fn should_reconcile_runtime_subagent_config(previous: &CodeyConfig, current: &CodeyConfig) -> bool {
+    previous.subagent_optimization && current.subagent_optimization
+}
+
 pub(super) async fn hot_reload_runtime_subagent_config(
     state: &Arc<AppState>,
     config: &CodeyConfig,
-) -> Option<Result<(), String>> {
-    let runtime = state.runtime.lock().await.clone()?;
-    if !runtime.supports_subagent_config_hot_reload(config) {
-        return None;
-    }
+) -> SubagentHotReloadOutcome {
     let desired_config = RuntimeSubagentConfig::from_config(config);
-    if runtime.applied_subagent_config().await == desired_config {
-        return None;
-    }
-    let runtime_generation = state.runtime_generation.load(Ordering::Acquire);
-    // Runtime role files are small and each individual write is atomic. Hold
-    // the lifecycle lock across the group so stop/restart cannot swap the lease
-    // while it is being committed.
+
+    // All code that needs both locks follows the lifecycle -> config order.
+    // Restart already holds the lifecycle lock while launch may synchronize and
+    // persist provider state, so taking the config lock first here would allow a
+    // save/restart lock inversion. Holding both locks across reconciliation still
+    // prevents an older save from committing role files after a newer config.
     let _runtime_operation = state.runtime_operation.lock().await;
+    let _config_commit_guard = state.config_write_lock.lock().await;
+    let current_config = state.config.read().await.clone();
+    let config_matches = current_config.subagent_optimization
+        && RuntimeSubagentConfig::from_config(&current_config) == desired_config
+        && current_config.fast_context_tools == config.fast_context_tools;
+    if !config_matches {
+        return SubagentHotReloadOutcome::superseded(
+            "Codey 设置在子代理配置热更新前已被更新；已跳过过期配置",
+        );
+    }
+    let Some(runtime) = state.runtime.lock().await.clone() else {
+        return SubagentHotReloadOutcome::default();
+    };
+    if !runtime.supports_subagent_config_hot_reload(&current_config) {
+        return SubagentHotReloadOutcome::default();
+    }
+    let applied_config_changed = runtime.applied_subagent_config().await != desired_config;
+    let runtime_generation = state.runtime_generation.load(Ordering::Acquire);
     let current_runtime = state.runtime.lock().await.clone();
     let same_runtime = current_runtime
         .as_ref()
         .is_some_and(|current| Arc::ptr_eq(current, &runtime));
     let current_generation = state.runtime_generation.load(Ordering::Acquire);
-    let current_config = state.config.read().await;
-    let config_matches = current_config.subagent_optimization
-        && RuntimeSubagentConfig::from_config(&current_config) == desired_config
-        && current_config.fast_context_tools == config.fast_context_tools;
-    drop(current_config);
     let has_startup_error = state.startup_error.read().await.is_some();
     if !subagent_hot_reload_commit_is_current(
         state.is_shutting_down(),
@@ -1113,30 +1797,28 @@ pub(super) async fn hot_reload_runtime_subagent_config(
         config_matches,
         has_startup_error,
     ) {
-        return Some(Err(
-            "Codex 运行时在子代理配置热更新前发生变化；已跳过过期配置".to_string(),
-        ));
+        return SubagentHotReloadOutcome::superseded(
+            "Codex 运行时在子代理配置热更新前发生变化；已跳过过期配置",
+        );
     }
 
-    let runtime_config = config.clone();
+    let runtime_config = current_config.clone();
     let result = tokio::task::spawn_blocking(move || {
-        refresh_runtime_subagent_roles(&runtime_config).map_err(|error| format!("{error:#}"))
+        reconcile_runtime_subagent_roles(&runtime_config).map_err(|error| format!("{error:#}"))
     })
     .await
     .map_err(|error| format!("子代理运行时文件更新任务异常退出：{error}"))
     .and_then(std::convert::identity);
     match result {
-        Ok(()) => {
+        Ok(report) => {
+            if !report.repaired && !applied_config_changed {
+                return SubagentHotReloadOutcome::unchanged();
+            }
             let current_runtime = state.runtime.lock().await.clone();
             let same_runtime = current_runtime
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &runtime));
             let current_generation = state.runtime_generation.load(Ordering::Acquire);
-            let current_config = state.config.read().await;
-            let config_matches = current_config.subagent_optimization
-                && RuntimeSubagentConfig::from_config(&current_config) == desired_config
-                && current_config.fast_context_tools == config.fast_context_tools;
-            drop(current_config);
             let has_startup_error = state.startup_error.read().await.is_some();
             if !subagent_hot_reload_commit_is_current(
                 state.is_shutting_down(),
@@ -1147,24 +1829,31 @@ pub(super) async fn hot_reload_runtime_subagent_config(
                 config_matches,
                 has_startup_error,
             ) {
-                return Some(Err(
-                    "Codex 运行时在子代理配置热更新期间发生变化；已跳过过期运行时提交".to_string(),
-                ));
+                return SubagentHotReloadOutcome::failed(
+                    "Codex 运行时在子代理配置热更新期间发生变化；需要重启以重新建立可信运行配置",
+                );
             }
-            runtime.mark_subagent_config_applied(config).await;
-            Some(Ok(()))
+            runtime.mark_subagent_config_applied(&current_config).await;
+            SubagentHotReloadOutcome::applied(
+                report.repaired,
+                report
+                    .reasons
+                    .into_iter()
+                    .map(|reason| reason.as_str().to_string())
+                    .collect(),
+            )
         }
         Err(error) => {
             let error = format!("{error:#}");
             error_log::record_failure(
                 "patch_verification_failed",
-                "refresh_subagent_runtime_files",
+                "reconcile_subagent_runtime_files",
                 error.clone(),
                 json!({
                     "roleCount": config.subagent_roles.len(),
                 }),
             );
-            Some(Err(error))
+            SubagentHotReloadOutcome::failed(error)
         }
     }
 }
@@ -1175,7 +1864,7 @@ mod subagent_hot_reload_commit_tests;
 fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
     let mut public = config.clone();
     for profile in &mut public.profiles {
-        profile.api_key.clear();
+        profile.api_key_configured = !profile.api_key.trim().is_empty();
     }
     public.webhook.url.clear();
     for channel in &mut public.webhook.channels {
@@ -1183,31 +1872,36 @@ fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
         channel.url.clear();
         channel.bot_token_configured = !channel.bot_token.trim().is_empty();
         channel.bot_token.clear();
+        channel.context_token_configured = !channel.context_token.trim().is_empty();
+        channel.context_token.clear();
+        channel.get_updates_buf.clear();
     }
     public.prompt_optimization.api_key_configured =
         !public.prompt_optimization.api_key.trim().is_empty();
-    public.prompt_optimization.api_key.clear();
     public
 }
 
 async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
-    let config = state.config.read().await.clone();
-    if !config.show_account_usage_in_header {
-        return json!({"status": "disabled"});
-    }
-    if !cc_switch::status_from_config(&config).provider.official {
-        return json!({
-            "status": "unavailable",
-            "reason": "third_party",
-            "message": "顶部额度仅支持官方账号线路",
-        });
+    {
+        let config = state.config.read().await;
+        if !config.show_account_usage_in_header {
+            return json!({"status": "disabled"});
+        }
+        if !account_usage_enabled_for_config(&config) {
+            return json!({
+                "status": "unavailable",
+                "reason": "official_account_missing",
+                "message": "当前线路列表中没有可用的官方账号线路",
+            });
+        }
     }
 
     let home = codex_home();
     let mut cache = state.account_usage_cache.lock().await;
-    match cache.fetch(&home).await {
+    match cache.fetch(home).await {
         Ok(snapshot) => {
-            let mut value = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}));
+            let mut value = serde_json::to_value(snapshot)
+                .expect("account usage snapshots must be JSON-serializable");
             if let Some(object) = value.as_object_mut() {
                 object.insert("status".into(), Value::String("ok".into()));
             }
@@ -1220,19 +1914,43 @@ async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
     }
 }
 
+fn account_usage_enabled_for_config(config: &CodeyConfig) -> bool {
+    config.show_account_usage_in_header
+        && config
+            .profiles
+            .iter()
+            .any(|profile| profile.official_account)
+}
+
+#[cfg(test)]
 fn config_requires_restart(
     applied: &CodeyConfig,
     applied_models: &RuntimeModelConfig,
     applied_subagent: &RuntimeSubagentConfig,
     current: &CodeyConfig,
 ) -> bool {
-    applied.active_profile() != current.active_profile()
+    config_requires_restart_with_route_status(
+        provider_route_requires_restart(applied, current),
+        applied,
+        applied_models,
+        applied_subagent,
+        current,
+    )
+}
+
+pub(super) fn config_requires_restart_with_route_status(
+    provider_route_restart_required: bool,
+    applied: &CodeyConfig,
+    applied_models: &RuntimeModelConfig,
+    applied_subagent: &RuntimeSubagentConfig,
+    current: &CodeyConfig,
+) -> bool {
+    provider_route_restart_required
         || applied.codex_app_path != current.codex_app_path
         || applied.user_scripts != current.user_scripts
         || applied.slim_codex_pet != current.slim_codex_pet
         || applied.gpu_launch_mode != current.gpu_launch_mode
         || applied.fast_context_tools != current.fast_context_tools
-        || applied.fast_codex_startup != current.fast_codex_startup
         || applied.subagent_optimization != current.subagent_optimization
         || applied_models != &RuntimeModelConfig::from_config(current)
         || ((applied.subagent_optimization || current.subagent_optimization)
@@ -1241,6 +1959,16 @@ fn config_requires_restart(
             && applied_subagent != &RuntimeSubagentConfig::from_config(current))
 }
 
+pub(super) fn provider_route_restart_required_for_runtime(
+    runtime: &CodeyRuntime,
+    current: &CodeyConfig,
+) -> bool {
+    official_route_snapshots(&runtime.applied_config) != official_route_snapshots(current)
+        || websocket_transport_requires_restart(&runtime.applied_config, current)
+        || remote_compaction_transport_requires_restart(&runtime.applied_config, current)
+}
+
+#[cfg(test)]
 fn model_catalog_config_for_runtime<'a>(
     current: &'a CodeyConfig,
     runtime_applied: Option<&'a CodeyConfig>,
@@ -1257,7 +1985,10 @@ async fn runtime_config_requires_restart(state: &Arc<AppState>, current: &CodeyC
     };
     let applied_models = runtime.applied_model_config().await;
     let applied_subagent = runtime.applied_subagent_config().await;
-    config_requires_restart(
+    let provider_route_restart_required =
+        provider_route_restart_required_for_runtime(&runtime, current);
+    config_requires_restart_with_route_status(
+        provider_route_restart_required,
         &runtime.applied_config,
         &applied_models,
         &applied_subagent,
@@ -1302,7 +2033,7 @@ pub async fn delete_selected_messages(
 ) -> Result<Value, String> {
     let home = codex_home();
     let result = tokio::task::spawn_blocking(move || {
-        delete_messages_persistently(&home, &session_id, &message_ids)
+        delete_messages_persistently(home, &session_id, &message_ids)
     })
     .await
     .map_err(|error| format!("消息删除任务异常退出：{error}"))?
@@ -1317,7 +2048,7 @@ pub async fn delete_session_record(
 ) -> Result<Value, String> {
     let home = codex_home();
     let result = tokio::task::spawn_blocking(move || {
-        session_delete::delete_session(&home, &session_id, &title)
+        session_delete::delete_session(home, &session_id, &title)
     })
     .await
     .map_err(|error| format!("会话删除任务异常退出：{error}"))?

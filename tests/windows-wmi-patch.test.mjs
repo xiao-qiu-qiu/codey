@@ -6,6 +6,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
+
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
 async function loadPatchExpression() {
@@ -16,7 +18,7 @@ async function loadPatchExpression() {
   assert.ok(template, "startup patch template should be readable by the regression test");
   return template
     .replaceAll("__DISABLE_PET__", "false")
-    .replaceAll("__FAST_CODEX_STARTUP__", "true");
+    .replaceAll("__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__", "false");
 }
 
 test("Windows worker source signature cache is bounded", async () => {
@@ -29,6 +31,8 @@ test("Windows worker source signature cache is bounded", async () => {
     /workerSourceMatchCache\.size > maximumWmiWorkerSourceCacheEntries/,
   );
   assert.match(source, /workerSourceMatchCache\.delete\(oldestKey\)/);
+  assert.match(source, /stats\.mtimeNs/);
+  assert.match(source, /stats\.ctimeNs/);
 });
 
 async function withWindowsPlatform(run) {
@@ -56,9 +60,10 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
 
     try {
       const expression = await loadPatchExpression();
-      assert.equal((0, eval)(expression), "codey-startup-patch-installed-v22");
+      assert.equal((0, eval)(expression), "codey-startup-patch-installed-v37");
       const initialSampler =
         globalThis.__CODEY_CODEX_STARTUP_PATCH__.windowsWmiSampler;
+      assert.equal(initialSampler.version, 4);
       assert.equal(initialSampler.selfTestPassed, true);
       assert.equal(initialSampler.selfTestError, "");
       assert.equal(initialSampler.blocked, 0);
@@ -128,6 +133,26 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
         value: [],
       });
 
+      const pwshWorkerPath = join(
+        temporaryDirectory,
+        "process-telemetry-pwsh.mjs",
+      );
+      await writeFile(
+        pwshWorkerPath,
+        [
+          'import { parentPort } from "node:worker_threads";',
+          'const executable = "pwsh.exe";',
+          'const command = "Get-CimInstance Win32_Process Win32_PerfRawData_PerfProc_Process";',
+          "parentPort.postMessage({ executable, command });",
+        ].join("\n"),
+      );
+      const pwshBlocked = new workerThreads.Worker(pwshWorkerPath);
+      assert.equal(pwshBlocked.threadId, -1);
+      assert.deepEqual((await once(pwshBlocked, "message"))[0], {
+        type: "ok",
+        value: [],
+      });
+
       const evalBlocked = new workerThreads.Worker(
         [
           'const { parentPort } = require("node:worker_threads");',
@@ -175,6 +200,22 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
       assert.equal((await once(harmless, "message"))[0], "harmless-worker-ran");
       await harmless.terminate();
 
+      await writeFile(
+        harmlessWorkerPath,
+        [
+          'import { parentPort } from "node:worker_threads";',
+          'const executable = "powershell.exe";',
+          'const command = "Get-WmiObject Win32_Process Win32_PerfFormattedData_PerfProc_Process";',
+          "parentPort.postMessage({ executable, command, replaced: true });",
+        ].join("\n"),
+      );
+      const replacedAtSamePath = new workerThreads.Worker(harmlessWorkerPath);
+      assert.equal(replacedAtSamePath.threadId, -1);
+      assert.deepEqual((await once(replacedAtSamePath, "message"))[0], {
+        type: "ok",
+        value: [],
+      });
+
       const normal = new workerThreads.Worker(
         'require("node:worker_threads").parentPort.postMessage("normal-worker-ran")',
         { eval: true, name: "child-process-snapshot-preview" },
@@ -188,8 +229,8 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
       assert.equal(sampler.workerWrapperPatched, true);
       assert.equal(sampler.esmExportsSynchronized, true);
       assert.equal(sampler.selfTestPassed, true);
-      assert.equal(sampler.blocked, 7);
-      assert.equal(sampler.sourceSignatureMatches, 3);
+      assert.equal(sampler.blocked, 9);
+      assert.equal(sampler.sourceSignatureMatches, 5);
       assert.equal(sampler.lastMatchReason, "source-signature");
       assert.equal(sampler.lastObservedWorkerName, "eval-worker");
       assert.equal(
@@ -206,13 +247,14 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
   });
 });
 
-test("settings exposes degraded Windows optimization failures", async () => {
+test("settings keeps Windows optimization checks without a standalone banner", async () => {
   const [
     sectionsSource,
     typesSource,
     commandsSource,
     launcherRootSource,
     launcherProcessSource,
+    runtimeStatusPresentation,
   ] = await Promise.all([
     readFile(new URL("../src/OperationsPanel.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/App.types.ts", import.meta.url), "utf8"),
@@ -222,24 +264,27 @@ test("settings exposes degraded Windows optimization failures", async () => {
       new URL("../backend/src/launcher/process.rs", import.meta.url),
       "utf8",
     ),
+    loadTypeScriptModule(
+      new URL("../src/runtimeStatusPresentation.ts", import.meta.url),
+    ),
   ]);
   const launcherSource = `${launcherRootSource}\n${launcherProcessSource}`;
 
   assert.match(commandsSource, /"clientPlatform": current_update_platform\(\)/);
-  assert.match(commandsSource, /injection_statuses_for_display/);
+  assert.doesNotMatch(commandsSource, /injection_statuses_for_display/);
   assert.match(typesSource, /clientPlatform\?: string/);
   assert.match(sectionsSource, /status\.clientPlatform === "windows"/);
-  assert.match(sectionsSource, /\{isWindowsClient && \(/);
-  assert.match(sectionsSource, /Windows 优化补丁/);
-  assert.match(sectionsSource, /windowsStartupPatchInstalled/);
-  assert.match(sectionsSource, /windowsWmiSamplerConfirmed/);
-  assert.match(sectionsSource, /script\.id === "windows-wmi-sampler"/);
+  assert.doesNotMatch(sectionsSource, /Windows 优化补丁/);
+  assert.doesNotMatch(sectionsSource, /windows-patch-status/);
+  assert.doesNotMatch(sectionsSource, /windowsStartupPatchInstalled/);
+  assert.doesNotMatch(sectionsSource, /windowsWmiSamplerConfirmed/);
+  assert.doesNotMatch(sectionsSource, /script\.id === "windows-wmi-sampler"/);
   assert.match(
     sectionsSource,
     /performanceStatus === "error" \|\|[\s\S]*?performanceStatus === "degraded"/,
   );
-  assert.match(sectionsSource, /windowsPatchReady[\s\S]*?"已启用"/);
-  assert.match(sectionsSource, /windowsPatchFailed[\s\S]*?"未生效"/);
+  assert.doesNotMatch(sectionsSource, /windowsPatchReady/);
+  assert.doesNotMatch(sectionsSource, /windowsPatchFailed/);
   assert.doesNotMatch(
     sectionsSource,
     /WMI 周期采样、临时 WebView 残留与执行环境泄漏修复已生效/,
@@ -248,8 +293,19 @@ test("settings exposes degraded Windows optimization failures", async () => {
     launcherSource,
     /WMI 周期采样保护等待运行时确认/,
   );
-  assert.match(sectionsSource, /script\.status === "failed"/);
-  assert.match(sectionsSource, /scriptFailed[\s\S]*?\? "失败"/);
+  const failedSummary = runtimeStatusPresentation.summarizeInjectionScripts([
+    {
+      id: "windows-internal-failure",
+      name: "Windows 内部保护",
+      source: "builtin",
+      visibility: "internal",
+      status: "failed",
+    },
+  ]);
+  assert.equal(failedSummary.internalInjectionError, true);
+  assert.equal(failedSummary.failedInjectionScriptCount, 0);
+  assert.doesNotMatch(sectionsSource, /injection-script-state/);
+  assert.doesNotMatch(sectionsSource, /id: "opt-patch"/);
   assert.doesNotMatch(launcherSource, /fn mark_pet_slim_startup_failure/);
   assert.doesNotMatch(launcherSource, /pet_status\.status = "failed"/);
 });

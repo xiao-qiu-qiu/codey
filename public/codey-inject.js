@@ -3,8 +3,8 @@
 // testing entry point.
 (() => {
   if (window.__codeySessionToolsInjectLoaded) return;
-  window.__codeySessionToolsInjectLoaded = true;
-  window.__codeyRendererInjectLoaded = true;
+  if (window.__codeySessionToolsInjectLoading) return;
+  window.__codeySessionToolsInjectLoading = true;
   const rendererSettingsButtonSelector = "#codey-settings-button";
   const toolbarId = "codey-message-toolbar";
   const toastId = "codey-runtime-toast";
@@ -51,15 +51,14 @@
   const sidebarTitleCache = new Map();
   let watcherWakeTimer = 0;
   let deletePopoverCleanup = null;
-  let codexSignalDispatcherPromise = null;
-  let activeWorkRefreshInFlight = false;
-  let lastActiveWorkRefreshAt = 0;
+  let codexSessionControllerPromise = null;
+  let completionRunningObservation = null;
+  let completionProbeInFlight = false;
+  let completionNextProbeAt = 0;
   let sidebarActionTooltipTimer = 0;
   let sidebarActionTooltipAnchor = null;
   let threadUpdatedAtFetchTimer = 0;
   let threadUpdatedAtFetchInFlight = false;
-  let threadUpdatedAtFetchRetryCount = 0;
-  const threadUpdatedAtReadRetryCounts = new Map();
   const threadUpdatedAtCache = new Map();
   const threadWorkStateByRow = new WeakMap();
   // React can briefly detach the native status rail or replace a virtualized
@@ -70,12 +69,14 @@
   const threadUpdatedAtRequestedAt = new Map();
   const pendingThreadUpdatedAtRefs = new Map();
   const threadUpdatedAtRows = new Set();
-  // A permanently deleted thread ID stays hidden for this renderer lifetime.
-  // Only an explicit Codey import can make the same ID valid again.
+  // A permanently deleted thread ID cannot become valid again unless an
+  // import explicitly restores it. Keep the tombstone for this renderer's
+  // lifetime so a stale native/virtualized row cannot reappear later.
   const deletedSidebarSessionIds = new Set();
   const pendingSidebarSessionDeleteIds = new Set();
   const hardDeletedMessageKeys = new Set();
-  const messageSelectButtons = typeof WeakMap === "function" ? new WeakMap() : null;
+  const completionRecoveryStateByKey = new Map();
+  const messageSelectButtons = new WeakMap();
   const conversationTurnSelector = [
     "[data-turn-key]",
     "[data-message-author-role]",
@@ -85,13 +86,13 @@
   // Rich conversation tooltips (notably Hooks details) can be taller than the
   // collision-limited tooltip box. Clip the overflowing children inside that
   // box so they cannot cover their trigger and create a pointer enter/leave
-  // loop. aria-describedby is present only while the native tooltip is open.
-  const conversationRichTooltipSelector = conversationTurnSelector
-    .split(", ")
-    .map((turnSelector) => (
-      `body:has(${turnSelector} span[tabindex="0"][aria-describedby]) [role="tooltip"]`
-    ))
-    .join(", ");
+  // loop. Codex has shipped both native button and focusable-span triggers;
+  // aria-describedby is present only while the native tooltip is open.
+  // Toggle a body class from the session-tools observer instead of body:has()
+  // so streaming characterData/childList invalidation does not re-match the
+  // four descendant :has() selectors on every mutation.
+  const conversationRichTooltipOpenClass = "codey-rich-tooltip-open";
+  const conversationRichTooltipTriggerSelector = "button, [role=\"button\"], span[tabindex=\"0\"]";
   const sidebarScanRootSelector = [
     "header",
     "nav",
@@ -106,16 +107,20 @@
   const taskListSectionHeadings = new Set(["task", "tasks", "recent", "recents", "任务", "最近"]);
   const threadRunningLossGraceMs = 2_000;
   const threadTimestampRefreshIntervalMs = 60_000;
-  const activeWorkRefreshIntervalMs = 3_000;
-  const threadTimestampListPageSize = 100;
-  const maxThreadTimestampListPages = 5;
-  const threadTimestampReadBatchSize = 32;
-  const threadTimestampReadConcurrency = 4;
-  const maxThreadTimestampFetchRetries = 5;
+  const stuckCompletionGraceMs = 30_000;
+  const stuckCompletionProbeIntervalMs = 15_000;
+  const stuckCompletionProbeTimeoutMs = 10_000;
+  const stuckCompletionRecoveryRetryMs = 30_000;
+  const stuckCompletionRecoveryCooldownMs = 60_000;
+  const stuckCompletionRecoveryResetMs = 5 * 60_000;
+  const stuckCompletionRecoveryMaxAttempts = 3;
+  const threadTimestampBridgePath = "/session/timestamps";
+  const stuckCompletionBridgePath = "/session/completion-state";
   const maxPendingThreadTimestampRefs = 200;
   const fallbackSessionExportMaxBytes = 64 * 1024 * 1024;
   const maxSessionCacheEntries = 2_048;
   const maxHardDeletedMessageKeys = 10_000;
+  const maxCompletionRecoveryKeys = 512;
   const maxPendingScanRoots = 64;
   const projectRunningRecoveryClickCooldownMs = 1_000;
   const rememberBoundedMapValue = (cache, key, value, limit = maxSessionCacheEntries) => {
@@ -143,9 +148,9 @@
     return matches;
   };
 
-  const callBridge = (path, payload = {}) => {
+  const callBridge = (path, payload = {}, options = {}) => {
     if (typeof window.__codexSessionDeleteBridge === "function") {
-      return window.__codexSessionDeleteBridge(path, payload);
+      return window.__codexSessionDeleteBridge(path, payload, options);
     }
     return Promise.resolve({ status: "failed", message: "Codey bridge unavailable" });
   };
@@ -235,18 +240,102 @@
       : normalized;
   };
 
+  const usableMessageId = (value) => {
+    const normalized = normalizeMessageId(value);
+    if (!normalized || normalized === "conversation-turn") return "";
+    return normalized;
+  };
+
+  const reactStateKeys = (element) => Object.keys(element).filter((key) => (
+    key.startsWith("__reactFiber")
+    || key.startsWith("__reactInternalInstance")
+    || key.startsWith("__reactProps")
+  ));
+
+  const messageIdFromReactState = (element) => {
+    const visited = new WeakSet();
+    const stack = reactStateKeys(element).map((key) => ({
+      value: element[key],
+      depth: 0,
+      path: key.toLowerCase(),
+    }));
+    const candidates = [];
+    const addCandidate = (value, score) => {
+      const messageId = usableMessageId(value);
+      if (messageId) candidates.push({ messageId, score });
+    };
+    let scanned = 0;
+    while (stack.length && candidates.length < 32 && scanned < 240) {
+      const { value, depth, path } = stack.pop();
+      if (!value || typeof value !== "object" || visited.has(value) || depth > 7) continue;
+      if (value instanceof HTMLElement || value === window || value === document) continue;
+      visited.add(value);
+      scanned += 1;
+      for (const key of Object.keys(value).slice(0, 80)) {
+        let child;
+        try {
+          child = value[key];
+        } catch {
+          continue;
+        }
+        const loweredKey = key.toLowerCase();
+        const nextPath = `${path}.${loweredKey}`;
+        const keyLooksLikeTurnId = /^(turnkey|turn_key|turnid|turn_id)$/.test(loweredKey);
+        const keyLooksLikeMessageId = /^(messageid|message_id|itemid|item_id)$/.test(loweredKey);
+        const genericIdScore = path.includes("turn")
+          ? 4
+          : /(message|item)/.test(path)
+            ? 2
+            : /(response|entry)/.test(path)
+              ? 1
+              : 0;
+        if (typeof child === "string" || typeof child === "number") {
+          if (keyLooksLikeTurnId) addCandidate(child, 5);
+          else if (keyLooksLikeMessageId) addCandidate(child, 3);
+          else if (loweredKey === "id" && genericIdScore) addCandidate(child, genericIdScore);
+          else if (loweredKey === "key" && genericIdScore) addCandidate(child, genericIdScore);
+          continue;
+        }
+        if (child && typeof child === "object") {
+          stack.push({ value: child, depth: depth + 1, path: nextPath });
+        }
+      }
+    }
+    candidates.sort((left, right) => right.score - left.score);
+    return candidates[0]?.messageId || "";
+  };
+
   const getMessageId = (row) => {
     const direct = ["data-turn-key", "data-message-id", "data-messageid", "data-item-id", "data-id"]
       .map((key) => row.getAttribute(key)).find(Boolean);
-    if (direct) return normalizeMessageId(direct);
+    if (direct) return usableMessageId(direct);
     const child = row.querySelector("[data-turn-key], [data-message-id], [data-item-id], [data-id]");
-    return normalizeMessageId(
+    return usableMessageId(
       child?.getAttribute("data-turn-key")
       || child?.getAttribute("data-message-id")
       || child?.getAttribute("data-item-id")
       || child?.getAttribute("data-id")
       || "",
-    );
+    ) || messageIdFromReactState(row);
+  };
+
+  const getCurrentTurnId = () => {
+    const rows = Array.from(document.querySelectorAll?.(conversationTurnSelector) || []);
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      let parent = rows[index].parentElement;
+      let nested = false;
+      while (parent) {
+        if (parent.matches?.(conversationTurnSelector)) {
+          nested = true;
+          break;
+        }
+        parent = parent.parentElement;
+      }
+      if (nested) continue;
+      const turnId = getMessageId(rows[index]);
+      if (turnId) return turnId;
+    }
+    return "";
   };
 
   const hardDeletedMessageKey = (sessionId, messageId) => {
@@ -289,10 +378,10 @@
       .${selectedClass}[data-codey-selected-next="true"]::before { border-bottom: 0; border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
       [data-codey-message-id] { overflow: visible !important; }
       [data-codey-message-select] { -webkit-app-region: no-drag !important; position: absolute; left: -48px; top: 8px; z-index: 30; display: grid; place-items: center; width: 24px; height: 24px; border: 1px solid rgba(139, 151, 255, .42); border-radius: 999px; padding: 0; background: rgba(22, 26, 39, .66); color: #dce2ff; cursor: pointer; font: 700 13px/1 system-ui, sans-serif; opacity: .24; pointer-events: auto !important; transition: opacity .15s ease, background .15s ease, transform .15s ease; }
-      [data-turn-key]:hover > [data-codey-message-select], [data-codey-message-select]:focus-visible, [data-codey-message-select][aria-pressed="true"] { opacity: 1; }
+      [data-codey-message-row]:hover > [data-codey-message-select], [data-codey-message-select]:focus-visible, [data-codey-message-select][aria-pressed="true"] { opacity: 1; }
       [data-codey-message-select]:hover { transform: scale(1.06); }
       [data-codey-message-select][aria-pressed="true"] { background: #5968de; border-color: #a5aeff; color: white; }
-      ${conversationRichTooltipSelector} { overflow-x: hidden !important; overflow-y: auto !important; overscroll-behavior: contain; }
+      body.${conversationRichTooltipOpenClass} [role="tooltip"] { overflow-x: hidden !important; overflow-y: auto !important; overscroll-behavior: contain; }
       @media (max-width: 760px) { [data-codey-message-select] { left: 4px; top: -34px; } }
       #${toastId} { -webkit-app-region: no-drag !important; position: fixed; right: 20px; bottom: 22px; z-index: 2147483645; max-width: 360px; border: 1px solid rgba(124, 140, 255, .4); border-radius: 11px; padding: 10px 13px; background: rgba(20, 24, 36, .97); color: #eef2ff; box-shadow: 0 12px 36px rgba(0,0,0,.4); font: 12px/1.45 system-ui, sans-serif; }
       #${toastId}[data-tone="error"] { border-color: rgba(248, 113, 113, .6); color: #fecaca; }
@@ -769,11 +858,6 @@
     [...pendingThreadUpdatedAtRefs.keys()].forEach((key) => {
       if (key.endsWith(`\u0000${normalizedSessionId}`)) pendingThreadUpdatedAtRefs.delete(key);
     });
-    [...threadUpdatedAtReadRetryCounts.keys()].forEach((key) => {
-      if (key.endsWith(`\u0000${normalizedSessionId}`)) {
-        threadUpdatedAtReadRetryCounts.delete(key);
-      }
-    });
     [...threadRunningStateByCacheKey.keys()].forEach((key) => {
       if (!key.endsWith(`\u0000${normalizedSessionId}`)) return;
       threadRunningStateByCacheKey.delete(key);
@@ -1046,7 +1130,7 @@
         scheduleThreadRunningRecheck(cacheKey, remainingMs);
         return;
       }
-      installThreadUpdatedTimes(document);
+      refreshTrackedThreadUpdatedTimes();
       const current = threadRunningStateByCacheKey.get(cacheKey);
       if (current === state && current?.missingSince === state.missingSince) {
         threadRunningStateByCacheKey.delete(cacheKey);
@@ -1170,7 +1254,6 @@
     if (state.kind !== "remote") return false;
     pendingThreadUpdatedAtRefs.delete(state.cacheKey);
     threadUpdatedAtRequestedAt.delete(state.cacheKey);
-    threadUpdatedAtReadRetryCounts.delete(state.cacheKey);
     const task = remoteThreadTaskFromRow(row, state.sessionId);
     if (!task) return true;
     const timestamp = threadTimestampMsFromPayload(task);
@@ -1406,161 +1489,23 @@
     const refs = [...pendingThreadUpdatedAtRefs.values()].slice(0, maxPendingThreadTimestampRefs);
     refs.forEach(({ cacheKey }) => pendingThreadUpdatedAtRefs.delete(cacheKey));
     threadUpdatedAtFetchInFlight = true;
-    let retryDelayMs = 40;
     try {
-      const dispatcher = await getCodexSignalDispatcher();
-      const refsByHost = new Map();
-      refs.forEach((ref) => {
-        const hostRefs = refsByHost.get(ref.hostId) || [];
-        hostRefs.push(ref);
-        refsByHost.set(ref.hostId, hostRefs);
-      });
-      const refreshedCacheKeys = new Set();
-      for (const [hostId, hostRefs] of refsByHost) {
-        const remainingSessionIds = new Set(hostRefs.map(({ sessionId }) => sessionId));
-        let cursor = null;
-        let pageCount = 0;
-        const seenCursors = new Set();
-        const listRefs = hostRefs.filter(({ exactReadOnly }) => !exactReadOnly);
-        if (listRefs.length) {
-          const listSessionIds = new Set(listRefs.map(({ sessionId }) => sessionId));
-          do {
-            const result = await dispatcher("send-cli-request-for-host", {
-              hostId,
-              method: "thread/list",
-              params: {
-                archived: false,
-                cursor,
-                limit: threadTimestampListPageSize,
-                modelProviders: null,
-                useStateDbOnly: true,
-              },
-              priority: "background",
-              source: "thread_list",
-            });
-            if (!Array.isArray(result?.data)) {
-              throw new Error("Codex thread/list response is unavailable");
-            }
-            pageCount += 1;
-            result.data.forEach((item) => {
-              const payload = item?.thread && typeof item.thread === "object" ? item.thread : item;
-              const sessionId = normalizeThreadSessionId(
-                payload?.id
-                ?? payload?.thread_id
-                ?? payload?.threadId
-                ?? payload?.conversation_id
-                ?? payload?.conversationId,
-              );
-              if (!listSessionIds.has(sessionId) || !remainingSessionIds.has(sessionId)) return;
-              const timestamp = threadTimestampMsFromPayload(payload);
-              const cacheKey = threadTimestampCacheKey(hostId, sessionId);
-              if (isDeletedSidebarSession(sessionId) || !timestamp) {
-                threadUpdatedAtCache.delete(cacheKey);
-              } else {
-                rememberBoundedMapValue(threadUpdatedAtCache, cacheKey, timestamp);
-              }
-              remainingSessionIds.delete(sessionId);
-              threadUpdatedAtReadRetryCounts.delete(cacheKey);
-              refreshedCacheKeys.add(cacheKey);
-            });
-            const nextCursor = result?.nextCursor ?? null;
-            if (![...listSessionIds].some((sessionId) => remainingSessionIds.has(sessionId))) {
-              break;
-            }
-            if (
-              nextCursor == null
-              || seenCursors.has(nextCursor)
-              || pageCount >= maxThreadTimestampListPages
-            ) break;
-            seenCursors.add(nextCursor);
-            cursor = nextCursor;
-          } while (true);
-        }
-
-        const fallbackRefs = hostRefs
-          .filter(({ sessionId }) => remainingSessionIds.has(sessionId));
-        for (
-          let chunkIndex = 0;
-          chunkIndex < fallbackRefs.length;
-          chunkIndex += threadTimestampReadBatchSize
-        ) {
-          const chunk = fallbackRefs.slice(
-            chunkIndex,
-            chunkIndex + threadTimestampReadBatchSize,
-          );
-          for (
-            let index = 0;
-            index < chunk.length;
-            index += threadTimestampReadConcurrency
-          ) {
-            const batch = chunk.slice(index, index + threadTimestampReadConcurrency);
-            const results = await Promise.all(batch.map(async (ref) => {
-              try {
-                const result = await dispatcher("send-cli-request-for-host", {
-                  hostId,
-                  method: "thread/read",
-                  params: {
-                    includeTurns: false,
-                    threadId: ref.sessionId,
-                  },
-                  priority: "background",
-                  source: "thread_list",
-                });
-                const payload = result?.thread && typeof result.thread === "object"
-                  ? result.thread
-                  : result;
-                return { failed: false, payload, ref };
-              } catch {
-                return { failed: true, payload: null, ref };
-              }
-            }));
-            results.forEach(({ failed, payload, ref }) => {
-              if (failed) {
-                if (isDeletedSidebarSession(ref.sessionId)) {
-                  threadUpdatedAtReadRetryCounts.delete(ref.cacheKey);
-                  threadUpdatedAtRequestedAt.delete(ref.cacheKey);
-                  return;
-                }
-                const retryCount = (threadUpdatedAtReadRetryCounts.get(ref.cacheKey) || 0) + 1;
-                if (retryCount <= maxThreadTimestampFetchRetries) {
-                  threadUpdatedAtReadRetryCounts.set(ref.cacheKey, retryCount);
-                  threadUpdatedAtRequestedAt.delete(ref.cacheKey);
-                  pendingThreadUpdatedAtRefs.set(ref.cacheKey, {
-                    ...ref,
-                    exactReadOnly: true,
-                  });
-                  retryDelayMs = Math.max(
-                    retryDelayMs,
-                    Math.min(30_000, 500 * (2 ** (retryCount - 1))),
-                  );
-                } else {
-                  threadUpdatedAtReadRetryCounts.delete(ref.cacheKey);
-                  rememberBoundedMapValue(
-                    threadUpdatedAtRequestedAt,
-                    ref.cacheKey,
-                    Date.now(),
-                  );
-                }
-                return;
-              }
-              const timestamp = threadTimestampMsFromPayload(payload);
-              if (isDeletedSidebarSession(ref.sessionId) || !timestamp) {
-                threadUpdatedAtCache.delete(ref.cacheKey);
-              } else {
-                rememberBoundedMapValue(threadUpdatedAtCache, ref.cacheKey, timestamp);
-              }
-              remainingSessionIds.delete(ref.sessionId);
-              threadUpdatedAtReadRetryCounts.delete(ref.cacheKey);
-              rememberBoundedMapValue(
-                threadUpdatedAtRequestedAt,
-                ref.cacheKey,
-                Date.now(),
-              );
-              refreshedCacheKeys.add(ref.cacheKey);
-            });
-          }
-        }
+      const sessionIds = [...new Set(refs.map(({ sessionId }) => sessionId))];
+      const result = await callBridge(threadTimestampBridgePath, { sessionIds });
+      if (result?.status !== "ok" || !result.timestamps || typeof result.timestamps !== "object") {
+        throw new Error(result?.message || "Codey thread timestamp bridge is unavailable");
       }
+      const refreshedCacheKeys = new Set();
+      refs.forEach((ref) => {
+        const timestamp = threadTimestampValueToMs(result.timestamps[ref.sessionId]);
+        if (isDeletedSidebarSession(ref.sessionId) || !timestamp) {
+          threadUpdatedAtCache.delete(ref.cacheKey);
+        } else {
+          rememberBoundedMapValue(threadUpdatedAtCache, ref.cacheKey, timestamp);
+        }
+        rememberBoundedMapValue(threadUpdatedAtRequestedAt, ref.cacheKey, Date.now());
+        refreshedCacheKeys.add(ref.cacheKey);
+      });
       forEachTrackedThreadRow((row) => {
         const identity = threadIdentityNode(row);
         const sessionId = identity instanceof HTMLElement
@@ -1572,38 +1517,21 @@
           && !isDeletedSidebarSession(sessionId)
         ) renderCachedThreadUpdatedAt(row);
       });
-      threadUpdatedAtFetchRetryCount = 0;
     } catch {
-      refs.forEach((ref) => {
-        threadUpdatedAtRequestedAt.delete(ref.cacheKey);
-        if (!isDeletedSidebarSession(ref.sessionId)) {
-          const pendingRef = pendingThreadUpdatedAtRefs.get(ref.cacheKey);
-          pendingThreadUpdatedAtRefs.set(
-            ref.cacheKey,
-            pendingRef?.exactReadOnly ? pendingRef : ref,
-          );
+      // A failed read keeps the previous label and waits for the ordinary
+      // one-minute refresh. Never retry in a tight loop on the renderer thread.
+      refs.forEach(({ cacheKey, sessionId }) => {
+        if (!isDeletedSidebarSession(sessionId)) {
+          rememberBoundedMapValue(threadUpdatedAtRequestedAt, cacheKey, Date.now());
         }
       });
-      threadUpdatedAtFetchRetryCount += 1;
-      if (threadUpdatedAtFetchRetryCount <= maxThreadTimestampFetchRetries) {
-        retryDelayMs = Math.min(30_000, 500 * (2 ** (threadUpdatedAtFetchRetryCount - 1)));
-      } else {
-        refs.forEach(({ cacheKey, sessionId }) => {
-          pendingThreadUpdatedAtRefs.delete(cacheKey);
-          threadUpdatedAtReadRetryCounts.delete(cacheKey);
-          if (!isDeletedSidebarSession(sessionId)) {
-            rememberBoundedMapValue(threadUpdatedAtRequestedAt, cacheKey, Date.now());
-          }
-        });
-        threadUpdatedAtFetchRetryCount = 0;
-      }
     } finally {
       threadUpdatedAtFetchInFlight = false;
       if (pendingThreadUpdatedAtRefs.size) {
         threadUpdatedAtFetchTimer = window.setTimeout(() => {
           threadUpdatedAtFetchTimer = 0;
           void flushThreadUpdatedAtFetch();
-        }, retryDelayMs);
+        }, 40);
       }
     }
   };
@@ -1660,34 +1588,83 @@
     scheduleThreadUpdatedAtFetch();
   };
 
-  const refreshTrackedThreadUpdatedTimes = () => {
+  const refreshTrackedThreadUpdatedTimes = (forceRefresh = false) => {
     const now = Date.now();
-    // The mutation observer and initial install already register visible rows.
-    // A minute tick only needs those rows; a full document query is reserved
-    // for focus/pageshow recovery where missed host mutations are possible.
+    // The mutation observer and deferred initial scan register visible rows.
+    // Periodic and focus/page recovery only revisit those tracked rows, keeping
+    // full-document work away from interaction-sensitive renderer events.
     forEachTrackedThreadRow((row) => {
-      refreshThreadUpdatedAtRow(row, now, false);
+      refreshThreadUpdatedAtRow(row, now, forceRefresh);
     });
     scheduleThreadUpdatedAtFetch();
   };
 
-  const refreshThreadUpdatedTimes = (forceRefresh = false) => {
-    if (forceRefresh) {
-      installThreadUpdatedTimes(document, true);
-      return;
-    }
-    refreshTrackedThreadUpdatedTimes();
+  const codexAppAssetUrls = () => {
+    const performanceUrls = (
+      typeof performance !== "undefined"
+      && typeof performance.getEntriesByType === "function"
+    )
+      ? performance.getEntriesByType("resource").map((entry) => entry.name)
+      : [];
+    return [...new Set([
+      ...Array.from(document.scripts || []).map((script) => script.src),
+      ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
+      ...performanceUrls,
+    ].filter((url) => (
+      url
+      && url.includes("/assets/")
+      && url.split("?")[0].endsWith(".js")
+    )))];
   };
 
-  const codexAppAssetUrls = () => [...new Set([
-    ...Array.from(document.scripts || []).map((script) => script.src),
-    ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
-    ...(
-      typeof performance?.getEntriesByType === "function"
-        ? performance.getEntriesByType("resource").map((entry) => entry.name)
-        : []
-    ),
-  ].filter((url) => url && url.includes("/assets/") && url.split("?")[0].endsWith(".js")))];
+  const codexAssetReferencesFromSource = (source, baseUrl) => {
+    const references = [];
+    const pattern = /["']((?:\.\/(?:assets\/)?|\/assets\/)(?:app-initial|app-server-manager-signals)(?:-[^"'?#/]+)?\.js(?:\?[^"']*)?)["']/g;
+    for (const match of String(source || "").matchAll(pattern)) {
+      try {
+        const resolved = new URL(match[1], baseUrl).href;
+        if (!references.includes(resolved)) references.push(resolved);
+      } catch {
+        continue;
+      }
+    }
+    return references;
+  };
+  window.__codeyCodexAssetReferencesFromSource = codexAssetReferencesFromSource;
+
+  const discoverCodexAppAssetUrls = async () => {
+    const loadedUrls = codexAppAssetUrls();
+    const discoveredUrls = loadedUrls.filter((url) => (
+      url.includes("app-server-manager-signals-")
+      || url.includes("app-initial-")
+    ));
+    const fetchAsset = typeof window.fetch === "function"
+      ? window.fetch.bind(window)
+      : (typeof fetch === "function" ? fetch : null);
+    if (!fetchAsset) return discoveredUrls;
+
+    const scriptUrls = [...new Set([
+      ...Array.from(document.scripts || []).map((script) => script.src),
+      ...loadedUrls,
+    ])].filter((url) => (
+      url
+      && !url.includes("app-server-manager-signals-")
+      && !url.includes("app-initial-")
+    )).slice(0, 6);
+    for (const scriptUrl of scriptUrls) {
+      try {
+        const response = await fetchAsset(scriptUrl);
+        if (!response?.ok || typeof response.text !== "function") continue;
+        const source = await response.text();
+        for (const assetUrl of codexAssetReferencesFromSource(source, scriptUrl)) {
+          if (!discoveredUrls.includes(assetUrl)) discoveredUrls.push(assetUrl);
+        }
+      } catch {
+        continue;
+      }
+    }
+    return discoveredUrls;
+  };
 
   const signalDispatcherFromModule = (module, namedSignalAsset) => {
     const preferred = namedSignalAsset ? [module?.rn, module?.O] : [module?.O, module?.rn];
@@ -1716,60 +1693,384 @@
   };
   window.__codeySignalDispatcherFromModule = signalDispatcherFromModule;
 
-  const loadCodexSignalDispatcher = async () => {
+  const appServerManagerResolverFromModule = (module) => {
+    const candidates = [...new Set(Object.values(module || {}).filter((candidate) => (
+      typeof candidate === "function"
+    )))];
+    const matches = candidates.filter((candidate) => {
+      let source = "";
+      try {
+        source = Function.prototype.toString.call(candidate);
+      } catch {
+        return false;
+      }
+      return (
+        candidate.length >= 2
+        && candidate.length <= 3
+        && /AppServerManager RPC is not connected/.test(source)
+        && /\.get\(/.test(source)
+        && /\.forHost\(/.test(source)
+      );
+    });
+    return matches.length === 1 ? matches[0] : null;
+  };
+  window.__codeyAppServerManagerResolverFromModule = appServerManagerResolverFromModule;
+
+  const reactFiberFromElement = (element) => {
+    if (!(element instanceof HTMLElement)) return null;
+    const key = Object.keys(element).find((candidate) => (
+      candidate.startsWith("__reactFiber$")
+      || candidate.startsWith("__reactInternalInstance$")
+    ));
+    return key ? element[key] : null;
+  };
+
+  const collectAppServerScopeCandidates = (root, candidates, seen) => {
+    const queue = [{ depth: 0, value: root }];
+    let cursor = 0;
+    let inspected = 0;
+    while (cursor < queue.length && inspected < 600 && candidates.length < 48) {
+      const { depth, value } = queue[cursor];
+      cursor += 1;
+      if (
+        !value
+        || (typeof value !== "object" && typeof value !== "function")
+        || seen.has(value)
+      ) continue;
+      seen.add(value);
+      inspected += 1;
+      let descriptors;
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(value);
+      } catch {
+        continue;
+      }
+      const hasFunction = (name) => {
+        if (typeof descriptors[name]?.value === "function") return true;
+        try {
+          return typeof value[name] === "function";
+        } catch {
+          return false;
+        }
+      };
+      if (
+        hasFunction("get")
+        && hasFunction("set")
+        && hasFunction("watch")
+        && hasFunction("when")
+        && Object.prototype.hasOwnProperty.call(descriptors, "query")
+      ) {
+        candidates.push(value);
+      }
+      if (depth >= 6) continue;
+      for (const [key, descriptor] of Object.entries(descriptors)) {
+        if (
+          !Object.prototype.hasOwnProperty.call(descriptor, "value")
+          || ["return", "child", "sibling", "alternate", "stateNode", "_owner"].includes(key)
+        ) continue;
+        const nested = descriptor.value;
+        if (nested && (typeof nested === "object" || typeof nested === "function")) {
+          queue.push({ depth: depth + 1, value: nested });
+        }
+      }
+    }
+  };
+
+  const appServerManagerFromReact = (resolver) => {
+    const elements = [...new Set([
+      ...Array.from(document.querySelectorAll("[data-app-action-sidebar-thread-row]") || []),
+      ...Array.from(document.querySelectorAll("[data-turn-key]") || []),
+      document.querySelector("[data-app-action-sidebar-section]"),
+      document.querySelector("[data-app-action-sidebar-project-row]"),
+      document.querySelector("#root"),
+      document.body,
+    ].filter((element) => element instanceof HTMLElement))].slice(0, 32);
+    const seenScopes = new WeakSet();
+    for (const element of elements) {
+      let fiber = reactFiberFromElement(element);
+      for (let depth = 0; fiber && depth < 24; depth += 1, fiber = fiber.return) {
+        const candidates = [];
+        const seenValues = new WeakSet();
+        collectAppServerScopeCandidates(fiber.memoizedState, candidates, seenValues);
+        collectAppServerScopeCandidates(fiber.memoizedProps, candidates, seenValues);
+        collectAppServerScopeCandidates(fiber.dependencies, candidates, seenValues);
+        collectAppServerScopeCandidates(fiber.updateQueue, candidates, seenValues);
+        for (const scope of candidates) {
+          if (seenScopes.has(scope)) continue;
+          seenScopes.add(scope);
+          try {
+            const manager = resolver(scope, "local");
+            if (
+              manager
+              && typeof manager.discardConversationFromCache === "function"
+              && typeof manager.handleThreadDeletion === "function"
+              && typeof manager.refreshRecentConversations === "function"
+              && typeof manager.resumeConversation === "function"
+            ) return manager;
+          } catch {
+            continue;
+          }
+        }
+      }
+    }
+    return null;
+  };
+  window.__codeyAppServerManagerFromReact = appServerManagerFromReact;
+
+  const legacySessionController = (dispatcher) => ({
+    kind: "signals",
+    dispatcher,
+    discardConversation: (sessionId) => dispatcher("unsubscribe-thread-for-host", {
+      hostId: "local",
+      threadId: sessionId,
+    }),
+    notifyConversationDeleted: (sessionId) => dispatcher(
+      "handle-app-server-notification-for-host",
+      {
+        hostId: "local",
+        notification: {
+          method: "thread/deleted",
+          params: { threadId: sessionId },
+        },
+      },
+    ),
+    refreshRecentConversations: () => dispatcher("refresh-recent-conversations-for-host", {
+      hostId: "local",
+    }),
+    resumeConversation: (payload) => {
+      const {
+        showThreadGoalResumeConfirmation: _showThreadGoalResumeConfirmation,
+        ...legacyPayload
+      } = payload;
+      return dispatcher("maybe-resume-conversation", {
+        hostId: "local",
+        ...legacyPayload,
+      });
+    },
+  });
+
+  const managerSessionController = (manager) => ({
+    kind: "manager",
+    manager,
+    discardConversation: (sessionId) => manager.discardConversationFromCache(sessionId),
+    notifyConversationDeleted: (sessionId) => manager.handleThreadDeletion([sessionId]),
+    refreshRecentConversations: () => manager.refreshRecentConversations(),
+    resumeConversation: (payload) => manager.resumeConversation(payload),
+  });
+
+  const sessionControllerLooksUsable = (controller) => (
+    controller
+    && typeof controller.discardConversation === "function"
+    && typeof controller.notifyConversationDeleted === "function"
+    && typeof controller.refreshRecentConversations === "function"
+    && typeof controller.resumeConversation === "function"
+  );
+
+  const loadCodexSessionController = async () => {
+    if (sessionControllerLooksUsable(window.__codeyCodexSessionController)) {
+      return window.__codeyCodexSessionController;
+    }
     if (typeof window.__codeyCodexSignalDispatcher === "function") {
-      return window.__codeyCodexSignalDispatcher;
+      const controller = legacySessionController(window.__codeyCodexSignalDispatcher);
+      window.__codeyCodexSessionController = controller;
+      return controller;
     }
     const signalAssetPriority = (url) => (
       url.includes("app-server-manager-signals-")
         ? 2
         : Number(url.includes("app-initial-"))
     );
-    const urls = codexAppAssetUrls().sort((
-      left,
-      right,
-    ) => signalAssetPriority(right) - signalAssetPriority(left));
+    const urls = (await discoverCodexAppAssetUrls())
+      .sort((left, right) => signalAssetPriority(right) - signalAssetPriority(left));
     for (const url of urls) {
       const namedSignalAsset = url.includes("app-server-manager-signals-");
-      const appInitialAsset = url.includes("app-initial-");
-      if (!namedSignalAsset && !appInitialAsset) {
-        let source = "";
-        try {
-          source = await fetch(url).then((response) => (response.ok ? response.text() : ""));
-        } catch {
-          continue;
-        }
-        if (!source.includes("Missing AppServer request message handler")) continue;
-      }
       try {
-        const module = await import(url);
+        const module = typeof window.__codeyImportCodexAsset === "function"
+          ? await window.__codeyImportCodexAsset(url)
+          : await import(url);
         const dispatcher = signalDispatcherFromModule(module, namedSignalAsset);
         if (dispatcher) {
           window.__codeyCodexSignalDispatcher = dispatcher;
-          return dispatcher;
+          const controller = legacySessionController(dispatcher);
+          window.__codeyCodexSessionController = controller;
+          return controller;
+        }
+        const resolver = appServerManagerResolverFromModule(module);
+        const manager = resolver ? appServerManagerFromReact(resolver) : null;
+        if (manager) {
+          const controller = managerSessionController(manager);
+          window.__codeyCodexSessionController = controller;
+          return controller;
         }
       } catch {
         continue;
       }
     }
-    throw new Error("Codex 会话刷新接口不可用");
+    throw new Error("Codex 会话管理接口不可用");
+  };
+  window.__codeyLoadCodexSessionController = loadCodexSessionController;
+
+  const loadCodexSignalDispatcher = async () => {
+    const controller = await loadCodexSessionController();
+    if (controller.kind === "signals" && typeof controller.dispatcher === "function") {
+      return controller.dispatcher;
+    }
+    throw new Error("当前 Codex 使用 AppServerManager 会话接口");
   };
   window.__codeyLoadCodexSignalDispatcher = loadCodexSignalDispatcher;
 
-  const getCodexSignalDispatcher = async () => {
-    codexSignalDispatcherPromise ||= loadCodexSignalDispatcher().catch((error) => {
-      codexSignalDispatcherPromise = null;
+  const getCodexSessionController = async () => {
+    if (sessionControllerLooksUsable(window.__codeyCodexSessionController)) {
+      return window.__codeyCodexSessionController;
+    }
+    codexSessionControllerPromise ||= loadCodexSessionController().catch((error) => {
+      codexSessionControllerPromise = null;
       throw error;
     });
-    return codexSignalDispatcherPromise;
+    return codexSessionControllerPromise;
+  };
+
+  const readAccountRateLimits = async () => {
+    const controller = await getCodexSessionController();
+    if (
+      controller?.kind !== "manager"
+      || typeof controller.manager?.sendRequest !== "function"
+    ) {
+      throw new Error("当前 Codex 不支持官方额度读取接口");
+    }
+    // Managed ChatGPT authentication, token refresh, credential-store access,
+    // and request serialization stay inside Codex's own AppServerManager.
+    return controller.manager.sendRequest("account/rateLimits/read");
+  };
+  window.__codeyReadAccountRateLimits = readAccountRateLimits;
+
+  const completionProbeTargetStillCurrent = (sessionId, turnId) => (
+    document.visibilityState !== "hidden"
+    && isTaskRunning()
+    && getSessionId() === sessionId
+    && getCurrentTurnId() === turnId
+  );
+
+  const completionRecoveryIsBlocked = (completionKey, now) => (
+    now < (completionRecoveryStateByKey.get(completionKey)?.retryAt || 0)
+  );
+
+  const rememberCompletionRecoveryAttempt = (completionKey, retryDelayMs) => {
+    const previousAttempts = completionRecoveryStateByKey.get(completionKey)?.attempts || 0;
+    const attempts = previousAttempts + 1;
+    const attemptsExhausted = attempts >= stuckCompletionRecoveryMaxAttempts;
+    rememberBoundedMapValue(
+      completionRecoveryStateByKey,
+      completionKey,
+      {
+        attempts: attemptsExhausted ? 0 : attempts,
+        retryAt: Date.now() + (
+          attemptsExhausted ? stuckCompletionRecoveryResetMs : retryDelayMs
+        ),
+      },
+      maxCompletionRecoveryKeys,
+    );
+  };
+
+  const probeStuckTaskCompletion = async () => {
+    if (document.visibilityState === "hidden") return false;
+    const now = Date.now();
+    if (!isTaskRunning()) {
+      if (completionRunningObservation?.key) {
+        completionRecoveryStateByKey.delete(completionRunningObservation.key);
+      }
+      completionRunningObservation = null;
+      return false;
+    }
+    const sessionId = getSessionId();
+    const turnId = getCurrentTurnId();
+    if (!sessionId || !turnId) {
+      completionRunningObservation = null;
+      return false;
+    }
+    const completionKey = `${sessionId}\u0000${turnId}`;
+    if (completionRunningObservation?.key !== completionKey) {
+      completionRunningObservation = { key: completionKey, since: now };
+      return false;
+    }
+    if (now - completionRunningObservation.since < stuckCompletionGraceMs) return false;
+    if (
+      completionProbeInFlight
+      || now < completionNextProbeAt
+      || completionRecoveryIsBlocked(completionKey, now)
+    ) return false;
+
+    completionProbeInFlight = true;
+    completionNextProbeAt = now + stuckCompletionProbeIntervalMs;
+    let recoveryAttempted = false;
+    try {
+      const result = await callBridge(
+        stuckCompletionBridgePath,
+        { sessionId, turnId },
+        { timeoutMs: stuckCompletionProbeTimeoutMs },
+      );
+      if (result?.status !== "ok") {
+        rememberCompletionRecoveryAttempt(
+          completionKey,
+          stuckCompletionRecoveryCooldownMs,
+        );
+        return false;
+      }
+      const lifecycleIsTerminal = result?.lifecycle === "idle" || result?.lifecycle === "error";
+      const terminalKindIsKnown = result?.terminalKind === "completed"
+        || result?.terminalKind === "aborted";
+      if (
+        result.sessionId !== sessionId
+        || result.turnId !== turnId
+        || result.sessionKnown !== true
+        || result.turnKnown !== true
+        || result.terminal !== true
+        || !terminalKindIsKnown
+        || !lifecycleIsTerminal
+        || !completionProbeTargetStillCurrent(sessionId, turnId)
+      ) return false;
+
+      recoveryAttempted = true;
+      const controller = await getCodexSessionController();
+      // Controller discovery can import renderer assets. Recheck the exact
+      // task and turn immediately before the first native state mutation.
+      if (!completionProbeTargetStillCurrent(sessionId, turnId)) return false;
+      await controller.discardConversation(sessionId);
+      await controller.resumeConversation({
+        conversationId: sessionId,
+        model: null,
+        serviceTier: null,
+        reasoningEffort: null,
+        workspaceRoots: [],
+        collaborationMode: null,
+        showThreadGoalResumeConfirmation: false,
+      });
+      await controller.refreshRecentConversations();
+      // Native refresh promises can resolve before React drops the stale Stop
+      // state. Revisit the same exact task after a short grace period; clearing
+      // the Stop state removes this retry record at the top of the next probe.
+      rememberCompletionRecoveryAttempt(
+        completionKey,
+        stuckCompletionRecoveryRetryMs,
+      );
+      return true;
+    } catch {
+      rememberCompletionRecoveryAttempt(
+        completionKey,
+        recoveryAttempted
+          ? stuckCompletionRecoveryCooldownMs
+          : stuckCompletionProbeIntervalMs,
+      );
+      return false;
+    } finally {
+      completionProbeInFlight = false;
+    }
   };
 
   const refreshRecentLocalSessions = async () => {
     try {
-      const dispatcher = await getCodexSignalDispatcher();
-      await dispatcher("refresh-recent-conversations-for-host", {
-        hostId: "local",
-      });
+      const controller = await getCodexSessionController();
+      await controller.refreshRecentConversations();
       return true;
     } catch {
       return false;
@@ -1802,11 +2103,8 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return false;
     try {
-      const dispatcher = await getCodexSignalDispatcher();
-      await dispatcher("unsubscribe-thread-for-host", {
-        hostId: "local",
-        threadId: normalizedSessionId,
-      });
+      const controller = await getCodexSessionController();
+      await controller.discardConversation(normalizedSessionId);
       return true;
     } catch {
       return false;
@@ -1817,14 +2115,8 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return false;
     try {
-      const dispatcher = await getCodexSignalDispatcher();
-      await dispatcher("handle-app-server-notification-for-host", {
-        hostId: "local",
-        notification: {
-          method: "thread/deleted",
-          params: { threadId: normalizedSessionId },
-        },
-      });
+      const controller = await getCodexSessionController();
+      await controller.notifyConversationDeleted(normalizedSessionId);
       return true;
     } catch {
       return false;
@@ -1834,14 +2126,12 @@
   const reloadConversationAfterHardDelete = async (sessionId, messageIds) => {
     const normalizedSessionId = String(sessionId || "").replace(/^local:/, "").trim();
     if (!normalizedSessionId || !messageIds.length) throw new Error("缺少会话或轮次 ID");
-    const dispatcher = await getCodexSignalDispatcher();
+    const controller = await getCodexSessionController();
 
-    // This native path unsubscribes app-server memory while preserving the
-    // active route and marking the React conversation as needing a resume.
-    await dispatcher("unsubscribe-thread-for-host", {
-      hostId: "local",
-      threadId: normalizedSessionId,
-    });
+    // Current Codex exposes AppServerManager through its renderer scope. Its
+    // discard path unsubscribes app-server and evicts React's conversation
+    // snapshot; older builds keep using the equivalent native signal.
+    await controller.discardConversation(normalizedSessionId);
 
     // Closing a loaded thread may flush a final record. Reapply the hard delete
     // only after unsubscribe has completed so stale memory cannot restore it.
@@ -1852,18 +2142,16 @@
     if (cleanup?.status === "failed") {
       throw new Error(cleanup.message || "卸载会话后的持久化清理失败");
     }
-    await dispatcher("maybe-resume-conversation", {
-      hostId: "local",
+    await controller.resumeConversation({
       conversationId: normalizedSessionId,
       model: null,
       serviceTier: null,
       reasoningEffort: null,
       workspaceRoots: [],
       collaborationMode: null,
+      showThreadGoalResumeConfirmation: false,
     });
-    await dispatcher("refresh-recent-conversations-for-host", {
-      hostId: "local",
-    });
+    await controller.refreshRecentConversations();
   };
 
   const importSessionFile = async (projectPath, file, button) => {
@@ -2459,15 +2747,19 @@
     // Incremental scans already hand us the nearest turn boundary. Avoid
     // enumerating that entire subtree again when the boundary itself carries
     // Codex's canonical turn key; document/container scans retain the fallback.
-    const currentTurnRows = (
+    const rows = (
       root instanceof HTMLElement
-      && root.matches?.("[data-turn-key]")
+      && root.matches?.(conversationTurnSelector)
     )
       ? [root]
-      : queryWithin(root, "[data-turn-key]");
-    const rows = currentTurnRows.length
-      ? currentTurnRows
-      : queryWithin(root, "[data-message-author-role], [data-testid=conversation-turn], [data-message-id]");
+      : queryWithin(root, conversationTurnSelector).filter((row, _index, all) => {
+        let parent = row.parentElement;
+        while (parent) {
+          if (all.includes(parent)) return false;
+          parent = parent.parentElement;
+        }
+        return true;
+      });
     let installed = false;
     // getSessionId() probes several document-wide attribute selectors, and its
     // only consumer here is the hard-delete filter, which stays empty until the
@@ -2485,14 +2777,14 @@
       // The select button is appended last, so querySelector walks nearly the
       // whole turn subtree. Remember it per row and only fall back to the walk
       // when the cached button is gone or React re-parented it.
-      const cachedButton = messageSelectButtons?.get(row);
+      const cachedButton = messageSelectButtons.get(row);
       const existingButton = cachedButton
         && cachedButton.isConnected !== false
         && cachedButton.parentElement === row
         ? cachedButton
         : row.querySelector("[data-codey-message-select]");
       if (existingButton) {
-        messageSelectButtons?.set(row, existingButton);
+        messageSelectButtons.set(row, existingButton);
         return;
       }
       row.dataset.codeyMessageId = messageId;
@@ -2512,7 +2804,7 @@
       // Codex 自己定位过的行不受影响；避免在安装循环里读取布局。
       row.dataset.codeyMessageRow = "true";
       row.appendChild(button);
-      messageSelectButtons?.set(row, button);
+      messageSelectButtons.set(row, button);
       installed = true;
     });
     if (installed) {
@@ -2549,6 +2841,7 @@
   window.__codeyGetSessionTitle = getSessionTitle;
   window.__codeySyncSidebarTitles = syncSidebarTitles;
   window.__codeyGetMessageId = getMessageId;
+  window.__codeyProbeStuckTaskCompletion = probeStuckTaskCompletion;
   window.__codeyProjectPathFromRow = projectPathFromRow;
   window.__codeyFormatRelativeThreadTime = formatRelativeThreadTime;
   window.__codeyThreadTimestampMsFromPayload = threadTimestampMsFromPayload;
@@ -2569,7 +2862,6 @@
   window.__codeyReloadConversationAfterHardDelete = reloadConversationAfterHardDelete;
   window.__codeyInstallMessageSelection = installMessageSelection;
   addStyle();
-  scan();
 
   const codeyOwnedSelector = [
     rendererSettingsButtonSelector,
@@ -2620,7 +2912,9 @@
   );
   const nearestScanRoot = (element) => {
     if (!(element instanceof HTMLElement)) return null;
-    return element.closest?.(scanBoundarySelector) || element;
+    return element.closest?.(scanBoundarySelector)
+      || element.querySelector?.(scanBoundarySelector)
+      || null;
   };
   const threadClassMutationMayAffectStatus = (target, threadRow, oldClassName) => (
     target === threadRow
@@ -2629,17 +2923,15 @@
   );
   const addPendingScanRoot = (root) => {
     if (!(root instanceof HTMLElement)) return;
-    if (
-      pendingScanRoots.size >= maxPendingScanRoots
-      && document.documentElement instanceof HTMLElement
-    ) {
-      pendingScanRoots.clear();
-      pendingScanRoots.add(document.documentElement);
-      return;
-    }
+    // Header mounts must stay fresh even while the root budget is saturated,
+    // otherwise the settings button can go stale for a whole mutation storm.
     if (root.matches?.("header, nav")) {
       window.__codeyRendererInvalidateHeaderMount?.(root);
     }
+    // Unknown/new Codex DOM shapes must degrade by skipping optional controls,
+    // not by turning a burst of virtualized rows into a synchronous full-page
+    // scan on the renderer thread.
+    if (pendingScanRoots.size >= maxPendingScanRoots) return;
     for (const pendingRoot of pendingScanRoots) {
       if (pendingRoot === root || pendingRoot.contains?.(root)) return;
       if (root.contains?.(pendingRoot)) pendingScanRoots.delete(pendingRoot);
@@ -2668,13 +2960,68 @@
     window.clearTimeout(scanTimer);
     scanTimer = window.setTimeout(flushIncrementalScans, delay);
   };
+  const scheduleInitialScan = () => {
+    const run = () => {
+      try {
+        scan();
+      } catch (error) {
+        window.__codeySessionToolsError = error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : String(error);
+        console.error("[Codey] deferred session tools scan failed", error);
+      }
+    };
+    if (typeof window.requestIdleCallback === "function") {
+      // Do not force this optional full-page discovery through a timeout: on a
+      // continuously scrolling/animating renderer that would move the same
+      // synchronous work back onto a latency-sensitive frame.
+      window.requestIdleCallback(run);
+    } else {
+      window.setTimeout(run, 0);
+    }
+  };
 
-  new MutationObserver((mutations) => {
+  const isConversationRichTooltipTriggerShape = (element) => (
+    Boolean(element?.matches?.(conversationRichTooltipTriggerSelector))
+    && Boolean(element.closest?.(conversationTurnSelector))
+  );
+  const conversationHasOpenRichTooltip = () => {
+    const turns = document.querySelectorAll?.(conversationTurnSelector);
+    if (!turns) return false;
+    for (const turn of turns) {
+      const candidates = turn.querySelectorAll?.(conversationRichTooltipTriggerSelector);
+      if (!candidates) continue;
+      for (const candidate of candidates) {
+        if (candidate.hasAttribute?.("aria-describedby")) return true;
+      }
+    }
+    return false;
+  };
+  const syncConversationRichTooltipOpen = (target) => {
+    const body = document.body;
+    if (!body?.classList || typeof body.classList.toggle !== "function") return;
+    if (target && isConversationRichTooltipTriggerShape(target)) {
+      if (target.hasAttribute?.("aria-describedby")) {
+        body.classList.add(conversationRichTooltipOpenClass);
+        return;
+      }
+      if (!body.classList.contains(conversationRichTooltipOpenClass)) return;
+    } else if (target) {
+      return;
+    }
+    body.classList.toggle(conversationRichTooltipOpenClass, conversationHasOpenRichTooltip());
+  };
+
+  const handleSessionToolMutations = (mutations) => {
     for (const mutation of mutations) {
       const target = mutation.target instanceof HTMLElement
         ? mutation.target
         : mutation.target?.parentElement;
       if (mutation.type === "attributes") {
+        if (mutation.attributeName === "aria-describedby") {
+          syncConversationRichTooltipOpen(target);
+          continue;
+        }
         if (target && !isCodeyOwned(target)) {
           const threadRow = target.closest?.(sidebarThreadRowSelector) || null;
           const relevantThreadClassChange = threadRow
@@ -2731,13 +3078,15 @@
     if (pendingScanRoots.size) {
       scheduleIncrementalScan(null);
     }
-  }).observe(document.documentElement, {
+  };
+  const sessionToolMutationOptions = {
     attributes: true,
     attributeOldValue: true,
     attributeFilter: [
       "aria-label",
       "aria-expanded",
       "aria-hidden",
+      "aria-describedby",
       "data-turn-key",
       "data-request-user-input-auto-resolution-conversation-id",
       "data-app-action-sidebar-thread-host-id",
@@ -2755,7 +3104,25 @@
     ],
     childList: true,
     subtree: true,
-  });
+  };
+  const mutationDispatcher = window.__codeyMutationDispatcher;
+  let sessionToolObserver = null;
+  if (typeof mutationDispatcher?.subscribe === "function") {
+    const unsubscribe = mutationDispatcher.subscribe(
+      handleSessionToolMutations,
+      sessionToolMutationOptions,
+    );
+    if (mutationDispatcher.snapshot?.().observerInstalled) {
+      sessionToolObserver = { disconnect: unsubscribe };
+    } else {
+      unsubscribe?.();
+    }
+  }
+  if (!sessionToolObserver) {
+    sessionToolObserver = new MutationObserver(handleSessionToolMutations);
+    sessionToolObserver.observe(document.documentElement, sessionToolMutationOptions);
+  }
+  syncConversationRichTooltipOpen();
   // forceRefresh bypasses the per-session throttle and re-fetches official
   // thread metadata for every sidebar row, so alt-tabbing must stay debounced.
   let lastForcedThreadTimeRefresh = 0;
@@ -2764,13 +3131,15 @@
     const now = Date.now();
     if (now - lastForcedThreadTimeRefresh < forcedThreadTimeRefreshIntervalMs) return;
     lastForcedThreadTimeRefresh = now;
-    refreshThreadUpdatedTimes(true);
-    refreshRecentLocalSessionsForActiveWork();
+    refreshTrackedThreadUpdatedTimes(true);
   };
   if (typeof document.addEventListener === "function") {
     document.addEventListener("visibilitychange", wakeSessionWatcher);
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState !== "hidden") refreshThreadUpdatedTimesOnReturn();
+      if (document.visibilityState !== "hidden") {
+        refreshThreadUpdatedTimesOnReturn();
+        void probeStuckTaskCompletion();
+      }
     });
     document.addEventListener("pointerdown", wakeSessionWatcher, { capture: true, passive: true });
     document.addEventListener("keydown", wakeSessionWatcherFromKey, true);
@@ -2779,16 +3148,26 @@
     window.addEventListener("codey-subagent-state-changed", handleSubagentStateChanged);
     window.addEventListener("focus", wakeSessionWatcher);
     window.addEventListener("focus", refreshThreadUpdatedTimesOnReturn);
+    window.addEventListener("focus", probeStuckTaskCompletion);
     window.addEventListener("pageshow", wakeSessionWatcher);
     window.addEventListener("pageshow", refreshThreadUpdatedTimesOnReturn);
+    window.addEventListener("pageshow", probeStuckTaskCompletion);
   }
   if (typeof window.setInterval === "function") {
     window.setInterval(() => {
+      void probeStuckTaskCompletion();
+    }, stuckCompletionProbeIntervalMs);
+    window.setInterval(() => {
       if (document.visibilityState === "hidden") return;
-      refreshThreadUpdatedTimes(false);
+      refreshTrackedThreadUpdatedTimes(false);
     }, threadTimestampRefreshIntervalMs);
     window.setInterval(() => {
       refreshRecentLocalSessionsForActiveWork();
     }, activeWorkRefreshIntervalMs);
   }
+  window.__codeyRendererInjectLoaded = true;
+  window.__codeySessionToolsInjectLoaded = true;
+  window.__codeySessionToolsInjectLoading = false;
+  void probeStuckTaskCompletion();
+  scheduleInitialScan();
 })();

@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::ProviderProfile;
 
 #[test]
 fn bridge_field_helpers_preserve_existing_payload_semantics() {
@@ -7,6 +8,7 @@ fn bridge_field_helpers_preserve_existing_payload_semantics() {
         "offset": 42,
         "wrongText": 7,
         "wrongOffset": "42",
+        "items": [" first ", 7, "", "second", "third"],
     });
 
     assert_eq!(bridge_string(&payload, "text"), "  value  ");
@@ -15,6 +17,11 @@ fn bridge_field_helpers_preserve_existing_payload_semantics() {
     assert_eq!(bridge_u64(&payload, "offset"), Some(42));
     assert_eq!(bridge_u64(&payload, "missing"), None);
     assert_eq!(bridge_u64(&payload, "wrongOffset"), None);
+    assert_eq!(
+        bridge_string_array(&payload, "items", 2),
+        vec!["first".to_string(), "second".to_string()]
+    );
+    assert!(bridge_string_array(&payload, "missing", 2).is_empty());
 }
 
 #[test]
@@ -49,7 +56,6 @@ fn user_fastctx_prevents_enabling_the_embedded_tools() {
 async fn session_metadata_cache_operations_are_serialized_in_blocking_workers() {
     let state = Arc::new(AppState::default());
     let first_started = Arc::new(AtomicBool::new(false));
-    let second_submitted = Arc::new(AtomicBool::new(false));
     let second_started = Arc::new(AtomicBool::new(false));
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
 
@@ -81,12 +87,11 @@ async fn session_metadata_cache_operations_are_serialized_in_blocking_workers() 
     .await
     .expect("the first cache operation should start");
 
+    let second_contended = state.session_metadata_cache_contended.notified();
     let second = tokio::spawn({
         let state = Arc::clone(&state);
-        let second_submitted = Arc::clone(&second_submitted);
         let second_started = Arc::clone(&second_started);
         async move {
-            second_submitted.store(true, Ordering::Release);
             with_session_metadata_cache(&state, "second cache operation", move |_| {
                 second_started.store(true, Ordering::Release);
                 2
@@ -94,14 +99,9 @@ async fn session_metadata_cache_operations_are_serialized_in_blocking_workers() 
             .await
         }
     });
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !second_submitted.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the second cache operation should be submitted");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(1), second_contended)
+        .await
+        .expect("the second cache operation did not contend for exclusive ownership");
     assert!(
         !second_started.load(Ordering::Acquire),
         "the second operation must wait for exclusive cache ownership"
@@ -119,14 +119,15 @@ async fn session_metadata_cache_operations_are_serialized_in_blocking_workers() 
 }
 
 #[test]
-fn renderer_settings_clear_provider_and_notification_secrets() {
+fn renderer_settings_keep_api_keys_and_clear_notification_secrets() {
     let mut config = CodeyConfig::default();
     config.profiles[0].api_key = "renderer-secret".to_string();
+    config.prompt_optimization.api_key = "optimizer-secret".to_string();
     config.hide_full_access_warning = true;
     config.webhook.url = "https://open.feishu.cn/legacy-secret".to_string();
     config.webhook.channels.push(NotificationChannelConfig {
         id: "feishu-1".to_string(),
-        url: "https://open.feishu.cn/open-apis/bot/v2/hook/renderer-secret".to_string(),
+        url: "https://open.feishu.cn/open-apis/bot/v2/hook/feishu-secret".to_string(),
         ..NotificationChannelConfig::default()
     });
     config.webhook.channels.push(NotificationChannelConfig {
@@ -136,19 +137,185 @@ fn renderer_settings_clear_provider_and_notification_secrets() {
         chat_id: "-100123".to_string(),
         ..NotificationChannelConfig::default()
     });
+    config.webhook.channels.push(NotificationChannelConfig {
+        id: "wecom-1".to_string(),
+        kind: crate::notifications::NotificationChannelKind::Wecom,
+        url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=wecom-secret".to_string(),
+        ..NotificationChannelConfig::default()
+    });
+    config.webhook.channels.push(NotificationChannelConfig {
+        id: "wechat-claw-1".to_string(),
+        kind: crate::notifications::NotificationChannelKind::WechatClaw,
+        url: "https://ilinkai.weixin.qq.com".to_string(),
+        bot_token: "wechat-claw-secret".to_string(),
+        context_token: "wechat-context-secret".to_string(),
+        chat_id: "user@im.wechat".to_string(),
+        ..NotificationChannelConfig::default()
+    });
 
     let public = serde_json::to_value(redacted_config(&config)).unwrap();
 
-    assert_eq!(public["profiles"][0]["apiKey"], "");
+    assert_eq!(public["profiles"][0]["apiKey"], "renderer-secret");
+    assert_eq!(public["profiles"][0]["apiKeyConfigured"], true);
+    assert_eq!(public["promptOptimization"]["apiKey"], "optimizer-secret");
+    assert_eq!(public["promptOptimization"]["apiKeyConfigured"], true);
+    assert!(public["profiles"][0].get("clearApiKey").is_none());
     assert_eq!(public["hideFullAccessWarning"], true);
     assert!(public["webhook"].get("url").is_none());
     assert_eq!(public["webhook"]["channels"][0]["url"], "");
     assert_eq!(public["webhook"]["channels"][0]["urlConfigured"], true);
     assert_eq!(public["webhook"]["channels"][1]["botToken"], "");
     assert_eq!(public["webhook"]["channels"][1]["botTokenConfigured"], true);
-    assert!(!public.to_string().contains("renderer-secret"));
+    assert_eq!(public["webhook"]["channels"][2]["url"], "");
+    assert_eq!(public["webhook"]["channels"][2]["urlConfigured"], true);
+    assert_eq!(public["webhook"]["channels"][3]["botToken"], "");
+    assert_eq!(public["webhook"]["channels"][3]["botTokenConfigured"], true);
+    assert_eq!(public["webhook"]["channels"][3]["contextToken"], "");
+    assert_eq!(
+        public["webhook"]["channels"][3]["contextTokenConfigured"],
+        true
+    );
+    assert!(public.to_string().contains("renderer-secret"));
+    assert!(public.to_string().contains("optimizer-secret"));
+    assert!(!public.to_string().contains("feishu-secret"));
     assert!(!public.to_string().contains("telegram-secret"));
+    assert!(!public.to_string().contains("wecom-secret"));
+    assert!(!public.to_string().contains("wechat-claw-secret"));
+    assert!(!public.to_string().contains("wechat-context-secret"));
     assert!(!public.to_string().contains("legacy-secret"));
+}
+
+#[test]
+fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
+    let mut official = crate::config::ProviderProfile::new("OpenAI 官方直登");
+    official.id = "official-route".to_string();
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    official.source_provider_id = Some("local-official".to_string());
+    official.normalize();
+
+    let previous = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official.clone()],
+        ..CodeyConfig::default()
+    };
+    let mut input = official;
+    input.auth_mode = crate::config::AUTH_MODE_API_KEY.to_string();
+    input.upstream_protocol = crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string();
+    input.base_url = "https://relay.example/v1".to_string();
+    input.api_key = "sk-relay".to_string();
+    input.api_key_configured = false;
+    input.official_account = false;
+    input.short_name = "中转".to_string();
+
+    let merged = merge_profile_secrets(vec![input], &previous).unwrap();
+    let route = &merged[0];
+
+    assert_eq!(route.auth_mode, crate::config::AUTH_MODE_API_KEY);
+    assert_eq!(
+        route.upstream_protocol,
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+    );
+    assert_eq!(route.base_url, "https://relay.example/v1");
+    assert_eq!(route.api_key, "sk-relay");
+    assert_eq!(route.short_name, "中转");
+    assert!(!route.official_account);
+    assert!(route.source_provider_id.is_none());
+    assert!(!route.supports_remote_compaction);
+    assert!(!route.supports_websockets);
+}
+
+#[test]
+fn account_usage_stays_enabled_when_an_official_route_exists_but_a_third_party_route_is_active() {
+    let mut official = ProviderProfile::new("OpenAI 官方直登");
+    official.id = "official-route".to_string();
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    official.normalize();
+
+    let mut third_party = ProviderProfile::new("第三方线路");
+    third_party.id = "third-party-route".to_string();
+    third_party.base_url = "https://relay.example/v1".to_string();
+    third_party.api_key = "sk-relay".to_string();
+    third_party.normalize();
+
+    let config = CodeyConfig {
+        active_profile_id: third_party.id.clone(),
+        profiles: vec![official, third_party],
+        show_account_usage_in_header: true,
+        ..CodeyConfig::default()
+    };
+
+    assert!(account_usage_enabled_for_config(&config));
+}
+
+#[test]
+fn account_usage_requires_both_the_display_setting_and_an_official_route() {
+    let mut third_party = ProviderProfile::new("第三方线路");
+    third_party.id = "third-party-route".to_string();
+    third_party.base_url = "https://relay.example/v1".to_string();
+    third_party.api_key = "sk-relay".to_string();
+    third_party.normalize();
+
+    let without_official = CodeyConfig {
+        active_profile_id: third_party.id.clone(),
+        profiles: vec![third_party],
+        show_account_usage_in_header: true,
+        ..CodeyConfig::default()
+    };
+    assert!(!account_usage_enabled_for_config(&without_official));
+
+    let mut official = ProviderProfile::new("OpenAI 官方直登");
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    official.normalize();
+    let disabled = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official],
+        show_account_usage_in_header: false,
+        ..CodeyConfig::default()
+    };
+    assert!(!account_usage_enabled_for_config(&disabled));
+}
+
+#[test]
+fn inconclusive_official_auth_probe_keeps_active_third_party_route() {
+    let mut third_party = ProviderProfile::new("第三方线路");
+    third_party.id = "custom".to_string();
+    third_party.base_url = "https://relay.example/v1".to_string();
+    third_party.api_key = "sk-relay".to_string();
+    third_party.normalize();
+    let mut official = ProviderProfile::new("OpenAI 官方直登");
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    official.source_provider_id = Some("openai".to_string());
+    official.normalize();
+    let previous = CodeyConfig {
+        active_profile_id: third_party.id.clone(),
+        profiles: vec![third_party.clone()],
+        default_model: "custom/gpt-5.6-sol".to_string(),
+        initial_route_import_completed: true,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+
+    let next = route_config_for_official_probe(
+        &previous,
+        OfficialAccountProfileStatus::Unknown {
+            profile: official,
+            reason: "probe unavailable".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(next.active_profile_id, third_party.id);
+    assert!(
+        next.profiles
+            .iter()
+            .all(|profile| !profile.official_account)
+    );
+    assert!(!next.official_account_available_this_launch);
+    assert_eq!(
+        next.official_account_status_this_launch,
+        LaunchOfficialAccountStatus::Unknown
+    );
+    assert_eq!(next.default_model, "custom/gpt-5.6-sol");
 }
 
 #[tokio::test]
@@ -169,41 +336,128 @@ async fn settings_bridge_matches_the_redacted_config_contract() {
         .await;
 
     assert_eq!(actual, expected);
-    assert!(!actual.to_string().contains("bridge-provider-secret"));
+    assert!(actual.to_string().contains("bridge-provider-secret"));
     assert!(!actual.to_string().contains("bridge-secret"));
 }
 
 #[tokio::test]
-async fn explicit_notification_channel_reveal_returns_only_the_selected_channel() {
+async fn backend_health_bridge_avoids_runtime_status_collection() {
     let state = Arc::new(AppState::default());
-    state.config.write().await.webhook.channels.extend([
-        NotificationChannelConfig {
-            id: "feishu-1".to_string(),
-            url: "https://open.feishu.cn/open-apis/bot/v2/hook/reveal-secret".to_string(),
-            ..NotificationChannelConfig::default()
-        },
-        NotificationChannelConfig {
+
+    let actual = state
+        .bridge_request("/backend/health".to_string(), json!({}))
+        .await;
+
+    assert_eq!(actual, json!({"status": "ok"}));
+}
+
+#[test]
+fn completion_state_requires_the_exact_non_snapshot_terminal_turn() {
+    let events = pending_approval::RecentSessionEvents {
+        started_turns: Arc::new(vec![
+            pending_approval::StartedTurn {
+                session_id: "session-1".to_string(),
+                turn_id: "turn-completed".to_string(),
+            },
+            pending_approval::StartedTurn {
+                session_id: "session-1".to_string(),
+                turn_id: "turn-running".to_string(),
+            },
+        ]),
+        aborted_turns: Arc::new(vec![pending_approval::AbortedTurn {
+            session_id: "session-1".to_string(),
+            turn_id: "turn-aborted".to_string(),
+            is_snapshot_replay: false,
+        }]),
+        completed_turns: Arc::new(vec![
+            pending_approval::CompletedTurn {
+                session_id: "session-1".to_string(),
+                turn_id: "turn-completed".to_string(),
+                duration_ms: 10,
+                completed_at: Some(42),
+                error: None,
+                is_snapshot_replay: false,
+            },
+            pending_approval::CompletedTurn {
+                session_id: "session-1".to_string(),
+                turn_id: "turn-imported".to_string(),
+                duration_ms: 10,
+                completed_at: Some(41),
+                error: None,
+                is_snapshot_replay: true,
+            },
+        ]),
+        session_statuses: Arc::new(HashMap::from([(
+            "session-1".to_string(),
+            pending_approval::SessionLifecycleStatus::Running,
+        )])),
+        ..pending_approval::RecentSessionEvents::default()
+    };
+
+    assert_eq!(
+        completion_state_response(&events, "session-1", "turn-completed"),
+        json!({
+            "status": "ok",
+            "sessionId": "session-1",
+            "turnId": "turn-completed",
+            "sessionKnown": true,
+            "turnKnown": true,
+            "lifecycle": "running",
+            "terminal": true,
+            "terminalKind": "completed",
+            "completedAt": 42,
+        })
+    );
+    assert_eq!(
+        completion_state_response(&events, "session-1", "turn-running")["terminal"],
+        false
+    );
+    assert_eq!(
+        completion_state_response(&events, "session-1", "turn-aborted")["terminalKind"],
+        "aborted"
+    );
+    assert_eq!(
+        completion_state_response(&events, "session-1", "turn-imported")["terminal"],
+        false
+    );
+    let unknown = completion_state_response(&events, "session-1", "turn-missing");
+    assert_eq!(unknown["turnKnown"], false);
+    assert_eq!(unknown["terminal"], false);
+}
+
+#[tokio::test]
+async fn renderer_api_keeps_notification_secrets_without_reveal_commands() {
+    let state = Arc::new(AppState::default());
+    state.config.write().await.prompt_optimization.api_key = "optimizer-secret".to_string();
+    state
+        .config
+        .write()
+        .await
+        .webhook
+        .channels
+        .push(NotificationChannelConfig {
             id: "telegram-1".to_string(),
             kind: crate::notifications::NotificationChannelKind::Telegram,
-            bot_token: "telegram-reveal-secret".to_string(),
+            bot_token: "telegram-secret".to_string(),
             chat_id: "-100123".to_string(),
             ..NotificationChannelConfig::default()
-        },
-    ]);
+        });
 
-    let revealed = reveal_notification_channel(&state, "telegram-1".to_string())
-        .await
-        .unwrap();
-
-    assert_eq!(revealed["channel"]["id"], "telegram-1");
-    assert_eq!(revealed["channel"]["botToken"], "telegram-reveal-secret");
-    assert!(!revealed.to_string().contains("hook/reveal-secret"));
+    let result = invoke_api(
+        &state,
+        "reveal_notification_channel",
+        json!({ "channelId": "telegram-1" }),
+    )
+    .await;
+    assert_eq!(result["status"], "failed");
     assert!(
-        reveal_notification_channel(&state, "unknown".to_string())
-            .await
-            .unwrap_err()
-            .contains("找不到")
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("未知 Codey API 命令")
     );
+    assert!(!result.to_string().contains("optimizer-secret"));
+    assert!(!result.to_string().contains("telegram-secret"));
 }
 
 #[tokio::test]
@@ -414,6 +668,73 @@ async fn partial_subagent_role_payload_merges_with_existing_roles() {
     assert_eq!(saved.subagent_roles["codey_worker"].reasoning_effort, "max");
 }
 
+#[tokio::test]
+async fn custom_role_matrix_persists_official_models_for_the_current_provider() {
+    let directory = tempfile::tempdir().unwrap();
+    let initial = CodeyConfig::default();
+    let provider_id = initial.current_provider_id().unwrap().to_string();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(initial.clone()),
+        ..AppState::default()
+    });
+    let mut payload = serde_json::to_value(initial).unwrap();
+    payload["subagentRoles"] = json!({
+        "codey_quick_scan": {
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "low"
+        },
+        "codey_deep_research": {
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "high"
+        },
+        "codey_visual_analysis": {
+            "model": "gpt-5.6-terra",
+            "reasoningEffort": "high"
+        },
+        "codey_worker": {
+            "model": "gpt-5.6-terra",
+            "reasoningEffort": "max"
+        },
+        "codey_visual_worker": {
+            "model": "gpt-5.6-terra",
+            "reasoningEffort": "max"
+        },
+        "default": {
+            "model": "gpt-5.6-terra",
+            "reasoningEffort": "low"
+        }
+    });
+
+    let result = invoke_api(&state, "save_codey_config", json!({ "config": payload })).await;
+
+    assert_eq!(result["status"], "ok");
+    let saved = state.config.read().await.clone();
+    assert_eq!(
+        saved.subagent_roles["codey_quick_scan"],
+        SubagentRoleConfig::new("gpt-5.6-luna", "low")
+    );
+    assert_eq!(
+        saved.subagent_roles["codey_worker"],
+        SubagentRoleConfig::new("gpt-5.6-terra", "max")
+    );
+    assert_eq!(
+        saved.declared_official_models_by_provider[&provider_id],
+        ["gpt-5.6-luna", "gpt-5.6-terra"]
+    );
+    assert_eq!(
+        saved.upstream_models_by_provider[&provider_id],
+        ["gpt-5.6-luna", "gpt-5.6-terra"]
+    );
+    assert!(!saved.selected_models_by_provider.contains_key(&provider_id));
+    assert!(
+        !saved
+            .manual_third_party_models_by_provider
+            .contains_key(&provider_id)
+    );
+    assert_eq!(state.store.load().unwrap(), saved);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watcher_join_does_not_hold_the_config_write_lock() {
     let directory = tempfile::tempdir().unwrap();
@@ -466,11 +787,11 @@ async fn provider_sync_does_not_block_config_writes_or_commit_a_stale_result() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let sync_state = Arc::clone(&state);
     let sync_task = tokio::spawn(async move {
-        sync_cc_switch_state_with(&sync_state, move |mut config| {
+        sync_provider_state_with(&sync_state, move |mut config| {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             config.profiles[0].name = "stale provider".to_string();
-            let mut status = cc_switch::status_from_config(&config);
+            let mut status = codex_provider::status_from_config(&config);
             status.changed = true;
             Ok((config, status))
         })
@@ -480,13 +801,14 @@ async fn provider_sync_does_not_block_config_writes_or_commit_a_stale_result() {
 
     let mut settings = initial;
     settings.slim_codex_pet = !settings.slim_codex_pet;
-    tokio::time::timeout(
-        Duration::from_millis(500),
-        save_codey_config(&state, settings),
-    )
-    .await
-    .expect("provider inspection must not hold the config write lock")
-    .unwrap();
+    let config_guard =
+        tokio::time::timeout(Duration::from_millis(500), state.config_write_lock.lock())
+            .await
+            .expect("provider inspection must not hold the config write lock");
+    save_codey_config_locked(&state, CodeyConfigSaveInput::complete(settings))
+        .await
+        .unwrap();
+    drop(config_guard);
     release_tx.send(()).unwrap();
 
     let error = sync_task.await.unwrap().unwrap_err();

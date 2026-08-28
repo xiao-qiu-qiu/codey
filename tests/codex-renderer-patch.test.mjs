@@ -4,7 +4,10 @@ import test from "node:test";
 
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
-async function loadStartupPatchExpression(disablePet = true) {
+async function loadStartupPatchExpression(
+  disablePet = true,
+  errorLoggerExecutable = null,
+) {
   const template = normalizeLineEndings(
     await readFile(
       new URL("../backend/src/codex_startup_patch.js", import.meta.url),
@@ -12,9 +15,16 @@ async function loadStartupPatchExpression(disablePet = true) {
     ),
   );
   assert.ok(template);
-  return template
-    .replaceAll("__DISABLE_PET__", disablePet ? "true" : "false")
-    .replaceAll("__FAST_CODEX_STARTUP__", "true");
+  const expression = template.replaceAll(
+    "__DISABLE_PET__",
+    disablePet ? "true" : "false",
+  ).replaceAll("__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__", "false");
+  return errorLoggerExecutable == null
+    ? expression
+    : expression.replaceAll(
+        '"__CODEY_ERROR_LOGGER_EXECUTABLE__"',
+        JSON.stringify(errorLoggerExecutable),
+      );
 }
 
 test("an incompatible optional renderer patch never blocks the Codex module response", async () => {
@@ -65,6 +75,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       this.currentUrl = "";
       this.loadedUrls = [];
       this.destroyed = false;
+      this.backgroundThrottling = [];
     }
 
     getURL() {
@@ -76,6 +87,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       this.loadedUrls.push(url);
       this.emit("did-start-navigation", {}, url);
       return Promise.resolve();
+    }
+
+    setBackgroundThrottling(enabled) {
+      this.backgroundThrottling.push(enabled);
     }
   }
   class FakeBrowserWindow extends FakeEmitter {
@@ -123,6 +138,30 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
   };
 
   const nativeConsoleError = console.error;
+  const childProcess = process.getBuiltinModule("child_process");
+  const nativeSpawn = childProcess.spawn;
+  const nativeSpawnSync = childProcess.spawnSync;
+  const asyncLogSpawns = [];
+  const syncLogSpawns = [];
+  childProcess.spawn = (command, args, options) => {
+    const child = new FakeEmitter();
+    const stdin = new FakeEmitter();
+    const call = { command, args, options, input: null, encoding: null };
+    stdin.end = (input, encoding) => {
+      call.input = input;
+      call.encoding = encoding;
+      queueMicrotask(() => child.emit("exit", 0));
+    };
+    child.stdin = stdin;
+    child.kill = () => true;
+    child.unref = () => child;
+    asyncLogSpawns.push(call);
+    return child;
+  };
+  childProcess.spawnSync = (command, args, options) => {
+    syncLogSpawns.push({ command, args, options });
+    return { status: 0, stderr: "" };
+  };
   const patchErrors = [];
   console.error = (...args) => {
     patchErrors.push(args);
@@ -130,8 +169,8 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
 
   try {
     assert.equal(
-      (0, eval)(await loadStartupPatchExpression()),
-      "codey-startup-patch-installed-v22",
+      (0, eval)(await loadStartupPatchExpression(true, "C:\\Codey\\codey.exe")),
+      "codey-startup-patch-installed-v37",
     );
     const electron = Module._load("electron", undefined, false);
     const petSurface = new electron.BrowserWindow({ title: "Pet Surface test" });
@@ -145,8 +184,20 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       show: false,
       frame: false,
       skipTaskbar: true,
+      webPreferences: { backgroundThrottling: false },
     });
     assert.equal(avatarOverlayWindow.destroyed, false);
+    assert.equal(
+      avatarOverlayWindow.options.webPreferences.backgroundThrottling,
+      true,
+    );
+    avatarOverlayWindow.emit("show");
+    avatarOverlayWindow.emit("hide");
+    assert.deepEqual(
+      avatarOverlayWindow.webContents.backgroundThrottling,
+      [false, true],
+    );
+    assert.equal(petSurface.options.webPreferences, undefined);
     assert.equal(
       Module._load("C:\\Codex\\avatar_overlay.node", undefined, false),
       fakeAvatarOverlayNative,
@@ -192,6 +243,42 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     assert.equal(avatarOverlayManager.ensureWindowCalls, 0);
     await avatarOverlayManager.prepareRealtimePresentation();
     assert.equal(avatarOverlayManager.ensureWindowCalls, 1);
+    const splitPrewarmManagerSource = [
+      "class UnrelatedPrewarmCache{async prewarm(){return 42}}",
+      "class SplitPrewarmAvatarOverlayManager{",
+      "constructor(){this.window=null;this.openingWindowPromise=null;",
+      "this.isAppQuitting=false;this.windowVisibilitySequence=1;",
+      "this.ensureWindowCalls=0}",
+      "async ensureWindow(){this.ensureWindowCalls+=1;return {}}",
+      "async prewarm(e){",
+      "if(this.window!=null||this.openingWindowPromise!=null||this.isAppQuitting)return;",
+      "let t=this.windowVisibilitySequence;",
+      "let n=await this.ensureWindow(t);",
+      "n==null||t!==this.windowVisibilitySequence||this.positionWindow(n,e)}",
+      "positionWindow(){}",
+      "async prepareRealtimePresentation(){return this.ensureWindow()}",
+      "}",
+    ].join("");
+    const patchedSplitPrewarmManagerSource =
+      globalThis.__CODEY_PATCH_CODEX_AVATAR_OVERLAY_PREWARM__(
+        splitPrewarmManagerSource,
+      );
+    assert.match(
+      patchedSplitPrewarmManagerSource,
+      /async prewarm\(e\)\{return;if\(this\.window!=null/,
+    );
+    assert.match(
+      patchedSplitPrewarmManagerSource,
+      /class UnrelatedPrewarmCache\{async prewarm\(\)\{return 42\}\}/,
+    );
+    const SplitPrewarmAvatarOverlayManager = Function(
+      `${patchedSplitPrewarmManagerSource};return SplitPrewarmAvatarOverlayManager`,
+    )();
+    const splitPrewarmManager = new SplitPrewarmAvatarOverlayManager();
+    await splitPrewarmManager.prewarm({ x: 0, y: 0 });
+    assert.equal(splitPrewarmManager.ensureWindowCalls, 0);
+    await splitPrewarmManager.prepareRealtimePresentation();
+    assert.equal(splitPrewarmManager.ensureWindowCalls, 1);
     assert.equal(globalThis.__CODEY_CODEX_STARTUP_PATCH__.disablePet, true);
     assert.equal(
       Object.hasOwn(globalThis.__CODEY_CODEX_STARTUP_PATCH__, "petManagerSourceRemoved"),
@@ -221,6 +308,445 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     for (const [message] of patchErrors) {
       assert.match(String(message), /incompatible Codex renderer patch/);
     }
+    assert.equal(syncLogSpawns.length, 0);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(asyncLogSpawns.length, 1);
+    assert.deepEqual(
+      JSON.parse(asyncLogSpawns[0].input).map(({ operation }) => operation),
+      [
+        "renderer_patch:model allowlist",
+        "renderer_patch:model visibility",
+      ],
+    );
+    // Every skipped gate must carry printable excerpts around its neighborhood
+    // anchors so an incompatible field bundle can be adapted without access to
+    // that exact build.
+    for (const record of JSON.parse(asyncLogSpawns[0].input)) {
+      assert.equal(record.context.matchCount, 0);
+      assert.ok(
+        Array.isArray(record.context.excerpts) &&
+          record.context.excerpts.length > 0 &&
+          record.context.excerpts.every((excerpt) => excerpt.length > 0),
+        `${record.operation} must carry anchor excerpts for field diagnosis`,
+      );
+      assert.match(
+        record.context.excerpts.join("\n"),
+        /useHiddenModels|includeUltraReasoningEffort/,
+      );
+    }
+
+    const repeatedResponse = await installedHandler({
+      url: "app://-/assets/app-initial-new-codex-build.js",
+    });
+    assert.match(await repeatedResponse.text(), /useHiddenModels:/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      patchErrors.length,
+      2,
+      "the same incompatible source must not rerun failed renderer gates",
+    );
+    assert.equal(
+      asyncLogSpawns.length,
+      1,
+      "the same incompatible source must not spawn another patch logger",
+    );
+
+    const currentRendererSource = [
+      "const includeUltraReasoningEffort=!0,isServiceTierAllowed=!0;",
+      "function currentModelFilter({additionalAvailableModels:e,authMethod:t,availableModels:n,isCustomModelProvider:r,model:i,useHiddenModels:a}){",
+      "return e?.has(i.model)===!0||i.model!==`codex-auto-review`&&",
+      "(a&&!r&&t!==`amazonBedrock`?n.has(i.model):!i.hidden)}",
+      "function currentComposer(){",
+      "let w=!1,F=!0,K=!1,xe=`fast`,M={availableOptions:[{value:`fast`}]};",
+      "let Ee=!w&&F&&M.availableOptions.length>1;",
+      "let Re=!w&&F&&!K&&xe!=null,ze={enabled:Re};",
+      "OQ(`composer.toggleFastMode`,()=>{},ze);",
+      "let de=!0,r=!1,pe=de&&!r,Se=`fast`,V=()=>{},H=()=>{},U=()=>{},z=!1,B={},te=[];",
+      "let Ze=pe?{labelCandidates:te,onBlur:V,onPointerDown:H,onPointerLeave:U,",
+      "selectedServiceTierIconKind:Se,showFastServiceTierIndicator:!0,tooltipOpen:z,triggerRef:B}:void 0;",
+      "let view={modelPickerTriggerConfig:Ze,selectedServiceTierIconKind:Se};",
+      "if(de&&Ze!=null)view.ready=!0;return {Ee,Re,pe,view}}",
+      "`composer.intelligenceDropdown.model.title`;",
+      "`composer.intelligenceDropdown.model.rowLabel`;",
+    ].join("");
+    electron.protocol.handle(
+      "app",
+      async () => new Response(currentRendererSource),
+    );
+    const currentRendererResponse = await installedHandler({
+      url: "app://-/assets/app-initial-current-codex-build.js",
+    });
+    const patchedCurrentRendererSource = await currentRendererResponse.text();
+    assert.match(
+      patchedCurrentRendererSource,
+      /Ee=!w&&M\.availableOptions\.length>1/,
+    );
+    assert.match(patchedCurrentRendererSource, /Re=!w&&!K&&xe!=null/);
+    assert.match(patchedCurrentRendererSource, /pe=!r/);
+    assert.match(patchedCurrentRendererSource, /if\(Ze!=null\)/);
+    assert.equal(
+      patchErrors.length,
+      2,
+      "native-compatible model access and current Fast controls must not log skips",
+    );
+
+    const serviceTierControlGateOrderings = [
+      "settings.availableOptions.length>1&&!draft&&allowed",
+      "settings.availableOptions.length>1&&allowed&&!draft",
+      "!draft&&settings.availableOptions.length>1&&allowed",
+      "!draft&&allowed&&settings.availableOptions.length>1",
+      "allowed&&!draft&&settings.availableOptions.length>1",
+      "allowed&&settings.availableOptions.length>1&&!draft",
+    ];
+    for (const [index, gate] of serviceTierControlGateOrderings.entries()) {
+      const reorderedServiceTierControlSource = [
+        "const isServiceTierAllowed=!0;",
+        "function nextComposer(){",
+        "let draft=!1,allowed=!0,settings={availableOptions:[{value:`fast`},{value:`auto`}]};",
+        "let loading=!1,fastOption=`fast`;",
+        `let show=${gate};`,
+        "OQ(`composer.toggleFastMode`,()=>{},{enabled:allowed&&!loading&&fastOption!=null});",
+        "return show}",
+      ].join("");
+      electron.protocol.handle(
+        "app",
+        async () => new Response(reorderedServiceTierControlSource),
+      );
+      const reorderedServiceTierControlResponse = await installedHandler({
+        url: `app://-/assets/app-initial-reordered-service-tier-control-${index}.js`,
+      });
+      const patchedReorderedServiceTierControlSource =
+        await reorderedServiceTierControlResponse.text();
+      assert.match(
+        patchedReorderedServiceTierControlSource,
+        /show=(?:settings\.availableOptions\.length>1&&!draft|!draft&&settings\.availableOptions\.length>1)/,
+      );
+      assert.doesNotMatch(
+        patchedReorderedServiceTierControlSource,
+        /show=[^;]*allowed/,
+      );
+      assert.match(
+        patchedReorderedServiceTierControlSource,
+        /enabled:!loading&&fastOption!=null/,
+      );
+      assert.equal(
+        patchErrors.length,
+        2,
+        "reordered service-tier control gates must patch without compatibility errors",
+      );
+    }
+
+    // Electron 151 hoists the toggle gate into a memoized variable and can
+    // place over 2KB of memo-cache code between the `availableOptions`
+    // assignment and the `composer.toggleFastMode` registration.
+    const memoizedGap = "t[99]===e?t[100]:(d(e),t[99]=e,t[100]=1),".repeat(90);
+    const electron151ServiceTierSource = [
+      "const isServiceTierAllowed=!0;",
+      "let{isServiceTierAllowed:I}=G7o(F),N={availableOptions:[{value:`fast`}]};",
+      "let w=!1,q=!1,Se=`fast`,Re=()=>{};",
+      `let De=!w&&I&&N.availableOptions.length>1,${memoizedGap}`,
+      "let ze=!w&&I&&!q&&Se!=null,Be;",
+      "t[45]===ze?Be=t[46]:(Be={enabled:ze},t[45]=ze,t[46]=Be),",
+      "U$(`composer.toggleFastMode`,Re,Be);",
+    ].join("");
+    electron.protocol.handle(
+      "app",
+      async () => new Response(electron151ServiceTierSource),
+    );
+    const electron151Response = await installedHandler({
+      url: "app://-/assets/app-initial-electron151-service-tier.js",
+    });
+    const patchedElectron151Source = await electron151Response.text();
+    assert.match(
+      patchedElectron151Source,
+      /De=!w&&N\.availableOptions\.length>1/,
+    );
+    assert.doesNotMatch(
+      patchedElectron151Source,
+      /De=[^,]*&&I&&/,
+      "the entitlement flag must be dropped from the model-aware gate",
+    );
+    assert.match(patchedElectron151Source, /ze=!w&&!q&&Se!=null/);
+    assert.match(patchedElectron151Source, /\{enabled:ze\}/);
+    assert.equal(
+      patchErrors.length,
+      2,
+      "Electron 151 memoized service-tier gates must patch without compatibility errors",
+    );
+
+    // The wider Electron 151 window can also contain an unrelated, earlier
+    // assignment with the same minified shape. Only the gate nearest the unique
+    // toggle registration belongs to that control.
+    const scopedMemoizedGap =
+      "cache[99]===model?cache[100]:(touch(model),cache[99]=model,cache[100]=1);"
+        .repeat(48);
+    assert.ok(scopedMemoizedGap.length > 2048);
+    const scopedServiceTierSource = [
+      "const isServiceTierAllowed=!1;",
+      "function unrelatedComposer(){",
+      "let draft=!1,allowed=!1,settings={availableOptions:[1,2]};",
+      "let unrelated=!draft&&allowed&&settings.availableOptions.length>1;",
+      "return unrelated}",
+      "function scopedComposer(OQ){",
+      "let draft=!1,allowed=isServiceTierAllowed,settings={availableOptions:[1,2]};",
+      "let show=!draft&&allowed&&settings.availableOptions.length>1;",
+      "const cache=[],model={},touch=()=>{};",
+      scopedMemoizedGap,
+      "OQ(`composer.toggleFastMode`,()=>{},{enabled:show});return show}",
+    ].join("");
+    electron.protocol.handle(
+      "app",
+      async () => new Response(scopedServiceTierSource),
+    );
+    const scopedServiceTierResponse = await installedHandler({
+      url: "app://-/assets/app-initial-scoped-service-tier.js",
+    });
+    const patchedScopedServiceTierSource =
+      await scopedServiceTierResponse.text();
+    assert.match(
+      patchedScopedServiceTierSource,
+      /unrelated=!draft&&allowed&&settings\.availableOptions\.length>1/,
+    );
+    assert.match(
+      patchedScopedServiceTierSource,
+      /show=!draft&&settings\.availableOptions\.length>1/,
+    );
+    assert.doesNotThrow(() => Function(patchedScopedServiceTierSource));
+    const scopedServiceTierResults = Function(
+      `${patchedScopedServiceTierSource};return [` +
+        "unrelatedComposer(),scopedComposer(()=>{})]",
+    )();
+    assert.deepEqual(scopedServiceTierResults, [false, true]);
+    assert.equal(
+      patchErrors.length,
+      2,
+      "an earlier same-shaped gate must not make the scoped Fast patch ambiguous",
+    );
+
+    // Electron 151 minifies `return!1` without a space and interleaves the
+    // entitlement cache write between the chatgpt check and the fast_mode
+    // requirement lookup.
+    const electron151EntitlementSource = [
+      "zp.error(`Failed to read service tier for request`,{safe:{},sensitive:{}});",
+      "async function YHr(e,t){",
+      "let n=await KHr(e,t);",
+      "if(n!==`chatgpt`)return!1;",
+      "let r=await N2t(e,t,{priority:`critical`});",
+      "return e.query.setData(rx,{authMethod:n,hostId:t},r),",
+      "r.requirements?.featureRequirements?.fast_mode!==!1}",
+    ].join("");
+    electron.protocol.handle(
+      "app",
+      async () => new Response(electron151EntitlementSource),
+    );
+    const entitlementResponse = await installedHandler({
+      url: "app://-/assets/app-initial-electron151-entitlement.js",
+    });
+    const patchedEntitlementSource = await entitlementResponse.text();
+    assert.match(
+      patchedEntitlementSource,
+      /async function YHr\(e,t\)\{return!0\}/,
+    );
+    assert.doesNotMatch(patchedEntitlementSource, /chatgpt/);
+    assert.equal(
+      patchErrors.length,
+      2,
+      "the minified entitlement probe must patch without compatibility errors",
+    );
+
+    const routeBridgeSource = [
+      "const routeLog={warning(){}};",
+      "const routeTransport={postMessage:e=>{let t=!1,n=window.electronBridge;",
+      "if(n?.sendMessageFromView){let r=e;n.sendMessageFromView(r).catch(t=>{",
+      "r.type!==`log-message`&&routeLog.warning(`Failed to send message from view`,{message:e,error:t})",
+      "}),t=!0}",
+      "let r=new CustomEvent(`codex-message-from-view`,{detail:e});",
+      "t&&(r.__codexForwardedViaBridge=!0),window.dispatchEvent(r)}};",
+    ].join("");
+    electron.protocol.handle("app", async () => new Response(routeBridgeSource));
+    const routeBridgeResponse = await installedHandler({
+      url: "app://-/assets/app-initial-route-bridge.js",
+    });
+    const patchedRouteBridgeSource = await routeBridgeResponse.text();
+    assert.match(
+      patchedRouteBridgeSource,
+      /globalThis\.__codeyModelWhitelistPatch\?\.rewriteOutgoingMessage\?\.\(e\)\?\?e/,
+    );
+    const sentMessages = [];
+    const blockedMessages = [];
+    const testRouteWindow = {
+      electronBridge: {
+        async sendMessageFromView(message) {
+          sentMessages.push(message);
+        },
+      },
+      dispatchEvent() {},
+    };
+    const routeGlobal = {
+      __codeyModelWhitelistPatch: {
+        rewriteOutgoingMessage(message) {
+          return { ...message, routed: true };
+        },
+        isBlockedOutgoingMessage(message) {
+          return message.blocked === true;
+        },
+        notifyBlockedOutgoingMessage(message) {
+          blockedMessages.push(message);
+        },
+      },
+    };
+    const routeTransport = Function(
+      "window",
+      "globalThis",
+      "CustomEvent",
+      `${patchedRouteBridgeSource};return routeTransport`,
+    )(
+      testRouteWindow,
+      routeGlobal,
+      class CustomEvent {
+        constructor(type, init) {
+          this.type = type;
+          this.detail = init.detail;
+        }
+      },
+    );
+    routeTransport.postMessage({ type: "mcp-request" });
+    await Promise.resolve();
+    assert.deepEqual(sentMessages, [{ type: "mcp-request", routed: true }]);
+    routeTransport.postMessage({ type: "mcp-request", blocked: true });
+    await Promise.resolve();
+    assert.deepEqual(sentMessages, [{ type: "mcp-request", routed: true }]);
+    assert.deepEqual(blockedMessages, [{
+      type: "mcp-request",
+      blocked: true,
+      routed: true,
+    }]);
+    assert.equal(
+      patchErrors.length,
+      2,
+      "the current Codex bridge preflight must patch without compatibility errors",
+    );
+
+    const appServerRequestSource = [
+      "class AppServerRequestClient{",
+      "constructor(){this.hostId=`local`;this.sent=[];this.queuedRequests=[];this.requestPromises=new Map();this.useHostRequestScheduler=!1;this.dispatchMessage=(e,t)=>this.sent.push({type:e,payload:t})}",
+      "createRequest(e,t,n,r=null){return{request:{id:`req-1`,method:e,params:t},promise:Promise.resolve({ok:!0})}}",
+      "startRequest(){} onError(){} pumpQueue(){let e=this.queuedRequests.shift();e?.dispatch()}",
+      "enqueueRequest(e,t,n,r=t=>{this.dispatchMessage?.(`mcp-request`,{request:t,hostId:this.hostId,...t.trace==null?{}:{dispatchedAtMs:Date.now()},priority:Mjt(e,n),source:Ejt(e,n?.source),timeoutMs:n?.timeoutMs,expiresAtMs:n?.timeoutMs!=null&&n.timeoutMs>0?Date.now()+n.timeoutMs:void 0,widget:n?.widget})},i=null){let a=Mjt(e,n),o=Ejt(e,n?.source);let{request:s,promise:c}=this.createRequest(e,t,n,i);return this.queuedRequests.push({dispatch:()=>{this.startRequest(s);try{r(s)}catch(e){this.onError(s.id,e)}},priority:a}),this.pumpQueue(),c}",
+      "async sendRequest(e,t,n){return this.enqueueRequest(e,t,n)}",
+      "}",
+      "function Mjt(){return `critical`}function Ejt(){return `source`}",
+      "const appServerPatchSignals=`AppServerRequestClient is missing a message dispatcher mcp_request_enqueued`;",
+    ].join("");
+    electron.protocol.handle("app", async () => new Response(appServerRequestSource));
+    const appServerRequestResponse = await installedHandler({
+      url: "app://-/assets/app-initial-app-server-request-current-build.js",
+    });
+    const patchedAppServerRequestSource = await appServerRequestResponse.text();
+    assert.match(
+      patchedAppServerRequestSource,
+      /__codeyModelWhitelistPatch\?\.rewriteOutgoingMessage/,
+    );
+    const blockedAppServerMessages = [];
+    const routedAppServerTypes = [];
+    const trackedAppServerMessages = [];
+    const appServerGlobal = {
+      __codeyModelWhitelistPatch: {
+        rewriteOutgoingMessage(detail) {
+          routedAppServerTypes.push(detail.type);
+          if (detail.request.params.model === "blocked-route/model") {
+            return { ...detail, blocked: true };
+          }
+          return {
+            ...detail,
+            request: {
+              ...detail.request,
+              params: {
+                model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+                modelProvider: "codey_router",
+              },
+            },
+          };
+        },
+        isBlockedOutgoingMessage(detail) {
+          return detail.blocked === true;
+        },
+        notifyBlockedOutgoingMessage(detail) {
+          blockedAppServerMessages.push(detail);
+        },
+        trackOutgoingMessage(detail) {
+          trackedAppServerMessages.push(detail);
+        },
+      },
+    };
+    const AppServerRequestClient = Function(
+      "globalThis",
+      "Date",
+      `${patchedAppServerRequestSource};return AppServerRequestClient`,
+    )(appServerGlobal, Date);
+    const requestClient = new AppServerRequestClient();
+    await requestClient.enqueueRequest("thread/start", {
+      model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+      model_provider: "openai",
+    }, {});
+    assert.deepEqual(requestClient.sent[0].payload.request.params, {
+      model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+      modelProvider: "codey_router",
+    });
+    await requestClient.enqueueRequest("thread/start", {
+      model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+      model_provider: "openai",
+    }, {}, (request) => {
+      requestClient.dispatchMessage?.("thread-prewarm-start", {
+        request,
+        hostId: requestClient.hostId,
+      });
+    });
+    assert.equal(routedAppServerTypes.at(-1), "mcp-request");
+    assert.deepEqual(requestClient.sent[1].payload.request.params, {
+      model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+      modelProvider: "codey_router",
+    });
+    await assert.rejects(
+      requestClient.enqueueRequest("thread/start", { model: "blocked-route/model" }, {}),
+      /Codey blocked cross-provider model request/,
+    );
+    assert.equal(requestClient.sent.length, 2);
+    assert.equal(blockedAppServerMessages.length, 1);
+    assert.equal(trackedAppServerMessages.length, 2);
+    assert.deepEqual(trackedAppServerMessages[0], {
+      type: "mcp-request",
+      request: requestClient.sent[0].payload.request,
+    });
+    assert.equal(
+      patchErrors.length,
+      2,
+      "the AppServerRequestClient route preflight must patch without compatibility errors",
+    );
+
+    const hookStatsSource = [
+      "const hookLabel=`assistantMessage.hookStats.label`;",
+      "const hookTitle=`assistantMessage.hookStats.title`;",
+      "function renderHookStats(r,l,d){",
+      "return (0,R.jsx)(r,{tooltipContent:l,tooltipClassName:`px-3 py-2`,",
+      "tooltipMaxWidth:`min(32rem, var(--radix-tooltip-content-available-width), calc(100vw - 16px))`,",
+      "children:d})}",
+    ].join("");
+    electron.protocol.handle("app", async () => new Response(hookStatsSource));
+    const hookStatsResponse = await installedHandler({
+      url: "app://-/assets/subagent-activity-chip-group-current-build.js",
+    });
+    const patchedHookStatsSource = await hookStatsResponse.text();
+    assert.match(
+      patchedHookStatsSource,
+      /\{interactive:!0,tooltipContent:l,tooltipClassName:`px-3 py-2`/,
+    );
+    assert.equal(
+      patchErrors.length,
+      2,
+      "the compatible hook tooltip patch must not log a skipped renderer gate",
+    );
+
 
     const petSettingsSource = [
       "import{AvatarPreview as P,builtInPets as L}",
@@ -265,43 +791,6 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       patchedSideEffectPetSettingsSource,
       /const petSettingsId=`settings\.pets\.title`/,
     );
-
-    const statsigSource = [
-      "function Ftu(e){",
-      "let m=async e=>{",
-      "let t=await Ueu(e);",
-      "try{let client=new Vtu.StatsigClient(c,t.user,config);return client}",
-      "catch(error){throw new Jeu(",
-      "mb.CODEX_POST_LOGIN_STATSIG_BOOTSTRAP_FAILURE_TYPE_CLIENT_INITIALIZATION_FAILED,",
-      "error)}};",
-      "return m}",
-      "`Statsig: error while bootstrapping post-login client ",
-      "CodexStatsigProvider.sync`;",
-      "`useStatsigInternalClientFactoryAsync`;`_getInstance`;",
-      "function runAsyncStatsigGate(i,n,o){",
-      "return i.loadingStatus!==`Ready`&&",
-      "i.initializeAsync().catch(n.Log.error).finally(()=>o(!1))}",
-    ].join("");
-    electron.protocol.handle("app", async () => new Response(statsigSource));
-    const statsigResponse = await installedHandler({
-      url: "app://-/assets/app-initial-BHB6SClA.js",
-    });
-    const patchedStatsigSource = await statsigResponse.text();
-    assert.match(
-      patchedStatsigSource,
-      /let t=await Promise\.race\(\[Ueu\(e\),new Promise/,
-    );
-    assert.match(patchedStatsigSource, /Codey Statsig bootstrap timeout/);
-    assert.doesNotMatch(patchedStatsigSource, /let t=await Ueu\(e\);/);
-    assert.match(
-      patchedStatsigSource,
-      /Promise\.race\(\[i\.initializeAsync\(\),new Promise/,
-    );
-    assert.match(
-      patchedStatsigSource,
-      /Codey Statsig async initialization timeout/,
-    );
-    assert.doesNotMatch(patchedStatsigSource, /i\.initializeAsync\(\)\.catch/);
 
     const localeSource = [
       "function resolveLocale(a,bp,Au){",
@@ -563,130 +1052,44 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       /function unrelated\(\)\{return beginCpuSampling\(\)\}/,
     );
 
-    let rejectBootstrap;
-    const neverCompletesBootstrap = new Promise((_, reject) => {
-      rejectBootstrap = reject;
-    });
-    const createStatsigSync = Function(
-      "Ueu",
-      "Vtu",
-      "Jeu",
-      "mb",
-      "c",
-      "config",
-      `${patchedStatsigSource};return Ftu()`,
-    );
-    const syncStatsig = createStatsigSync(
-      () => neverCompletesBootstrap,
-      {
-        StatsigClient() {
-          assert.fail(
-            "StatsigClient must not be constructed after bootstrap timeout",
-          );
-        },
-      },
-      class FakeStatsigInitializationError extends Error {},
-      {
-        CODEX_POST_LOGIN_STATSIG_BOOTSTRAP_FAILURE_TYPE_CLIENT_INITIALIZATION_FAILED:
-          "client-initialization-failed",
-      },
-      {},
-      {},
-    );
-    const unhandledRejections = [];
-    const onUnhandledRejection = (reason) => {
-      unhandledRejections.push(reason);
-    };
-    const nativeDateNow = Date.now;
-    const nativeSetTimeout = globalThis.setTimeout;
-    const nativeClearTimeout = globalThis.clearTimeout;
-    let now = 10_000;
-    const scheduledTimers = [];
-    const runNextTimer = () => {
-      const timer = scheduledTimers.find((candidate) => !candidate.cleared);
-      assert.ok(timer, "expected a scheduled timeout");
-      timer.cleared = true;
-      timer.callback(...timer.args);
-      return timer.delay;
-    };
-
-    delete globalThis.__CODEY_STATSIG_STARTUP_DEADLINE_MS__;
-    process.on("unhandledRejection", onUnhandledRejection);
-    let releaseAsyncInitialization;
-    const neverCompletesAsyncInitialization = new Promise((_, reject) => {
-      releaseAsyncInitialization = reject;
-    });
-    const asyncInitializationErrors = [];
-    const asyncGateFinished = [];
-    const runAsyncStatsigGate = Function(
-      `${patchedStatsigSource};return runAsyncStatsigGate`,
-    )();
-    try {
-      Date.now = () => now;
-      globalThis.setTimeout = (callback, delay = 0, ...args) => {
-        const timer = { callback, delay, args, cleared: false };
-        scheduledTimers.push(timer);
-        return timer;
-      };
-      globalThis.clearTimeout = (timer) => {
-        if (timer) timer.cleared = true;
-      };
-
-      const syncStatsigPromise = syncStatsig("input");
-      const syncStatsigAssertion = assert.rejects(
-        syncStatsigPromise,
-        (error) => {
-          assert.match(String(error), /Codey Statsig bootstrap timeout/);
-          return true;
-        },
-      );
-      assert.equal(runNextTimer(), 1500);
-      now += 1500;
-      await syncStatsigAssertion;
-      const asyncGatePromise = runAsyncStatsigGate(
-        {
-          loadingStatus: "Loading",
-          initializeAsync: () => neverCompletesAsyncInitialization,
-        },
-        {
-          Log: {
-            error: (error) => {
-              asyncInitializationErrors.push(error);
-            },
-          },
-        },
-        (loading) => {
-          asyncGateFinished.push(loading);
-        },
-      );
-      assert.equal(runNextTimer(), 0);
-      await asyncGatePromise;
-      assert.equal(asyncInitializationErrors.length, 1);
-      assert.match(
-        String(asyncInitializationErrors[0]),
-        /Codey Statsig async initialization timeout/,
-      );
-      assert.deepEqual(asyncGateFinished, [false]);
-      rejectBootstrap(new Error("late bootstrap failure"));
-      releaseAsyncInitialization(
-        new Error("late async initialization failure"),
-      );
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.deepEqual(unhandledRejections, []);
-    } finally {
-      delete globalThis.__CODEY_STATSIG_STARTUP_DEADLINE_MS__;
-      Date.now = nativeDateNow;
-      globalThis.setTimeout = nativeSetTimeout;
-      globalThis.clearTimeout = nativeClearTimeout;
-      process.off("unhandledRejection", onUnhandledRejection);
-    }
-
     // Only the first (fully incompatible) bundle logged skips — two gates whose
-    // anchors were present but whose shapes did not match. The statsig and
-    // interaction bundles patched cleanly, so no further skips were logged.
+    // anchors were present but whose shapes did not match. The interaction
+    // bundle patched cleanly, so no further skips were logged.
     assert.equal(patchErrors.length, 2);
+
+    const productionRendererAsset = process.env.CODEY_RENDERER_ASSET;
+    if (productionRendererAsset) {
+      const productionSource = await readFile(productionRendererAsset, "utf8");
+      const previousErrorCount = patchErrors.length;
+      electron.protocol.handle("app", async () => new Response(productionSource));
+      const productionResponse = await installedHandler({
+        url: "app://-/assets/app-initial-production-build.js",
+      });
+      const patchedProductionSource = await productionResponse.text();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.notEqual(
+        patchedProductionSource,
+        productionSource,
+        "the production renderer asset should receive compatible Codey gates",
+      );
+      const currentGateFailures = patchErrors
+        .slice(previousErrorCount)
+        .map(([message]) => String(message))
+        .filter((message) =>
+          /model allowlist|model visibility|model-aware service tier control|model-aware Fast toggle|fast model trigger availability/.test(
+            message,
+          ),
+        );
+      assert.deepEqual(
+        currentGateFailures,
+        [],
+        "the current production renderer shapes must not log known compatibility failures",
+      );
+    }
   } finally {
     console.error = nativeConsoleError;
+    childProcess.spawn = nativeSpawn;
+    childProcess.spawnSync = nativeSpawnSync;
     Module._load = nativeLoad;
     Module._extensions[".js"] = nativeJsExtension;
   }

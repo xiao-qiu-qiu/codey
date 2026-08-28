@@ -9,7 +9,13 @@ const source = fs.readFileSync(
 
 test("development preview fixtures cannot be mistaken for live credentials", () => {
   assert.match(source, /example\.invalid/);
-  assert.match(source, /preview-only-not-a-secret/);
+  assert.match(source, /apiKey: "preview-route-primary-key"/);
+  assert.match(source, /apiKey: "preview-route-backup-key"/);
+  assert.match(source, /apiKey: "preview-prompt-optimization-key"/);
+  assert.match(
+    source,
+    /kind: "telegram"[\s\S]*?botToken: ""[\s\S]*?botTokenConfigured: true/,
+  );
   assert.match(source, /preview-chat-id/);
   assert.doesNotMatch(source, /\bsk-(?:proj-)?[A-Za-z0-9._-]+/);
   assert.doesNotMatch(source, /api\.(?:openai|anthropic)\.com/);
@@ -17,4 +23,48 @@ test("development preview fixtures cannot be mistaken for live credentials", () 
     source,
     /open\.feishu\.cn\/open-apis\/bot\/v2\/hook\/[A-Za-z0-9-]+/,
   );
+  assert.doesNotMatch(
+    source,
+    /qyapi\.weixin\.qq\.com\/cgi-bin\/webhook\/send\?key=[A-Za-z0-9-]+/,
+  );
+});
+
+test("development preview includes Windows-only injection status only on Windows", () => {
+  assert.match(
+    source,
+    /\.\.\.\(previewClientPlatform === "windows"[\s\S]*?id: "windows-wmi-sampler"/,
+  );
+});
+
+test("development preview follows the current runtime-status contract", () => {
+  assert.match(source, /visibility: "internal"/);
+  assert.match(source, /visibility: "feature"/);
+  assert.match(
+    source,
+    /id: "renderer-controls"[\s\S]*?visibility: "internal"/,
+  );
+  assert.match(source, /fastContextToolsActive: previewConfig\.fastContextTools/);
+  assert.match(
+    source,
+    /subagentOptimizationActive: previewConfig\.subagentOptimization/,
+  );
+  assert.match(source, /notificationChannelsActive: activeNotificationChannelCount > 0/);
+  assert.match(source, /activeNotificationChannelCount,/);
+  assert.match(
+    source,
+    /traceLogWriteProtectionActive: previewConfig\.disableTraceLogWrites/,
+  );
+  assert.match(
+    source,
+    /crashpadDiskProtectionActive:[\s\S]*?previewClientPlatform === "macos"[\s\S]*?previewConfig\.protectCrashpadPending/,
+  );
+  assert.doesNotMatch(source, /command === "refresh_injection_status"/);
+});
+
+test("development preview exercises cross-route subagent model selection", () => {
+  assert.match(
+    source,
+    /backup: \["claude-sonnet-4-5", "claude-opus-4-1"\]/,
+  );
+  assert.match(source, /model: "backup\/claude-sonnet-4-5"/);
 });

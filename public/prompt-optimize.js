@@ -17,6 +17,8 @@
   const styleId = "codey-prompt-optimize-style";
   const toastId = "codey-runtime-toast";
   const configChangedEvent = "codey:config-changed";
+  const injectionStatusId = "prompt-optimize";
+  const injectionStatusChangedEvent = "codey-injection-status-changed";
   const optimizeTimeoutMs = 75_000;
   const pendingOptimizationLimit = 20;
   const scanDelayMs = 250;
@@ -38,6 +40,26 @@
   let inputElement = null;
   let button = null;
   let busy = false;
+
+  const publishInjectionStatus = () => {
+    if (!ready) return;
+    const entry = window.__codeyInjectionStatus?.[injectionStatusId];
+    if (!entry || entry.status === "pending") return;
+    const status = enabled ? "effective" : "inactive";
+    const detail = enabled ? "提示词优化按钮已就绪" : "提示词优化已关闭";
+    if (entry.status === status && entry.detail === detail && !entry.error) return;
+    entry.status = status;
+    entry.detail = detail;
+    entry.error = null;
+    if (
+      typeof window.dispatchEvent === "function"
+      && typeof window.CustomEvent === "function"
+    ) {
+      window.dispatchEvent(new window.CustomEvent(injectionStatusChangedEvent, {
+        detail: { id: injectionStatusId, status },
+      }));
+    }
+  };
   let scanTimer = 0;
   let repositionTimer = 0;
   let configLoadTimer = 0;
@@ -45,6 +67,7 @@
   let configLoadAttempts = 0;
   let observer = null;
   let observerActive = false;
+  let unsubscribeMutations = null;
   const pendingOptimizations = new Map();
 
   const MAX_CONFIG_LOAD_ATTEMPTS = 10;
@@ -114,6 +137,7 @@
     element.id = buttonId;
     element.type = "button";
     element.dataset.codeyPromptOptimize = "true";
+    element.setAttribute("contenteditable", "false");
     element.setAttribute("aria-label", "优化提示词");
     element.setAttribute("aria-disabled", "true");
     element.setAttribute("aria-busy", "false");
@@ -164,11 +188,52 @@
     if (!isComposerInput(element)) return false;
     if (element.closest?.(ignoredComposerContainerSelector)) return false;
     if (element.closest?.("[hidden], [aria-hidden='true']")) return false;
-    if (element.disabled) return false;
+    if (element.disabled || element.readOnly) return false;
     const style = window.getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden") return false;
     const rect = element.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
+  };
+
+  const controlLooksLikeComposerAction = (control) =>
+    /(^|[^a-z])(model|send|submit|attach|upload|microphone|mic|voice|full access)([^a-z]|$)|模型|发送|提交|附件|上传|语音|麦克风|完全访问/i.test(
+      controlDescriptor(control),
+    );
+
+  const controlIsNearInput = (control, inputRect) => {
+    const rect = control.getBoundingClientRect();
+    if (rect.bottom <= inputRect.top) return false;
+    const controlMiddle = rect.top + rect.height / 2;
+    const inputMiddle = inputRect.top + inputRect.height / 2;
+    return Math.abs(controlMiddle - inputMiddle) <= Math.max(96, inputRect.height);
+  };
+
+  const scopeHasComposerActions = (scope, inputRect) =>
+    [...(scope?.querySelectorAll?.(composerControlSelector) || [])].some(
+      (control) =>
+        isVisibleControl(control) &&
+        controlIsNearInput(control, inputRect) &&
+        controlLooksLikeComposerAction(control),
+    );
+
+  const scopeHasVisibleControls = (scope, inputRect) =>
+    [...(scope?.querySelectorAll?.(composerControlSelector) || [])].some(
+      (control) =>
+        isVisibleControl(control) && controlIsNearInput(control, inputRect),
+    );
+
+  const hasComposerActionContext = (element) => {
+    if (!element?.parentElement) return false;
+    const inputRect = element.getBoundingClientRect();
+    let scope = element.parentElement;
+    let depth = 0;
+    while (scope && depth < 6) {
+      if (scopeHasComposerActions(scope, inputRect)) return true;
+      if (scopeHasVisibleControls(scope, inputRect)) return false;
+      scope = scope.parentElement;
+      depth += 1;
+    }
+    return false;
   };
 
   const findComposerInput = () => {
@@ -193,6 +258,7 @@
       composerFallbackSelector,
     )) {
       if (!isVisible(candidate)) continue;
+      if (!hasComposerActionContext(candidate)) continue;
       const rect = candidate.getBoundingClientRect();
       if (
         viewportHeight > 0 &&
@@ -237,6 +303,7 @@
   const modelControlScore = (control, inputRect) => {
     const rect = control.getBoundingClientRect();
     if (rect.bottom <= inputRect.top) return Number.NEGATIVE_INFINITY;
+    if (!controlIsNearInput(control, inputRect)) return Number.NEGATIVE_INFINITY;
     const descriptor = controlDescriptor(control);
     const visibleText = [control.textContent, control.innerText]
       .filter((value) => typeof value === "string" && value.trim())
@@ -244,7 +311,13 @@
       .replace(/\s+/g, " ")
       .trim();
     const hasModelHint = /(^|[^a-z])model([^a-z]|$)|模型/i.test(descriptor);
-    if (!hasModelHint && !visibleText) return Number.NEGATIVE_INFINITY;
+    const hasModelValueHint =
+      /(^|[^a-z])(gpt|codex|claude|gemini|grok|llama|qwen|deepseek|mistral|sonnet|opus|haiku|mini|sol|low|medium|high|xhigh|auto)([^a-z]|$)|\bo\d+\b|\d+(?:\.\d+)?|低|中|高|极高|自动/i.test(
+        visibleText,
+      );
+    if (!hasModelHint && !hasModelValueHint) {
+      return Number.NEGATIVE_INFINITY;
+    }
     if (
       !hasModelHint &&
       /完全访问|full access|附件|attach|上传|upload|优化/i.test(descriptor)
@@ -277,6 +350,7 @@
     while (scope && depth < 8) {
       for (const control of scope.querySelectorAll?.(composerControlSelector) ||
         []) {
+        if (inputElement.contains?.(control)) continue;
         if (seen.has(control) || !isVisibleControl(control)) continue;
         seen.add(control);
         const score = modelControlScore(control, inputRect);
@@ -290,6 +364,7 @@
       depth += 1;
     }
     if (!bestControl) return null;
+    if (!hasComposerActionContext(inputElement)) return null;
 
     let anchor = bestControl;
     let host = bestControl.parentElement;
@@ -307,6 +382,19 @@
     return children.indexOf(element) + 1 === children.indexOf(anchor);
   };
 
+  const nodeIsInsideInputElement = (node) =>
+    Boolean(
+      inputElement &&
+        node &&
+        (node === inputElement || inputElement.contains?.(node)),
+    );
+
+  const removeButtonFromEditableInput = () => {
+    if (button && nodeIsInsideInputElement(button)) {
+      button.remove();
+    }
+  };
+
   const updateButtonPosition = () => {
     if (!button || !inputElement) return;
     if (!isVisible(inputElement)) {
@@ -317,6 +405,15 @@
     }
     const target = findModelInsertionTarget();
     if (!target) {
+      removeButtonFromEditableInput();
+      button.style.display = "none";
+      return;
+    }
+    if (
+      nodeIsInsideInputElement(target.host) ||
+      nodeIsInsideInputElement(target.anchor)
+    ) {
+      removeButtonFromEditableInput();
       button.style.display = "none";
       return;
     }
@@ -588,46 +685,68 @@
     );
   };
 
-  const installObserver = () => {
-    observer = new MutationObserver((mutations) => {
-      if (!enabled) return;
-      const hasExternalMutation = mutations.some((mutation) => {
-        const target = mutation.target;
-        if (!target) return true;
-        if (target === button || target.id === toastId) return false;
-        if (target.id === styleId) return false;
-        return (
-          !target.closest?.(`#${buttonId}, #${toastId}`) &&
-          mutationRequiresComposerScan(mutation)
-        );
-      });
-      if (hasExternalMutation) scheduleScan();
+  const handleComposerMutations = (mutations) => {
+    if (!enabled) return;
+    const hasExternalMutation = mutations.some((mutation) => {
+      const target = mutation.target;
+      if (!target) return true;
+      if (target === button || target.id === toastId) return false;
+      if (target.id === styleId) return false;
+      return (
+        !target.closest?.(`#${buttonId}, #${toastId}`) &&
+        mutationRequiresComposerScan(mutation)
+      );
     });
+    if (hasExternalMutation) scheduleScan();
+  };
+
+  const composerMutationOptions = {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: [
+      "aria-hidden",
+      "class",
+      "contenteditable",
+      "data-above-composer-conversation-id",
+      "disabled",
+      "hidden",
+      "readonly",
+      "role",
+      "style",
+    ],
+  };
+
+  const installObserver = () => {
+    if (typeof window.__codeyMutationDispatcher?.subscribe === "function") return;
+    observer = new MutationObserver(handleComposerMutations);
   };
 
   const observeComposerMutations = () => {
-    if (!observer || observerActive || !enabled) return;
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: [
-        "aria-hidden",
-        "class",
-        "contenteditable",
-        "data-above-composer-conversation-id",
-        "disabled",
-        "hidden",
-        "role",
-        "style",
-      ],
-    });
+    if (observerActive || !enabled) return;
+    const mutationDispatcher = window.__codeyMutationDispatcher;
+    if (typeof mutationDispatcher?.subscribe === "function") {
+      const unsubscribe = mutationDispatcher.subscribe(
+        handleComposerMutations,
+        composerMutationOptions,
+      );
+      if (mutationDispatcher.snapshot?.().observerInstalled) {
+        unsubscribeMutations = unsubscribe;
+        observerActive = true;
+        return;
+      }
+      unsubscribe?.();
+    }
+    observer ||= new MutationObserver(handleComposerMutations);
+    observer.observe(document.documentElement, composerMutationOptions);
     observerActive = true;
   };
 
   const disconnectComposerObserver = () => {
-    if (!observer || !observerActive) return;
-    observer.disconnect();
+    if (!observerActive) return;
+    unsubscribeMutations?.();
+    unsubscribeMutations = null;
+    observer?.disconnect();
     observerActive = false;
   };
 
@@ -657,7 +776,8 @@
           const optimization = config?.promptOptimization;
           applyEnabledState(
             optimization?.enabled === true &&
-              optimization.apiKeyConfigured === true,
+              (optimization?.mode === "codeyRoute" ||
+                optimization?.apiKeyConfigured === true),
           );
         } catch (error) {
           // A script-side error must not look like a missing bridge; report
@@ -670,6 +790,7 @@
           }
         }
         ready = true;
+        publishInjectionStatus();
       })
       .catch(() => {
         // The bridge may not be ready during early startup; retry with

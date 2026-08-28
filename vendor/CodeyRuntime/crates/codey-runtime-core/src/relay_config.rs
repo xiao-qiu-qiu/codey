@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
-use crate::settings::{RelayContextSelection, RelayProfile, RelayProtocol};
+use crate::config_manager::ConfigManager;
+use crate::settings::{RelayContextSelection, RelayProfile};
 
 const RELAY_PROVIDER: &str = "custom";
 const LEGACY_RELAY_PROVIDERS: &[&str] = &["CodeyRuntime", "CodeyRuntime"];
-const CHAT_UPSTREAM_BASE_URL_KEY: &str = "codey_chat_base_url";
 const RESERVED_MODEL_PROVIDER_IDS: &[&str] = &[
     "amazon-bedrock",
     "openai",
@@ -86,53 +86,32 @@ pub fn default_relay_status() -> RelayStatus {
 }
 
 pub fn set_codex_goals_feature_in_home(home: &Path, enabled: bool) -> anyhow::Result<()> {
-    std::fs::create_dir_all(home)?;
-    let config_path = home.join("config.toml");
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let updated = match parse_toml_document(&existing) {
-        Ok(mut doc) => {
-            if enabled {
-                let features = table_mut_or_insert(&mut doc, "features")?;
-                features["goals"] = toml_edit::value(true);
-            } else if let Some(features) = table_mut_if_exists(&mut doc, "features") {
-                features.remove("goals");
-                if features.is_empty() {
-                    doc.as_table_mut().remove("features");
+    let manager = ConfigManager::for_home(home);
+    let snapshot = manager.load()?;
+    manager.update(
+        Some(snapshot.revision()),
+        if enabled {
+            "enable Codex goals feature"
+        } else {
+            "disable Codex goals feature"
+        },
+        "relay_config.set_codex_goals_feature_in_home",
+        |editor| {
+            editor.edit_document(|doc| {
+                if enabled {
+                    let features = table_mut_or_insert(doc, "features")?;
+                    features["goals"] = toml_edit::value(true);
+                } else if let Some(features) = table_mut_if_exists(doc, "features") {
+                    features.remove("goals");
+                    if features.is_empty() {
+                        doc.as_table_mut().remove("features");
+                    }
                 }
-            }
-            ensure_trailing_newline(doc.to_string())
-        }
-        Err(_) => set_codex_goals_feature_text_fallback(&existing, enabled),
-    };
-    crate::settings::atomic_write(&config_path, updated.as_bytes())
-}
-
-fn set_codex_goals_feature_text_fallback(existing: &str, enabled: bool) -> String {
-    let mut kept = Vec::new();
-    let mut skipping_features = false;
-
-    for line in existing.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[features]" {
-            skipping_features = true;
-            continue;
-        }
-        if skipping_features && trimmed.starts_with('[') && trimmed.ends_with(']') {
-            skipping_features = false;
-        }
-        if !skipping_features {
-            kept.push(line);
-        }
-    }
-
-    let mut updated = kept.join("\n").trim_end().to_string();
-    if enabled {
-        if !updated.is_empty() {
-            updated.push_str("\n\n");
-        }
-        updated.push_str("[features]\ngoals = true");
-    }
-    ensure_trailing_newline(updated)
+                Ok(())
+            })
+        },
+    )?;
+    Ok(())
 }
 
 fn table_mut_or_insert<'a>(doc: &'a mut DocumentMut, key: &str) -> anyhow::Result<&'a mut Table> {
@@ -186,7 +165,11 @@ pub fn chatgpt_auth_status_from_home(home: &Path) -> ChatGptAuthStatus {
 
 pub fn relay_config_status_from_home(home: &Path) -> RelayConfigStatus {
     let config_path = home.join("config.toml");
-    let contents = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let contents = ConfigManager::for_home(home)
+        .load()
+        .ok()
+        .and_then(|snapshot| String::from_utf8(snapshot.raw().to_vec()).ok())
+        .unwrap_or_default();
     let auth_contents = std::fs::read_to_string(home.join("auth.json")).unwrap_or_default();
     let root_provider = root_key_string(&contents, "model_provider");
     let provider = root_provider
@@ -224,22 +207,6 @@ pub fn apply_relay_config_to_home(
     base_url: &str,
     bearer_token: &str,
 ) -> anyhow::Result<RelayApplyResult> {
-    apply_relay_config_to_home_with_protocol(
-        home,
-        base_url,
-        bearer_token,
-        RelayProtocol::Responses,
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-    )
-}
-
-pub fn apply_relay_config_to_home_with_protocol(
-    home: &Path,
-    base_url: &str,
-    bearer_token: &str,
-    protocol: RelayProtocol,
-    proxy_port: u16,
-) -> anyhow::Result<RelayApplyResult> {
     let base_url = base_url.trim();
     if base_url.is_empty() {
         anyhow::bail!("中转 Base URL 不能为空");
@@ -248,13 +215,18 @@ pub fn apply_relay_config_to_home_with_protocol(
     if bearer_token.is_empty() {
         anyhow::bail!("中转 Key 不能为空");
     }
-    let codex_base_url = codex_base_url_for_protocol(base_url, protocol, proxy_port);
-    let updated = upsert_model_provider_config("", &codex_base_url, bearer_token)?;
+    let updated = upsert_model_provider_config("", base_url, bearer_token)?;
     let auth_contents = serde_json::to_string_pretty(&json!({
         "OPENAI_API_KEY": bearer_token
     }))?;
-    let backup_path =
-        write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()), false)?;
+    let backup_path = write_codex_live_atomic(
+        home,
+        Some(&updated),
+        Some(auth_contents.as_bytes()),
+        false,
+        "apply relay endpoint and credentials",
+        "relay_config.apply_relay_config_to_home",
+    )?;
     let status = relay_config_status_from_home(home);
     Ok(RelayApplyResult {
         config_path: status.config_path,
@@ -268,13 +240,7 @@ pub fn apply_pure_api_config_to_home(
     base_url: &str,
     bearer_token: &str,
 ) -> anyhow::Result<RelayApplyResult> {
-    apply_pure_api_config_to_home_with_protocol(
-        home,
-        base_url,
-        bearer_token,
-        RelayProtocol::Responses,
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-    )
+    apply_relay_config_to_home(home, base_url, bearer_token)
 }
 
 pub fn apply_relay_files_to_home(
@@ -301,6 +267,8 @@ pub fn apply_relay_files_to_home_with_computer_use_guard(
         Some(config_contents),
         Some(auth_contents.as_bytes()),
         preserve_computer_use_guard,
+        "apply relay config/auth files",
+        "relay_config.apply_relay_files_to_home_with_computer_use_guard",
     )?;
 
     let status = relay_config_status_from_home(home);
@@ -483,7 +451,14 @@ pub fn apply_relay_config_file_to_home(
     }
     std::fs::create_dir_all(home)?;
 
-    let backup_path = write_codex_live_atomic(home, Some(config_contents), None, false)?;
+    let backup_path = write_codex_live_atomic(
+        home,
+        Some(config_contents),
+        None,
+        false,
+        "apply relay config file",
+        "relay_config.apply_relay_config_file_to_home",
+    )?;
 
     let status = relay_config_status_from_home(home);
     Ok(RelayApplyResult {
@@ -491,25 +466,6 @@ pub fn apply_relay_config_file_to_home(
         backup_path,
         configured: status.configured,
     })
-}
-
-pub fn apply_pure_api_config_to_home_with_protocol(
-    home: &Path,
-    base_url: &str,
-    bearer_token: &str,
-    protocol: RelayProtocol,
-    proxy_port: u16,
-) -> anyhow::Result<RelayApplyResult> {
-    apply_relay_config_to_home_with_protocol(home, base_url, bearer_token, protocol, proxy_port)
-}
-
-fn codex_base_url_for_protocol(base_url: &str, protocol: RelayProtocol, proxy_port: u16) -> String {
-    match protocol {
-        RelayProtocol::Responses => base_url.to_string(),
-        RelayProtocol::ChatCompletions => {
-            crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
-        }
-    }
 }
 
 pub fn clear_relay_config_to_home(home: &Path) -> anyhow::Result<RelayApplyResult> {
@@ -533,8 +489,7 @@ pub fn clear_relay_config_to_home_with_auth_and_computer_use_guard(
         Some(contents) if !contents.trim().is_empty() => Some(contents.as_bytes().to_vec()),
         _ => pure_api_auth_json_removed(home)?,
     };
-    let config_path = home.join("config.toml");
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let existing = read_live_config(home)?;
     let mut without_tables = remove_table(&existing, &format!("model_providers.{RELAY_PROVIDER}"));
     for legacy_provider in LEGACY_RELAY_PROVIDERS {
         without_tables = remove_table(
@@ -556,6 +511,8 @@ pub fn clear_relay_config_to_home_with_auth_and_computer_use_guard(
         Some(&updated),
         auth_bytes.as_deref(),
         preserve_computer_use_guard,
+        "clear relay-owned configuration",
+        "relay_config.clear_relay_config_to_home_with_auth_and_computer_use_guard",
     )?;
     let status = relay_config_status_from_home(home);
     Ok(RelayApplyResult {
@@ -589,7 +546,7 @@ pub fn backfill_relay_profile_from_home(
     home: &Path,
     profile: &mut RelayProfile,
 ) -> anyhow::Result<()> {
-    profile.config_contents = read_optional_text(&home.join("config.toml"))?;
+    profile.config_contents = read_live_config(home)?;
     profile.auth_contents = read_optional_text(&home.join("auth.json"))?;
     let live_config = profile.config_contents.clone();
     sync_context_limits_from_config(profile, &live_config);
@@ -606,7 +563,7 @@ pub fn backfill_relay_profile_from_home_with_common(
     profile: &mut RelayProfile,
     common_config_contents: &str,
 ) -> anyhow::Result<()> {
-    let live_config = read_optional_text(&home.join("config.toml"))?;
+    let live_config = read_live_config(home)?;
     let template_config = profile.config_contents.clone();
     let template_auth = profile.auth_contents.clone();
     profile.config_contents = if profile.use_common_config {
@@ -630,13 +587,7 @@ pub fn backfill_relay_profile_from_home_with_common(
 
 pub fn extract_common_config_from_config(config_text: &str) -> anyhow::Result<String> {
     let mut doc = parse_toml_document(config_text)?;
-    for key in [
-        "model",
-        "model_provider",
-        "base_url",
-        "model_catalog_json",
-        CHAT_UPSTREAM_BASE_URL_KEY,
-    ] {
+    for key in ["model", "model_provider", "base_url", "model_catalog_json"] {
         doc.as_table_mut().remove(key);
     }
     doc.as_table_mut().remove("model_providers");
@@ -791,7 +742,7 @@ fn preserve_unmanaged_live_context_entries(
     config_text: &str,
     managed_context_config: &str,
 ) -> anyhow::Result<String> {
-    let live_config = read_optional_text(&home.join("config.toml"))?;
+    let live_config = read_live_config(home)?;
     if live_config.trim().is_empty() {
         return Ok(ensure_trailing_newline(config_text.to_string()));
     }
@@ -966,6 +917,8 @@ fn write_codex_live_atomic(
     config_text: Option<&str>,
     auth_bytes: Option<&[u8]>,
     preserve_computer_use_guard: bool,
+    reason: &str,
+    caller: &str,
 ) -> anyhow::Result<Option<String>> {
     std::fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
@@ -995,8 +948,12 @@ fn write_codex_live_atomic(
     #[cfg(windows)]
     let config_text = guarded_config_text.as_deref();
 
+    let manager = ConfigManager::for_home(home);
+    let snapshot = manager.load()?;
+    let live_config = std::str::from_utf8(snapshot.raw())
+        .with_context(|| format!("{} 不是 UTF-8", config_path.display()))?;
     let config_text = match config_text {
-        Some(config_text) => Some(preserve_live_marketplace_configs(home, config_text)?),
+        Some(config_text) => Some(preserve_live_marketplace_configs(live_config, config_text)?),
         None => None,
     };
     let config_text = config_text.as_deref();
@@ -1019,7 +976,7 @@ fn write_codex_live_atomic(
         validate_auth_json(auth_bytes, &auth_path)?;
     }
 
-    let old_config = read_optional_bytes(&config_path)?;
+    let old_config = snapshot.exists().then(|| snapshot.raw().to_vec());
     let old_auth = read_optional_bytes(&auth_path)?;
     let backup_path = create_live_backup(home, old_config.as_deref(), old_auth.as_deref())?;
     let mut auth_written = false;
@@ -1032,26 +989,33 @@ fn write_codex_live_atomic(
     }
 
     if let Some(config_text) = config_text
-        && let Err(error) = crate::settings::atomic_write(&config_path, config_text.as_bytes())
+        && config_text.as_bytes() != snapshot.raw()
+        && let Err(error) =
+            manager.replace_text(Some(snapshot.revision()), config_text, reason, caller)
     {
-        if auth_written {
-            let _ = restore_optional_file(&auth_path, old_auth.as_deref());
+        if auth_written
+            && let Err(restore_error) = restore_optional_file(&auth_path, old_auth.as_deref())
+        {
+            return Err(error.context(format!(
+                "写入 config.toml 失败，且 auth.json 回滚失败：{restore_error}"
+            )));
         }
-        let _ = restore_optional_file(&config_path, old_config.as_deref());
         return Err(error.context("写入 config.toml 失败"));
     }
 
     Ok(backup_path)
 }
 
-fn preserve_live_marketplace_configs(home: &Path, config_text: &str) -> anyhow::Result<String> {
-    let live_config = read_optional_text(&home.join("config.toml"))?;
+fn preserve_live_marketplace_configs(
+    live_config: &str,
+    config_text: &str,
+) -> anyhow::Result<String> {
     if live_config.trim().is_empty() {
         return Ok(config_text.to_string());
     }
 
     let mut target = parse_toml_document(config_text)?;
-    let live = parse_toml_document(&live_config)?;
+    let live = parse_toml_document(live_config)?;
     let Some(live_marketplaces) = live.get("marketplaces").and_then(Item::as_table_like) else {
         return Ok(ensure_trailing_newline(target.to_string()));
     };
@@ -1124,13 +1088,7 @@ fn parse_toml_document(contents: &str) -> anyhow::Result<DocumentMut> {
 }
 
 fn remove_provider_specific_common_keys(table: &mut dyn TableLike) {
-    for key in [
-        "model",
-        "model_provider",
-        "base_url",
-        "model_catalog_json",
-        CHAT_UPSTREAM_BASE_URL_KEY,
-    ] {
+    for key in ["model", "model_provider", "base_url", "model_catalog_json"] {
         table.remove(key);
     }
     table.remove("model_providers");
@@ -1158,11 +1116,7 @@ fn sanitize_common_config_text_fallback(common_config: &str) -> String {
             let key = key.trim();
             if matches!(
                 key,
-                "model"
-                    | "model_provider"
-                    | "base_url"
-                    | "model_catalog_json"
-                    | CHAT_UPSTREAM_BASE_URL_KEY
+                "model" | "model_provider" | "base_url" | "model_catalog_json"
             ) {
                 continue;
             }
@@ -1804,35 +1758,10 @@ pub fn relay_profile_model(profile: &RelayProfile) -> String {
 }
 
 pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
-    if profile.relay_mode == crate::settings::RelayMode::Aggregate {
-        return crate::protocol_proxy::local_responses_proxy_base_url(
-            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-        );
-    }
-    if profile.protocol == RelayProtocol::ChatCompletions {
-        if !profile.upstream_base_url.trim().is_empty() {
-            return profile.upstream_base_url.trim().to_string();
-        }
-        if let Some(value) = root_key_string(&profile.config_contents, CHAT_UPSTREAM_BASE_URL_KEY)
-            .filter(|value| !value.trim().is_empty())
-        {
-            return value;
-        }
-        if !profile.base_url.trim().is_empty() {
-            return profile.base_url.trim().to_string();
-        }
-    }
     let provider_base_url = provider_string_from_config(&profile.config_contents, "base_url")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_default();
-    if profile.protocol == RelayProtocol::ChatCompletions
-        && provider_base_url
-            == crate::protocol_proxy::local_responses_proxy_base_url(
-                crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-            )
-    {
-        String::new()
-    } else if !provider_base_url.is_empty() {
+    if !provider_base_url.is_empty() {
         provider_base_url
     } else {
         profile.base_url.trim().to_string()
@@ -1840,9 +1769,6 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
 }
 
 pub fn relay_profile_api_key(profile: &RelayProfile) -> String {
-    if profile.relay_mode == crate::settings::RelayMode::Aggregate {
-        return "codey-aggregate".to_string();
-    }
     if profile.relay_mode == crate::settings::RelayMode::Official {
         return experimental_bearer_token_from_config(&profile.config_contents)
             .ok()
@@ -1887,7 +1813,6 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
 
     let base_url = relay_profile_base_url(profile);
     let api_key = relay_profile_api_key(profile);
-    doc.as_table_mut().remove(CHAT_UPSTREAM_BASE_URL_KEY);
     retain_only_provider_table(&mut doc, &provider_id);
     for legacy_provider in LEGACY_RELAY_PROVIDERS {
         if provider_id != *legacy_provider {
@@ -1918,13 +1843,8 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["requires_openai_auth"] = toml_edit::value(true);
     }
-    let provider_base_url = codex_base_url_for_protocol(
-        base_url.trim(),
-        profile.protocol,
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-    );
-    if !provider_base_url.trim().is_empty() {
-        provider["base_url"] = toml_edit::value(provider_base_url.trim());
+    if !base_url.trim().is_empty() {
+        provider["base_url"] = toml_edit::value(base_url.trim());
     }
     if profile.relay_mode == crate::settings::RelayMode::PureApi {
         provider.remove("experimental_bearer_token");
@@ -1957,7 +1877,6 @@ pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow
         }
         profile.model.clear();
         profile.base_url.clear();
-        profile.upstream_base_url.clear();
         profile.api_key.clear();
         if auth_contents_looks_like_chatgpt_auth(&profile.auth_contents) {
             profile.auth_contents =
@@ -1988,7 +1907,6 @@ pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow
     }
     profile.model = relay_profile_model(profile);
     profile.model_list = merge_model_into_model_list(&profile.model, &profile.model_list);
-    profile.upstream_base_url = source_base_url.clone();
     profile.base_url = source_base_url;
     profile.api_key = relay_profile_api_key(profile);
     Ok(())
@@ -2196,6 +2114,12 @@ fn read_optional_text(path: &Path) -> anyhow::Result<String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_live_config(home: &Path) -> anyhow::Result<String> {
+    let snapshot = ConfigManager::for_home(home).load()?;
+    String::from_utf8(snapshot.raw().to_vec())
+        .with_context(|| format!("{} 不是 UTF-8", snapshot.path().display()))
 }
 
 fn read_optional_bytes(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
@@ -2496,7 +2420,6 @@ mod tests {
 
         let mut profile = RelayProfile {
             relay_mode: crate::settings::RelayMode::PureApi,
-            protocol: crate::settings::RelayProtocol::Responses,
             config_contents: "model_provider = \"ai\"\nmodel = \"gpt-image-2\"\n\n[model_providers.ai]\nname = \"ai\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://ahg.codes\"\n"
                 .to_string(),
             auth_contents: "{}\n".to_string(),

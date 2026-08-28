@@ -12,10 +12,13 @@ use tokio::sync::{Mutex, oneshot};
 
 use super::AppState;
 use crate::codex_config::codex_home;
-use crate::config::{CodeyConfig, ConfigStore};
-use crate::notifications::{NotificationChannelConfig, NotificationDispatcher, NotificationEvent};
+use crate::config::{CodeyConfig, ConfigStore, OFFICIAL_ROUTE_SHORT_NAME};
+use crate::notifications::{
+    NotificationChannelConfig, NotificationChannelKind, NotificationDispatcher, NotificationEvent,
+};
 use crate::pending_approval;
 use crate::pending_approval::{CompletedTurn, RecentSessionEvents, SessionLifecycleStatus};
+use crate::{local_router, model_id};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,11 +93,7 @@ impl WebhookNotificationState {
 }
 
 fn waiting_notification_ledger_path(store: &ConfigStore) -> PathBuf {
-    store
-        .path()
-        .parent()
-        .map(|parent| parent.join("webhook-notifications.json"))
-        .unwrap_or_else(|| PathBuf::from("webhook-notifications.json"))
+    store.path().with_file_name("webhook-notifications.json")
 }
 
 /// Persisted "waiting" reservation keys in insertion order so the ledger stays
@@ -280,7 +279,9 @@ fn session_event_state_changed(
             .iter()
             .zip(current.aborted_turns.iter())
             .any(|(left, right)| {
-                left.session_id != right.session_id || left.turn_id != right.turn_id
+                left.session_id != right.session_id
+                    || left.turn_id != right.turn_id
+                    || left.is_snapshot_replay != right.is_snapshot_replay
             })
         || previous.completed_turns.len() != current.completed_turns.len()
         || previous
@@ -435,16 +436,8 @@ fn save_waiting_notification_ledger(
     fs::create_dir_all(parent).map_err(|error| format!("创建消息通知记录目录失败：{error}"))?;
     let bytes = serde_json::to_vec_pretty(&WaitingNotificationLedger { notification_keys })
         .map_err(|error| format!("序列化消息通知记录失败：{error}"))?;
-    let temp = crate::fs_util::unique_temp_path(path);
-    fs::write(&temp, bytes).map_err(|error| format!("写入消息通知记录失败：{error}"))?;
-    crate::fs_util::persist_temp_file(&temp, path)
+    crate::fs_util::atomic_write_private(path, &bytes)
         .map_err(|error| format!("替换消息通知记录失败：{error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("保护消息通知记录失败：{error}"))?;
-    }
     Ok(())
 }
 
@@ -678,7 +671,7 @@ pub(super) fn start_recent_session_scan(
 ) -> RecentSessionScanTask {
     let home = codex_home();
     tokio::task::spawn_blocking(move || {
-        let events = cache.refresh(&home);
+        let events = cache.refresh(home);
         (cache, events)
     })
 }
@@ -715,33 +708,39 @@ pub(super) async fn stop_waiting_webhook_watcher(state: &Arc<AppState>) {
     }
 }
 
-pub(super) async fn test_webhook(
-    state: &Arc<AppState>,
-    channel_id: Option<String>,
-) -> Result<Value, String> {
-    let webhook = state.config.read().await.webhook.clone();
-    let channel = match channel_id.as_deref().map(str::trim) {
-        Some(channel_id) if !channel_id.is_empty() => webhook
-            .channels
-            .into_iter()
-            .find(|channel| channel.id == channel_id)
-            .ok_or_else(|| "找不到要测试的通知渠道".to_string())?,
-        _ => webhook
-            .channels
-            .into_iter()
-            .next()
-            .ok_or_else(|| "请先添加通知渠道".to_string())?,
-    };
-    test_notification_channel(state, channel).await
-}
-
 pub(super) async fn test_notification_channel(
     state: &Arc<AppState>,
     channel: NotificationChannelConfig,
 ) -> Result<Value, String> {
-    let dispatcher =
-        NotificationDispatcher::with_client(state.webhook_http_client.clone(), channel);
+    // Renderer drafts never receive saved webhook URLs or bot tokens. Restore
+    // only the matching channel's redacted value for this one test request,
+    // using the same explicit-clear semantics as the save path.
+    let previous = state.config.read().await.webhook.clone();
+    let mut draft = crate::notifications::WebhookConfig {
+        channels: vec![channel],
+        ..crate::notifications::WebhookConfig::default()
+    };
+    draft.merge_redacted_secrets(&previous);
+    let channel = draft
+        .channels
+        .pop()
+        .expect("notification test draft must contain one channel");
+    let client = current_notification_http_client(state)?;
+    let dispatcher = NotificationDispatcher::with_client(client, channel);
     dispatcher.test().await.map_err(|error| error.to_string())
+}
+
+fn current_notification_http_client(_state: &AppState) -> Result<reqwest::Client, String> {
+    #[cfg(test)]
+    if let Some(client) = &_state.webhook_http_client_override {
+        return Ok(client.clone());
+    }
+
+    // reqwest snapshots the operating system proxy configuration when a client
+    // is built. Notifications are infrequent, so create one client per test or
+    // delivery batch instead of retaining stale proxy settings for the entire
+    // Codey process lifetime.
+    crate::notifications::notification_http_client().map_err(|error| error.to_string())
 }
 
 fn webhook_session_configuration(
@@ -759,6 +758,65 @@ fn webhook_session_configuration(
         requested_reasoning_effort.trim().to_string()
     };
     (model, reasoning_effort)
+}
+
+fn webhook_display_model(config: &CodeyConfig, requested_model: &str) -> String {
+    let requested_model = requested_model.trim();
+    if requested_model.is_empty() {
+        return "Codex".to_string();
+    }
+
+    let mut matching_raw_profile = None;
+    for profile in &config.profiles {
+        let provider_id = profile.provider_id().trim();
+        if provider_id.is_empty() {
+            continue;
+        }
+
+        let alias_prefix = local_router::model_alias(provider_id, "");
+        if let Some(model) = requested_model
+            .strip_prefix(&alias_prefix)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            return format_webhook_model_name(profile, model);
+        }
+
+        let enabled_models = if profile.official_account {
+            config.enabled_official_route_models(provider_id)
+        } else {
+            config.enabled_route_models(provider_id)
+        };
+        if enabled_models
+            .iter()
+            .any(|model| model_id::equal(model, requested_model))
+        {
+            if matching_raw_profile.is_some() {
+                // A raw model shared by multiple routes has no reliable route
+                // identity, so retain it instead of showing a misleading prefix.
+                matching_raw_profile = None;
+                break;
+            }
+            matching_raw_profile = Some(profile);
+        }
+    }
+
+    matching_raw_profile
+        .map(|profile| format_webhook_model_name(profile, requested_model))
+        .unwrap_or_else(|| requested_model.to_string())
+}
+
+fn format_webhook_model_name(profile: &crate::config::ProviderProfile, model: &str) -> String {
+    let prefix = if profile.official_account {
+        OFFICIAL_ROUTE_SHORT_NAME
+    } else {
+        profile.short_name.trim()
+    };
+    if prefix.is_empty() {
+        model.to_string()
+    } else {
+        format!("[{prefix}] {model}")
+    }
 }
 
 fn webhook_turn_configuration(
@@ -792,7 +850,9 @@ async fn webhook_session_name(state: &Arc<AppState>, payload: &Value, session_id
     let fallback_title = cached_title.clone();
     let home = codex_home();
     let session_id = session_id.to_string();
-    match super::resolve_session_name_cached(state, home, session_id, cached_title).await {
+    match super::resolve_session_name_cached(state, home.to_path_buf(), session_id, cached_title)
+        .await
+    {
         Ok(session_name) => session_name,
         Err(error) => {
             eprintln!("读取通知会话名称任务异常退出：{error}");
@@ -823,12 +883,12 @@ async fn terminal_notification_was_sent(
 #[derive(Debug)]
 struct WebhookDispatchError {
     detail: String,
-    uncertain: bool,
+    settle_delivery: bool,
 }
 
 impl WebhookDispatchError {
-    fn is_uncertain(&self) -> bool {
-        self.uncertain
+    fn should_settle_delivery(&self) -> bool {
+        self.settle_delivery
     }
 }
 
@@ -856,17 +916,28 @@ async fn dispatch_webhook_channels(
         let notifications = state.webhook_notifications.lock().await;
         deliveries.retain(|(_, delivery_key)| !notifications.was_settled(delivery_key));
     }
+    if deliveries.is_empty() {
+        return Ok(());
+    }
+    let client =
+        current_notification_http_client(state).map_err(|detail| WebhookDispatchError {
+            detail: format!("创建通知网络客户端失败：{detail}"),
+            settle_delivery: false,
+        })?;
     let deliveries = deliveries.into_iter().map(|(channel, delivery_key)| {
-        let client = state.webhook_http_client.clone();
+        let client = client.clone();
         let event = event.clone();
+        let state = Arc::clone(state);
         async move {
-            let dispatcher = NotificationDispatcher::with_client(client, channel);
-            (delivery_key, dispatcher.send(&event).await)
+            (
+                delivery_key,
+                dispatch_webhook_channel(&state, client, channel, &event).await,
+            )
         }
     });
     let results = collect_webhook_deliveries(deliveries).await;
     let mut errors = Vec::new();
-    let mut uncertain = false;
+    let mut settle_delivery = false;
     let mut notifications = state.webhook_notifications.lock().await;
     for (delivery_key, result) in results {
         match result {
@@ -874,8 +945,8 @@ async fn dispatch_webhook_channels(
                 notifications.remember_settled(delivery_key);
             }
             Err(error) => {
-                if error.is_uncertain() {
-                    uncertain = true;
+                if error.should_settle_delivery() {
+                    settle_delivery = true;
                     notifications.remember_settled(delivery_key);
                 }
                 errors.push(error.to_string());
@@ -888,9 +959,120 @@ async fn dispatch_webhook_channels(
     } else {
         Err(WebhookDispatchError {
             detail: format!("部分通知渠道发送失败：{}", errors.join("；")),
-            uncertain,
+            settle_delivery,
         })
     }
+}
+
+async fn dispatch_webhook_channel(
+    state: &Arc<AppState>,
+    client: reqwest::Client,
+    channel: NotificationChannelConfig,
+    event: &NotificationEvent,
+) -> Result<(), WebhookDispatchError> {
+    let channel = latest_channel_for_delivery(state, &channel).await;
+    if channel.kind == NotificationChannelKind::WechatClaw
+        && let Some(remaining) =
+            super::wechat_claw_notification_cooldown_remaining(state, &channel).await
+    {
+        return Err(WebhookDispatchError {
+            detail: wechat_claw_cooldown_message(remaining),
+            settle_delivery: false,
+        });
+    }
+    let dispatcher = NotificationDispatcher::with_client(client.clone(), channel.clone());
+    match dispatcher.send(event).await {
+        Ok(()) => Ok(()),
+        Err(error)
+            if channel.kind == NotificationChannelKind::WechatClaw
+                && error.indicates_stale_token() =>
+        {
+            let remaining = super::pause_wechat_claw_notification_channel(state, &channel)
+                .await
+                .unwrap_or_else(|| Duration::from_secs(60 * 60));
+            Err(WebhookDispatchError {
+                detail: format!("{error}（{}）", wechat_claw_cooldown_message(remaining)),
+                settle_delivery: false,
+            })
+        }
+        Err(error)
+            if channel.kind == NotificationChannelKind::WechatClaw
+                && error.should_retry_with_fresh_context() =>
+        {
+            let mut fresh_channel = latest_channel_for_delivery(state, &channel).await;
+            if !fresh_channel.enabled || !fresh_channel.is_configured() {
+                return Ok(());
+            }
+            if fresh_channel.context_token.trim() == channel.context_token.trim() {
+                let refresh_result =
+                    super::refresh_wechat_claw_channel_context(state, &channel).await;
+                fresh_channel = latest_channel_for_delivery(state, &channel).await;
+                if !fresh_channel.enabled || !fresh_channel.is_configured() {
+                    if let Err(refresh_error) = refresh_result {
+                        return Err(WebhookDispatchError {
+                            detail: format!("{error}（ClawBot 同步刷新失败：{refresh_error}）"),
+                            settle_delivery: false,
+                        });
+                    }
+                    return Ok(());
+                }
+                if let Err(refresh_error) = refresh_result {
+                    return Err(WebhookDispatchError {
+                        detail: format!("{error}（ClawBot 同步重建失败：{refresh_error}）"),
+                        settle_delivery: false,
+                    });
+                }
+            }
+            let dispatcher = NotificationDispatcher::with_client(client, fresh_channel);
+            match dispatcher.send(event).await {
+                Ok(()) => Ok(()),
+                Err(error) => Err(WebhookDispatchError {
+                    detail: error.to_string(),
+                    settle_delivery: error.should_settle_delivery(),
+                }),
+            }
+        }
+        Err(error) => Err(WebhookDispatchError {
+            detail: error.to_string(),
+            settle_delivery: error.should_settle_delivery(),
+        }),
+    }
+}
+
+fn wechat_claw_cooldown_message(remaining: Duration) -> String {
+    let minutes = (remaining.as_secs().saturating_add(59) / 60).max(1);
+    format!("微信 ClawBot 凭据暂时不可用，约 {minutes} 分钟后自动重试")
+}
+
+async fn latest_channel_for_delivery(
+    state: &Arc<AppState>,
+    channel: &NotificationChannelConfig,
+) -> NotificationChannelConfig {
+    if channel.kind != NotificationChannelKind::WechatClaw {
+        return channel.clone();
+    }
+    let mut delivery = channel.clone();
+    let config = state.config.read().await;
+    let Some(saved) =
+        config.webhook.channels.iter().find(|saved| {
+            saved.id == channel.id && saved.kind == NotificationChannelKind::WechatClaw
+        })
+    else {
+        delivery.enabled = false;
+        return delivery;
+    };
+    let same_binding = saved.enabled
+        && saved.bot_token.trim() == channel.bot_token.trim()
+        && saved.chat_id.trim() == channel.chat_id.trim()
+        && saved.wechat_claw_base_url().ok() == channel.wechat_claw_base_url().ok();
+    if !same_binding {
+        delivery.enabled = false;
+        return delivery;
+    }
+    delivery.context_token = saved.context_token.clone();
+    delivery.context_token_configured = saved.context_token_configured;
+    delivery.get_updates_buf = saved.get_updates_buf.clone();
+    delivery
 }
 
 async fn collect_webhook_deliveries<F, T>(deliveries: impl IntoIterator<Item = F>) -> Vec<T>
@@ -950,7 +1132,7 @@ async fn dispatch_settled_webhook_failure(
     .with_reasoning_effort(reasoning_effort);
     if let Err(error) = dispatch_webhook_channels(state, channels, &event, &failed_key).await {
         let mut notifications = state.webhook_notifications.lock().await;
-        if error.is_uncertain() {
+        if error.should_settle_delivery() {
             notifications.settle(failed_key);
         } else {
             notifications.abandon(&failed_key);
@@ -1004,22 +1186,6 @@ async fn notify_webhook_completion(
     if terminal_notification_was_sent(state, &session_id, &turn_id).await {
         return Ok(json!({"status":"duplicate"}));
     }
-    let (channels, profile_id) = {
-        let config = state.config.read().await;
-        (
-            config.webhook.channels.clone(),
-            config
-                .active_profile()
-                .map(|profile| profile.id)
-                .unwrap_or_default(),
-        )
-    };
-    if !channels
-        .iter()
-        .any(|channel| channel.enabled && channel.is_configured())
-    {
-        return Ok(json!({"status":"skipped","reason":"disabled"}));
-    }
     let requested_model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -1031,6 +1197,23 @@ async fn notify_webhook_completion(
         .unwrap_or_default();
     let (model, reasoning_effort) =
         webhook_session_configuration(requested_model, requested_reasoning_effort);
+    let (channels, profile_id, model) = {
+        let config = state.config.read().await;
+        (
+            config.webhook.channels.clone(),
+            config
+                .active_profile()
+                .map(|profile| profile.id)
+                .unwrap_or_default(),
+            webhook_display_model(&config, &model),
+        )
+    };
+    if !channels
+        .iter()
+        .any(|channel| channel.enabled && channel.is_configured())
+    {
+        return Ok(json!({"status":"skipped","reason":"disabled"}));
+    }
     if let Some(error) = rollout_error {
         return dispatch_settled_webhook_failure(
             state,
@@ -1068,7 +1251,7 @@ async fn notify_webhook_completion(
     if let Err(error) = dispatch_webhook_channels(state, channels, &event, &notification_key).await
     {
         let mut notifications = state.webhook_notifications.lock().await;
-        if error.is_uncertain() {
+        if error.should_settle_delivery() {
             notifications.settle(notification_key);
         } else {
             notifications.abandon(&notification_key);
@@ -1119,7 +1302,7 @@ async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Resul
         .unwrap_or_default();
     let (model, reasoning_effort) =
         webhook_session_configuration(requested_model, requested_reasoning_effort);
-    let (channels, profile_id) = {
+    let (channels, profile_id, model) = {
         let config = state.config.read().await;
         (
             config.webhook.channels.clone(),
@@ -1127,6 +1310,7 @@ async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Resul
                 .active_profile()
                 .map(|profile| profile.id)
                 .unwrap_or_default(),
+            webhook_display_model(&config, &model),
         )
     };
     if !channels
@@ -1178,7 +1362,7 @@ async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Resul
     .with_reasoning_effort(reasoning_effort);
     if let Err(error) = dispatch_webhook_channels(state, channels, &event, &notification_key).await
     {
-        if error.is_uncertain() {
+        if error.should_settle_delivery() {
             state
                 .webhook_notifications
                 .lock()
@@ -1217,8 +1401,55 @@ mod tests {
     use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 
     use super::*;
-    use crate::notifications::NotificationChannelKind;
+    use crate::config::ConfigStore;
     use crate::pending_approval::{AbortedTurn, PendingApproval, StartedTurn};
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut body_start = None;
+        let mut content_length = 0_usize;
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if body_start.is_none()
+                && let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                body_start = Some(index + 4);
+                let headers = String::from_utf8_lossy(&request[..index]);
+                content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+            }
+            if let Some(body_start) = body_start
+                && request.len() >= body_start + content_length
+            {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    async fn write_json_response(socket: &mut tokio::net::TcpStream, body: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
 
     fn lifecycle(started: &[(&str, &str)], completed: &[(&str, &str)]) -> RecentSessionEvents {
         RecentSessionEvents {
@@ -1287,6 +1518,291 @@ mod tests {
         assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
+    #[tokio::test]
+    async fn clawbot_delivery_uses_the_latest_saved_context_token() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            write_json_response(&mut socket, r#"{"ret":0}"#).await;
+            request
+        });
+        let fresh_channel = NotificationChannelConfig {
+            id: "fresh-claw".to_string(),
+            kind: NotificationChannelKind::WechatClaw,
+            enabled: true,
+            url: format!("http://{address}"),
+            bot_token: "bot-token".to_string(),
+            context_token: "fresh-context".to_string(),
+            chat_id: "recipient@im.wechat".to_string(),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        };
+        let mut stale_channel = fresh_channel.clone();
+        stale_channel.context_token = "stale-context".to_string();
+        let state = Arc::new(AppState {
+            config: RwLock::new(CodeyConfig {
+                webhook: crate::notifications::WebhookConfig {
+                    channels: vec![fresh_channel],
+                    ..crate::notifications::WebhookConfig::default()
+                },
+                ..CodeyConfig::default()
+            }),
+            ..AppState::default()
+        });
+        let event = NotificationEvent::new(
+            "session.completed",
+            "session-claw",
+            "profile-claw",
+            "Codex",
+            0,
+            None,
+        );
+
+        dispatch_webhook_channels(
+            &state,
+            vec![stale_channel],
+            &event,
+            "completed:session:turn",
+        )
+        .await
+        .unwrap();
+
+        let request = server.await.unwrap();
+        assert!(request.contains("POST /ilink/bot/sendmessage "));
+        assert!(request.contains(r#""context_token":"fresh-context""#));
+        assert!(!request.contains("stale-context"));
+    }
+
+    #[tokio::test]
+    async fn clawbot_stale_delivery_enters_cooldown_and_blocks_followup_requests() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            write_json_response(&mut socket, r#"{"errcode":-14,"errmsg":"token expired"}"#).await;
+            let followup =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+            (request, followup.is_err())
+        });
+        let channel = NotificationChannelConfig {
+            id: "stale-claw".to_string(),
+            kind: NotificationChannelKind::WechatClaw,
+            enabled: true,
+            url: format!("http://{address}"),
+            bot_token: "bot-token".to_string(),
+            context_token: "context-token".to_string(),
+            chat_id: "recipient@im.wechat".to_string(),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        };
+        let state = Arc::new(AppState {
+            config: RwLock::new(CodeyConfig {
+                webhook: crate::notifications::WebhookConfig {
+                    channels: vec![channel.clone()],
+                    ..crate::notifications::WebhookConfig::default()
+                },
+                ..CodeyConfig::default()
+            }),
+            ..AppState::default()
+        });
+        let event = NotificationEvent::new(
+            "session.completed",
+            "session-claw",
+            "profile-claw",
+            "Codex",
+            0,
+            None,
+        );
+
+        let first = dispatch_webhook_channels(
+            &state,
+            vec![channel.clone()],
+            &event,
+            "completed:session:turn",
+        )
+        .await
+        .unwrap_err();
+        let second = dispatch_webhook_channels(
+            &state,
+            vec![channel.clone()],
+            &event,
+            "completed:session:turn",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(first.to_string().contains("自动重试"));
+        assert!(second.to_string().contains("自动重试"));
+        assert!(
+            crate::commands::wechat_claw_notification_cooldown_remaining(&state, &channel)
+                .await
+                .is_some()
+        );
+        let saved = state.config.read().await.webhook.channels[0].clone();
+        assert_eq!(saved.bot_token, "bot-token");
+        assert_eq!(saved.context_token, "context-token");
+        let (request, no_followup_request) = server.await.unwrap();
+        assert!(request.starts_with("POST /ilink/bot/sendmessage "));
+        assert!(no_followup_request);
+    }
+
+    #[tokio::test]
+    async fn clawbot_prepare_failure_retries_only_after_context_refresh() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let channel = NotificationChannelConfig {
+            id: "refresh-claw".to_string(),
+            kind: NotificationChannelKind::WechatClaw,
+            enabled: true,
+            url: format!("http://{address}"),
+            bot_token: "bot-token".to_string(),
+            context_token: "stale-context".to_string(),
+            chat_id: "recipient@im.wechat".to_string(),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        };
+        let state = Arc::new(AppState {
+            config: RwLock::new(CodeyConfig {
+                webhook: crate::notifications::WebhookConfig {
+                    channels: vec![channel.clone()],
+                    ..crate::notifications::WebhookConfig::default()
+                },
+                ..CodeyConfig::default()
+            }),
+            ..AppState::default()
+        });
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut first_socket).await);
+            {
+                let mut config = server_state.config.write().await;
+                config.webhook.channels[0].context_token = "fresh-context".to_string();
+                config.webhook.channels[0].context_token_configured = true;
+            }
+            write_json_response(&mut first_socket, r#"{"ret":-2,"errmsg":"prepare failed"}"#).await;
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut second_socket).await);
+            write_json_response(&mut second_socket, r#"{"ret":0}"#).await;
+            requests
+        });
+        let event = NotificationEvent::new(
+            "session.completed",
+            "session-claw",
+            "profile-claw",
+            "Codex",
+            0,
+            None,
+        );
+
+        dispatch_webhook_channels(&state, vec![channel], &event, "completed:session:turn")
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("POST /ilink/bot/sendmessage "));
+        assert!(requests[0].contains(r#""context_token":"stale-context""#));
+        assert!(requests[1].starts_with("POST /ilink/bot/sendmessage "));
+        assert!(requests[1].contains(r#""context_token":"fresh-context""#));
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("notifystart"))
+        );
+    }
+
+    #[tokio::test]
+    async fn clawbot_prepare_failure_reprepares_session_before_retrying_delivery() {
+        use tokio::net::TcpListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let channel = NotificationChannelConfig {
+            id: "self-heal-claw".to_string(),
+            kind: NotificationChannelKind::WechatClaw,
+            enabled: true,
+            url: format!("http://{address}"),
+            bot_token: "bot-token".to_string(),
+            context_token: "stale-context".to_string(),
+            chat_id: "recipient@im.wechat".to_string(),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        };
+        let state = Arc::new(AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
+            config: RwLock::new(CodeyConfig {
+                webhook: crate::notifications::WebhookConfig {
+                    channels: vec![channel.clone()],
+                    ..crate::notifications::WebhookConfig::default()
+                },
+                ..CodeyConfig::default()
+            }),
+            shutting_down: std::sync::atomic::AtomicBool::new(true),
+            ..AppState::default()
+        });
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let responses = [
+                r#"{"ret":-2,"errmsg":"prepare failed"}"#.to_string(),
+                r#"{"ret":0}"#.to_string(),
+                json!({
+                    "ret": 0,
+                    "get_updates_buf": "fresh-cursor",
+                    "msgs": [{
+                        "from_user_id": "recipient@im.wechat",
+                        "context_token": "stale-context",
+                    }]
+                })
+                .to_string(),
+                r#"{"ret":0}"#.to_string(),
+            ];
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_http_request(&mut socket).await);
+                write_json_response(&mut socket, &response).await;
+            }
+            requests
+        });
+        let event = NotificationEvent::new(
+            "session.completed",
+            "session-claw",
+            "profile-claw",
+            "Codex",
+            0,
+            None,
+        );
+
+        dispatch_webhook_channels(&state, vec![channel], &event, "completed:session:turn")
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("POST /ilink/bot/sendmessage "));
+        assert!(requests[0].contains(r#""context_token":"stale-context""#));
+        assert!(requests[1].starts_with("POST /ilink/bot/msg/notifystart "));
+        assert!(requests[2].starts_with("POST /ilink/bot/getupdates "));
+        assert!(requests[3].starts_with("POST /ilink/bot/sendmessage "));
+        assert!(requests[3].contains(r#""context_token":"stale-context""#));
+        let memory = state.config.read().await.clone();
+        let disk = state.store.load().unwrap();
+        assert_eq!(memory.webhook.channels[0].context_token, "stale-context");
+        assert_eq!(disk.webhook.channels[0].get_updates_buf, "fresh-cursor");
+    }
+
     #[test]
     fn webhook_notifications_use_the_matching_turn_configuration() {
         let events = RecentSessionEvents {
@@ -1311,6 +1827,57 @@ mod tests {
             webhook_turn_configuration(&events, "session-1", "missing"),
             ("Codex".to_string(), "默认".to_string())
         );
+    }
+
+    #[test]
+    fn webhook_models_use_the_same_route_prefix_as_the_model_picker() {
+        let mut official = crate::config::ProviderProfile::new("官方线路");
+        official.id = "official".into();
+        official.official_account = true;
+        official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+
+        let mut relay = crate::config::ProviderProfile::new("中转线路");
+        relay.id = "relay".into();
+        relay.short_name = "中转".into();
+        relay.base_url = "https://relay.example/v1".into();
+        relay.api_key = "relay-key".into();
+        relay.normalize();
+
+        let mut config = CodeyConfig {
+            profiles: vec![official, relay],
+            active_profile_id: "relay".into(),
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        };
+        config
+            .selected_models_by_provider
+            .insert("relay".into(), vec!["claude-opus-4-8".into()]);
+        config = config.normalize();
+
+        assert_eq!(
+            webhook_display_model(
+                &config,
+                &local_router::model_alias("relay", "claude-opus-4-8"),
+            ),
+            "[中转] claude-opus-4-8"
+        );
+        assert_eq!(
+            webhook_display_model(
+                &config,
+                &local_router::model_alias("official", "gpt-5.6-sol"),
+            ),
+            "[官] gpt-5.6-sol"
+        );
+        assert_eq!(
+            webhook_display_model(&config, "claude-opus-4-8"),
+            "[中转] claude-opus-4-8"
+        );
+        assert_eq!(
+            webhook_display_model(&config, "unknown-model"),
+            "unknown-model"
+        );
+        assert_eq!(webhook_display_model(&config, ""), "Codex");
     }
 
     #[test]
@@ -1601,11 +2168,13 @@ mod tests {
         let state = Arc::new(AppState {
             store: ConfigStore::new(directory.path().join("config.json")),
             config: RwLock::new(config),
-            webhook_http_client: reqwest::Client::builder()
-                .timeout(Duration::from_millis(50))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap(),
+            webhook_http_client_override: Some(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_millis(50))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap(),
+            ),
             webhook_notifications: Mutex::new(WebhookNotificationState::default()),
             persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
             ..AppState::default()
@@ -1880,6 +2449,7 @@ mod tests {
             aborted_turns: Arc::new(vec![AbortedTurn {
                 session_id: "session-1".to_string(),
                 turn_id: "turn-1".to_string(),
+                is_snapshot_replay: false,
             }]),
             ..RecentSessionEvents::default()
         };

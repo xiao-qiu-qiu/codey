@@ -4,23 +4,24 @@ import {
   IconKey,
 } from "@tabler/icons-react";
 
-import { Button, Input } from "../components/semi";
+import { Button, Input } from "../components/mantine";
+import { inputShellClass, insetInputClass } from "../uiClasses";
 import type { NotificationChannelEditorProps } from "./types";
 
 function TelegramChannelEditorComponent({
   channel,
   disabled,
-  revealSecrets = false,
   onChange,
 }: NotificationChannelEditorProps) {
   return (
     <>
       <label className="field">
         <span>Bot Token</span>
-        <div className="input-shell">
+        <div className={inputShellClass}>
           <IconKey size={15} aria-hidden="true" />
           <Input
-            type={revealSecrets ? "text" : "password"}
+            className={insetInputClass}
+            type="password"
             value={channel.botToken}
             disabled={disabled}
             onChange={(event) =>
@@ -40,8 +41,9 @@ function TelegramChannelEditorComponent({
         </div>
       </label>
       {channel.botTokenConfigured ? (
-        <div className="notification-secret-action">
+        <div className="-mt-[7px] flex justify-end">
           <Button
+            className="text-[#8e8e93] hover:text-[#d70015]"
             variant="ghost"
             size="xs"
             disabled={disabled}
@@ -59,9 +61,10 @@ function TelegramChannelEditorComponent({
       ) : null}
       <label className="field">
         <span>Chat ID</span>
-        <div className="input-shell">
+        <div className={inputShellClass}>
           <IconBrandTelegram size={15} aria-hidden="true" />
           <Input
+            className={insetInputClass}
             value={channel.chatId}
             disabled={disabled}
             onChange={(event) => onChange({ chatId: event.target.value })}

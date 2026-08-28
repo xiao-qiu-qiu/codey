@@ -1,49 +1,284 @@
 use super::*;
+use std::collections::HashMap;
 
 #[test]
-fn chat_provider_builds_an_explicit_protocol_proxy_snapshot() {
-    let mut config = CodeyConfig::default();
-    let mut profile = crate::config::ProviderProfile::new("DeepSeek");
-    profile.base_url = "https://relay.example/v1".to_string();
-    profile.api_key = "sk-test".to_string();
-    profile.protocol = RelayProtocol::ChatCompletions;
-    config.active_profile_id = profile.id.clone();
-    config.profiles = vec![profile.clone()];
-    config
-        .default_model_by_provider
-        .insert(profile.id.clone(), "deepseek-reasoner".to_string());
+fn packaged_activation_detects_a_reused_process_id() {
+    let existing_process_ids = HashSet::from([41_u32, 42_u32]);
 
-    let settings = protocol_proxy_settings(&profile, config.default_model(), &[]).unwrap();
-    let relay = settings.active_relay_profile();
-    assert_eq!(settings.active_relay_id, profile.id);
-    assert_eq!(relay.base_url, "https://relay.example/v1");
-    assert_eq!(relay.api_key, "sk-test");
-    assert_eq!(relay.model, "deepseek-reasoner");
-    assert_eq!(relay.protocol, RelayProtocol::ChatCompletions);
-    assert_eq!(relay.relay_mode, RelayMode::PureApi);
+    assert!(activation_reused_existing_process(
+        &existing_process_ids,
+        42
+    ));
+    assert!(!activation_reused_existing_process(
+        &existing_process_ids,
+        43
+    ));
 }
 
 #[test]
-fn responses_provider_starts_a_per_model_proxy_only_for_third_party_models() {
-    let mut config = CodeyConfig::default();
-    let mut profile = crate::config::ProviderProfile::new("Responses");
-    profile.base_url = "https://relay.example/v1".to_string();
-    config.active_profile_id = profile.id.clone();
-    config.profiles = vec![profile.clone()];
+fn process_creation_identity_rejects_pid_reuse_when_timestamps_are_available() {
+    assert!(process_creation_identity_matches(Some(100), Some(100)));
+    assert!(!process_creation_identity_matches(Some(100), Some(101)));
+    assert!(process_creation_identity_matches(Some(100), None));
+    assert!(process_creation_identity_matches(None, Some(101)));
+}
 
-    assert!(protocol_proxy_settings(&profile, config.default_model(), &[]).is_none());
-    // 即使目录里有第三方模型，无第三方模型的 Responses 线路保持直连。
-    let third_party = vec!["kimi-k2.6".to_string()];
-    assert!(
-        protocol_proxy_settings(&profile, config.default_model(), &third_party).is_some(),
-        "Responses 线路存在第三方模型时应启动按模型选路的本地代理"
+#[test]
+fn windows_stop_survivors_match_targets_by_creation_identity() {
+    let mut expected = HashMap::new();
+    expected.insert(10, Some(100));
+    expected.insert(11, Some(101));
+    expected.insert(12, None);
+    let targets = HashSet::from([10, 11, 12, 13]);
+    let current = vec![
+        (10, "ChatGPT.exe".to_string(), Some(100)),
+        // A recycled pid no longer matches the process we tried to stop.
+        (11, "ChatGPT.exe".to_string(), Some(999)),
+        // The snapshot had no identity. Even if a timestamp is now available,
+        // keep waiting without passing that new identity to retry termination.
+        (12, "codex.exe".to_string(), Some(777)),
+        // Processes outside the pre-termination snapshot are never ours.
+        (13, "unrelated.exe".to_string(), None),
+    ];
+
+    let survivors = windows_stop_survivors(&expected, &current, &targets);
+    assert_eq!(
+        survivors,
+        vec![
+            (10, "ChatGPT.exe".to_string(), Some(100)),
+            (12, "codex.exe".to_string(), None),
+        ]
     );
-    let settings = protocol_proxy_settings(&profile, config.default_model(), &third_party).unwrap();
-    let relay = settings.active_relay_profile();
-    assert_eq!(relay.protocol, RelayProtocol::Responses);
-    assert_eq!(relay.chat_completions_models, vec!["kimi-k2.6".to_string()]);
-    assert_eq!(relay.base_url, "https://relay.example/v1");
-    assert_eq!(relay.relay_mode, RelayMode::PureApi);
+}
+
+#[test]
+fn windows_stop_failure_summary_lists_surviving_executables() {
+    let remaining = vec![
+        (10, "ChatGPT.exe".to_string(), Some(100)),
+        (11, "codex.exe".to_string(), Some(101)),
+    ];
+    assert_eq!(
+        windows_stop_failure_summary(&remaining),
+        "2 个进程仍在运行：ChatGPT.exe(10)、codex.exe(11)",
+    );
+
+    let many = (0..7)
+        .map(|index| (100 + index, "helper.exe".to_string(), None))
+        .collect::<Vec<_>>();
+    let summary = windows_stop_failure_summary(&many);
+    assert!(summary.starts_with("7 个进程仍在运行："));
+    assert!(summary.ends_with("等共 7 个"));
+}
+
+#[test]
+fn official_provider_inherits_the_codex_builtin_model_catalog() {
+    assert!(!should_install_codey_model_catalog(true, true));
+    assert!(!should_install_codey_model_catalog(true, false));
+}
+
+#[test]
+fn third_party_provider_installs_the_codey_model_catalog_when_available() {
+    assert!(should_install_codey_model_catalog(false, true));
+    assert!(!should_install_codey_model_catalog(false, false));
+}
+
+#[test]
+fn generated_catalog_uses_the_route_aware_default_selector() {
+    let config = CodeyConfig {
+        default_model: "route-a/shared-model".into(),
+        ..CodeyConfig::default()
+    };
+    let state = model_catalog::ModelSelectionState {
+        default_model: "shared-model".into(),
+        ..model_catalog::ModelSelectionState::default()
+    };
+
+    assert_eq!(
+        runtime_default_model(&config, true, &state).as_deref(),
+        Some("route-a/shared-model")
+    );
+    assert_eq!(
+        runtime_default_model(&config, false, &state).as_deref(),
+        Some("shared-model")
+    );
+}
+
+#[test]
+fn subagent_runtime_models_use_route_aware_aliases() {
+    let route_aliases = vec!["route-b/shared-model".to_string()];
+    assert_eq!(
+        route_subagent_model("route-a", "shared-model", &route_aliases),
+        "route-a/shared-model"
+    );
+    assert_eq!(
+        route_subagent_model("route-a", "gpt-5.6-sol", &route_aliases),
+        "route-a/gpt-5.6-sol"
+    );
+    assert_eq!(
+        route_subagent_model("route-a", "route-b/shared-model", &route_aliases),
+        "route-b/shared-model"
+    );
+}
+
+#[test]
+fn persistent_session_provider_never_targets_the_launch_only_router_id() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        format!("model_provider = \"{ROUTER_PROVIDER_ID}\"\n"),
+    )
+    .unwrap();
+
+    assert_eq!(persistent_session_provider(temp.path()).unwrap(), "openai");
+}
+
+#[test]
+fn persistent_session_provider_rejects_a_user_owned_router_before_sync() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        format!(
+            "[model_providers.{ROUTER_PROVIDER_ID}]\n\
+             name = \"User Router\"\n\
+             base_url = \"https://example.com/v1\"\n"
+        ),
+    )
+    .unwrap();
+
+    let error = persistent_session_provider(temp.path()).unwrap_err();
+    assert!(error.to_string().contains("已占用 Codey 内部 Provider ID"));
+}
+
+#[test]
+fn persistent_session_provider_allows_a_codey_owned_resume_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        format!(
+            "model_provider = \"codey_global\"\n\
+             \n\
+             [model_providers.codey_global]\n\
+             name = \"OpenAI\"\n\
+             base_url = \"https://chatgpt.com/backend-api/codex\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n\
+             \n\
+             [model_providers.{ROUTER_PROVIDER_ID}]\n\
+             name = \"Codey Local Router\"\n\
+             base_url = \"https://chatgpt.com/backend-api/codex\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n\
+             supports_websockets = false\n"
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        persistent_session_provider(temp.path()).unwrap(),
+        "codey_global"
+    );
+}
+
+#[test]
+fn persistent_session_provider_reads_legacy_codey_global_after_resume_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "model_provider = \"codey_global\"\n\
+         \n\
+         [model_providers]\n\
+         \n\
+         [model_providers.codey_global]\n\
+         name = \"OpenAI\"\n\
+         base_url = \"https://chatgpt.com/backend-api/codex\"\n\
+         wire_api = \"responses\"\n\
+         requires_openai_auth = true\n",
+    )
+    .unwrap();
+
+    assert!(crate::codex_config::prepare_persistent_router_resume_shim_at(temp.path()).unwrap());
+    assert_eq!(
+        persistent_session_provider(temp.path()).unwrap(),
+        "codey_global"
+    );
+}
+
+#[test]
+fn session_maintenance_repairs_router_stamped_threads_for_third_party_launches() {
+    // Third-party users may never set `model_provider` in config.toml, and a
+    // Codex started outside Codey cannot resolve the launch-only router id
+    // that Codey stamped into their thread records.
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "model = \"gpt-5.6-terra\"\n",
+    )
+    .unwrap();
+    let sessions = temp.path().join("sessions/2026/08/27");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let rollout = sessions.join("rollout-thread-1.jsonl");
+    std::fs::write(
+        &rollout,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "thread-1",
+                    "model_provider": ROUTER_PROVIDER_ID
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let provider = persistent_session_provider(temp.path()).unwrap();
+    assert_eq!(provider, "openai");
+    let result =
+        codey_runtime_data::run_provider_sync_with_target(Some(temp.path()), Some(&provider));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.target_provider, "openai");
+    let repaired = std::fs::read_to_string(&rollout).unwrap();
+    assert!(repaired.contains("\"model_provider\":\"openai\""));
+    assert!(!repaired.contains(ROUTER_PROVIDER_ID));
+}
+
+#[test]
+fn session_maintenance_repairs_a_runtime_only_provider_to_the_persistent_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "model_provider = \"openai\"\n",
+    )
+    .unwrap();
+    let sessions = temp.path().join("sessions/2026/08/24");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let rollout = sessions.join("rollout-thread-1.jsonl");
+    std::fs::write(
+        &rollout,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "thread-1",
+                    "model_provider": "route-runtime-only"
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let provider = persistent_session_provider(temp.path()).unwrap();
+    let result =
+        codey_runtime_data::run_provider_sync_with_target(Some(temp.path()), Some(&provider));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.target_provider, "openai");
+    let repaired = std::fs::read_to_string(rollout).unwrap();
+    assert!(repaired.contains("\"model_provider\":\"openai\""));
+    assert!(!repaired.contains("route-runtime-only"));
 }
 
 #[cfg(target_os = "macos")]
@@ -187,10 +422,58 @@ async fn exit_watcher_returns_the_child_to_stop_on_shutdown() {
 fn cdp_watchdog_requires_consecutive_failures_before_reinjecting() {
     let mut failures = 0;
 
-    assert!(!watchdog_should_reinject(&mut failures, false));
+    assert!(!watchdog_should_reinject(
+        &mut failures,
+        InjectionHealth::Unhealthy
+    ));
     assert_eq!(failures, 1);
-    assert!(!watchdog_should_reinject(&mut failures, true));
+    assert!(!watchdog_should_reinject(
+        &mut failures,
+        InjectionHealth::Healthy
+    ));
     assert_eq!(failures, 0);
-    assert!(!watchdog_should_reinject(&mut failures, false));
-    assert!(watchdog_should_reinject(&mut failures, false));
+    assert!(!watchdog_should_reinject(
+        &mut failures,
+        InjectionHealth::Unhealthy
+    ));
+    assert!(watchdog_should_reinject(
+        &mut failures,
+        InjectionHealth::Unhealthy
+    ));
+}
+
+#[test]
+fn cdp_watchdog_does_not_reinject_after_renderer_timeouts() {
+    let mut failures = 0;
+
+    assert!(!watchdog_should_reinject(
+        &mut failures,
+        InjectionHealth::Inconclusive
+    ));
+    assert!(!watchdog_should_reinject(
+        &mut failures,
+        InjectionHealth::Inconclusive
+    ));
+    assert_eq!(failures, 0);
+
+    assert!(!watchdog_should_reinject(
+        &mut failures,
+        InjectionHealth::Unhealthy
+    ));
+    assert!(!watchdog_should_reinject(
+        &mut failures,
+        InjectionHealth::Inconclusive
+    ));
+    assert_eq!(failures, 0);
+}
+
+#[test]
+fn cdp_watchdog_immediately_rediscovers_an_unavailable_target() {
+    let mut failures = 1;
+
+    assert!(watchdog_should_reinject(
+        &mut failures,
+        InjectionHealth::TargetUnavailable
+    ));
+    assert_eq!(failures, 0);
 }

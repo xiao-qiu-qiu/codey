@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconCheck,
+  IconCircleArrowUp,
   IconDeviceFloppy as Save,
   IconGitBranch as GitBranch,
   IconLoader2 as LoaderCircle,
@@ -11,17 +12,19 @@ import {
 import { invoke } from "./api";
 import { TraceLogModule } from "./TraceLogModule";
 import { ModelPickerDialog } from "./AppDialogs";
+import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
+import { ModelSection } from "./ModelSection";
+import { OperationsPanel } from "./OperationsPanel";
+import { PromptOptimizationCard } from "./PromptOptimizationCard";
 import {
-  AppUpdateCard,
-  FeaturePolicyCard,
-  ModelSection,
-  OperationsPanel,
-  PromptOptimizationCard,
-} from "./AppSections";
-import { NotificationChannelsCard } from "./notifications";
+  getNotificationChannelDefinition,
+  NotificationChannelsCard,
+} from "./notifications";
 import type { NotificationChannel } from "./notifications";
 import { errorText, withTimeout } from "./appUtils";
 import { formatBytes } from "./formatters";
+import { modelIdsEqual, uniqueModelIds } from "./modelIds";
+import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
 import { useModelSelection } from "./useModelSelection";
 import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
@@ -39,40 +42,58 @@ import {
 import { useStableEvent } from "./useStableEvent";
 import type {
   AppProps,
-  CcSwitchStatus,
+  ProviderStatus,
   Config,
   CrashpadCleanup,
   FastContextToolsStatus,
   ModelState,
   PluginMarketplaceStatus,
+  Profile,
   TraceLogCleanup,
 } from "./App.types";
-import { Badge, Button, Button as SaveButton } from "./components/semi";
+import { Badge, Button, Tooltip } from "./components/mantine";
 
 const Check = IconCheck;
 const X = IconX;
-const FEEDBACK_GROUP_QR_URL =
+const FEEDBACK_GROUP_QR_BASE_URL =
   "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev/qr.png";
 const UNKNOWN_FAST_CONTEXT_TOOLS_STATUS: FastContextToolsStatus = {
   userConfigured: false,
   detectionFailed: true,
 };
 
-function configWithoutPromptOptimization(config: Config): Partial<Config> {
-  const comparable: Partial<Config> = { ...config };
-  delete comparable.settingsRevision;
-  delete comparable.promptOptimization;
-  return comparable;
+function localDateCacheKey(date: Date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("");
 }
 
-function hasUnsavedConfigOutsidePromptOptimization(
-  current: Config,
-  persisted: Config,
-) {
-  return (
-    JSON.stringify(configWithoutPromptOptimization(current)) !==
-    JSON.stringify(configWithoutPromptOptimization(persisted))
-  );
+function thirdPartyRouteModelState(
+  config: Config,
+  route: Profile,
+  catalog: ModelState,
+): ModelState {
+  const providerId = routeProviderId(route);
+  const selectedModels = uniqueModelIds([
+    ...(config.selectedModelsByProvider[providerId] || []),
+    ...(config.declaredOfficialModelsByProvider[providerId] || []),
+  ]);
+  return {
+    officialModels: [],
+    officialModelIds: catalog.officialModelIds,
+    thirdPartyModels: selectedModels,
+    thirdPartyModelMetadata: catalog.thirdPartyModelMetadata,
+    manualThirdPartyModels:
+      config.manualThirdPartyModelsByProvider[providerId] || [],
+    upstreamModels: uniqueModelIds([
+      ...(config.upstreamModelsByProvider[providerId] || []),
+      ...selectedModels,
+    ]),
+    defaultModel:
+      globalDefaultForRoute(config, route, selectedModels) || selectedModels[0] || "",
+  };
 }
 
 export function App({
@@ -82,15 +103,18 @@ export function App({
   onAfterClose,
   onClose,
 }: AppProps) {
+  const feedbackGroupQrUrl =
+    `${FEEDBACK_GROUP_QR_BASE_URL}?date=${localDateCacheKey(new Date())}`;
   const [config, setConfig] = useState<Config | null>(null);
   const persistedConfigRef = useRef<Config | null>(null);
-  const { status, setStatus, refreshStatusForLoad } = useRuntimeStatus({
-    active: !embedded || modalVisible,
-    embedded,
-  });
+  const { status, setStatus, refreshStatus, refreshStatusForLoad } =
+    useRuntimeStatus({
+      active: !embedded || modalVisible,
+      embedded,
+    });
   const [pluginMarketplaceStatus, setPluginMarketplaceStatus] =
     useState<PluginMarketplaceStatus | null>(null);
-  const [ccSwitchStatus, setCcSwitchStatus] = useState<CcSwitchStatus | null>(
+  const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(
     null,
   );
   const [fastContextToolsStatus, setFastContextToolsStatus] =
@@ -102,13 +126,16 @@ export function App({
     null,
   );
   const popupContainer = modalContainer ?? null;
-  const [traceSnapshotStale, setTraceSnapshotStale] = useState(false);
+  const getTooltipContainer = useCallback(
+    () => popupContainer ?? portalContainer ?? document.body,
+    [popupContainer, portalContainer],
+  );
   const noticeController = useAppNoticeController();
   const confirmationController = useConfirmationController();
   const setNotice = noticeController.setNotice;
   const setConfirmation = confirmationController.setConfirmation;
 
-  const provider = ccSwitchStatus?.provider;
+  const provider = providerStatus?.provider;
   const isBusy = busy !== null;
   const configLoaded = config !== null;
   const setPersistedConfig = useCallback((next: Config) => {
@@ -142,10 +169,15 @@ export function App({
       clientPlatform: status.clientPlatform,
       restartRequired: status.restartRequired,
       restartInProgress: status.restartInProgress,
-      startupError: status.startupError,
       codexAppPath: status.codexAppPath,
       maintenance: status.maintenance,
       injectionScripts: status.injectionScripts,
+      fastContextToolsActive: status.fastContextToolsActive,
+      subagentOptimizationActive: status.subagentOptimizationActive,
+      notificationChannelsActive: status.notificationChannelsActive,
+      activeNotificationChannelCount: status.activeNotificationChannelCount,
+      traceLogWriteProtectionActive: status.traceLogWriteProtectionActive,
+      crashpadDiskProtectionActive: status.crashpadDiskProtectionActive,
     }),
     [
       status.running,
@@ -153,35 +185,41 @@ export function App({
       status.clientPlatform,
       status.restartRequired,
       status.restartInProgress,
-      status.startupError,
       status.codexAppPath,
       status.maintenance,
       status.injectionScripts,
+      status.fastContextToolsActive,
+      status.subagentOptimizationActive,
+      status.notificationChannelsActive,
+      status.activeNotificationChannelCount,
+      status.traceLogWriteProtectionActive,
+      status.crashpadDiskProtectionActive,
     ],
   );
   const {
     subagentModelOptions,
     modelState,
+    modelEditorState,
     setModelState,
     modelPickerVisible,
     setModelPickerVisible,
     customModelInput,
     modelInputError,
     modelSyncWarning,
+    draftAutoReviewSupported,
+    setDraftAutoReviewSupported,
     draftModelSet,
     draftManualThirdPartyModelKeys,
-    manualThirdPartyModelKeys,
     thirdPartyModelOptions,
-    fetchCurrentModels,
+    openModelPicker,
     toggleDraftModel,
     deleteDraftThirdPartyModel,
     updateCustomModelInput,
     addCustomModel,
     saveModelSelection,
-    deleteThirdPartyModel,
-    setDefaultModel,
   } = useModelSelection({
-    provider,
+    config,
+    officialAccountAvailable: status.officialAccountAvailable === true,
     runOperation,
     setPersistedConfig,
     setStatus,
@@ -216,15 +254,19 @@ export function App({
         config: Config;
         modelState?: ModelState;
         startupError?: string;
-        ccSwitch?: CcSwitchStatus;
+        officialAccountAvailable?: boolean;
+        providerStatus?: ProviderStatus;
         fastContextToolsStatus?: FastContextToolsStatus;
         defaultSubagentGuidance?: string;
       }>("load_codey_config");
       setPersistedConfig(result.config);
-      setDefaultSubagentGuidance(
-        result.defaultSubagentGuidance ?? result.config.subagentGuidance,
-      );
-      setCcSwitchStatus(result.ccSwitch ?? null);
+      setProviderStatus(result.providerStatus ?? null);
+      if (typeof result.officialAccountAvailable === "boolean") {
+        setStatus((current) => ({
+          ...current,
+          officialAccountAvailable: result.officialAccountAvailable,
+        }));
+      }
       setFastContextToolsStatus(
         result.fastContextToolsStatus ?? UNKNOWN_FAST_CONTEXT_TOOLS_STATUS,
       );
@@ -277,13 +319,16 @@ export function App({
   async function persist(next: Config) {
     const result = await invoke<{
       config: Config;
-      ccSwitch?: CcSwitchStatus;
+      providerStatus?: ProviderStatus;
       modelState?: ModelState;
       restartRequired?: boolean;
+      modelHotReloaded?: boolean;
+      modelHotReloadError?: string;
       subagentConfigHotReloaded?: boolean;
+      subagentConfigRepaired?: boolean;
+      subagentConfigHealth?: string;
+      subagentConfigRepairReasons?: string[];
       subagentConfigHotReloadError?: string;
-      subagentDefaultsHotReloaded?: boolean;
-      subagentDefaultsHotReloadError?: string;
       fastContextToolsStatus?: FastContextToolsStatus;
     }>("save_codey_config", { config: next });
     setPersistedConfig(result.config);
@@ -295,7 +340,7 @@ export function App({
         detail: { config: result.config },
       }),
     );
-    if (result.ccSwitch) setCcSwitchStatus(result.ccSwitch);
+    if (result.providerStatus) setProviderStatus(result.providerStatus);
     if (result.modelState) setModelState(result.modelState);
     if (typeof result.restartRequired === "boolean") {
       setStatus((current) => ({
@@ -304,6 +349,7 @@ export function App({
       }));
     }
     setDirty(false);
+    await refreshStatus().catch(() => undefined);
     return result;
   }
 
@@ -378,12 +424,12 @@ export function App({
     await runOperation("sync-provider", async () => {
       const result = await invoke<{
         config: Config;
-        ccSwitch: CcSwitchStatus;
+        providerStatus: ProviderStatus;
         modelState: ModelState;
         restartRequired?: boolean;
       }>("sync_current_provider");
       setPersistedConfig(result.config);
-      setCcSwitchStatus(result.ccSwitch);
+      setProviderStatus(result.providerStatus);
       setModelState(result.modelState);
       setStatus((current) => ({
         ...current,
@@ -392,66 +438,264 @@ export function App({
       setNotice({
         tone: result.restartRequired ? "info" : "success",
         text: result.restartRequired
-          ? `已读取「${result.ccSwitch.provider.name}」，重启 Codex 后应用线路`
-          : `已同步「${result.ccSwitch.provider.name}」`,
+          ? "已重新读取 Codex 配置，重启后应用当前线路"
+          : "已重新读取 Codex 配置",
       });
     });
   }
 
-  async function syncPromptOptimizationCurrentProvider() {
-    if (!config || isBusy) return false;
-    const currentConfig = config;
-    setBusy("sync-prompt-provider");
-    try {
-      const result = await invoke<{ config: Config }>(
-        "sync_prompt_optimization_current_provider",
-        { config: currentConfig.promptOptimization },
-      );
-      const hasOtherDraft = hasUnsavedConfigOutsidePromptOptimization(
-        currentConfig,
-        result.config,
-      );
-      persistedConfigRef.current = result.config;
-      setConfig(
-        hasOtherDraft
-          ? {
-              ...currentConfig,
-              settingsRevision: result.config.settingsRevision,
-              promptOptimization: result.config.promptOptimization,
-            }
-          : result.config,
-      );
-      setDirty(hasOtherDraft);
-      window.dispatchEvent(
-        new CustomEvent("codey:config-changed", {
-          detail: { config: result.config },
-        }),
-      );
-      return true;
-    } finally {
-      setBusy(null);
+  function applyRouteResult(result: {
+    config: Config;
+    providerStatus?: ProviderStatus;
+    modelState?: ModelState;
+    restartRequired?: boolean;
+  }) {
+    setPersistedConfig(result.config);
+    if (result.providerStatus) setProviderStatus(result.providerStatus);
+    if (result.modelState) setModelState(result.modelState);
+    if (typeof result.restartRequired === "boolean") {
+      setStatus((current) => ({
+        ...current,
+        restartRequired: result.restartRequired,
+      }));
     }
+    setDirty(false);
+    window.dispatchEvent(
+      new CustomEvent("codey:config-changed", {
+        detail: { config: result.config },
+      }),
+    );
+  }
+
+  async function saveRoute(route: Profile) {
+    if (!config) return false;
+    let saved = false;
+    await runOperation("save-route", async () => {
+      const routeExists = config.profiles.some(
+        (profile) => profile.id === route.id,
+      );
+      const nextConfig = {
+        ...config,
+        profiles: routeExists
+          ? config.profiles.map((profile) =>
+              profile.id === route.id ? route : profile
+            )
+          : [...config.profiles, route],
+      };
+      const result = await persist(nextConfig);
+      saved = true;
+      setNotice({
+        tone: result.restartRequired ? "info" : "success",
+        text: result.restartRequired
+          ? `线路「${route.name}」已保存，重启 Codex 后注册新的接入配置`
+          : `线路「${route.name}」已保存，模型选择器已刷新`,
+      });
+    });
+    return saved;
+  }
+
+  async function deleteRoute(routeId: string) {
+    if (!config || dirty) return;
+    await runOperation("delete-route", async () => {
+      const result = await invoke<{
+        config: Config;
+        providerStatus: ProviderStatus;
+        modelState: ModelState;
+        restartRequired?: boolean;
+        modelHotReloaded?: boolean;
+      }>("delete_route", {
+        routeId,
+        expectedRevision: config.settingsRevision,
+      });
+      applyRouteResult(result);
+      setNotice({
+        tone: result.modelHotReloaded === false ? "info" : "success",
+        text: "线路已删除，相关模型已从选择器移除",
+      });
+    });
+  }
+
+  function requestDeleteRoute(routeId: string) {
+    if (!config) return;
+    const persisted = persistedConfigRef.current;
+    const persistedRoute = persisted?.profiles.some(
+      (profile) => profile.id === routeId,
+    );
+    if (!persistedRoute) {
+      const profiles = config.profiles.filter((profile) => profile.id !== routeId);
+      if (profiles.length === 0) return;
+      const next = {
+        ...config,
+        activeProfileId:
+          config.activeProfileId === routeId
+            ? profiles[0].id
+            : config.activeProfileId,
+        profiles,
+      };
+      setConfig(next);
+      setDirty(
+        !persisted ||
+          JSON.stringify({ ...next, settingsRevision: 0 }) !==
+            JSON.stringify({ ...persisted, settingsRevision: 0 }),
+      );
+      return;
+    }
+    if (dirty) {
+      setNotice({ tone: "info", text: "请先保存或放弃当前更改，再删除已保存线路" });
+      return;
+    }
+    const route = config.profiles.find((profile) => profile.id === routeId);
+    setConfirmation({
+      action: "delete-route",
+      title: `删除线路「${route?.name || "未命名线路"}」？`,
+      description: "该线路及其模型选择会立即从对话模型选择器移除。此操作无法撤销。",
+      confirmLabel: "删除线路",
+      run: () => void deleteRoute(routeId),
+    });
+  }
+
+  async function fetchRouteModels(route: Profile) {
+    if (!config) return;
+    if (route.authMode === "officialAccount") {
+      await syncCurrentProvider();
+      return;
+    }
+    await runOperation("fetch-route-models", async () => {
+      const savedConfig = config;
+      const savedRoute = savedConfig.profiles.find(
+        (profile) => profile.id === route.id,
+      );
+      if (!savedRoute) throw new Error("找不到要同步模型的线路");
+      try {
+        const result = await invoke<{
+          config: Config;
+          providerStatus: ProviderStatus;
+          modelState: ModelState;
+          routeModelState: ModelState;
+          models: string[];
+          restartRequired?: boolean;
+          modelHotReloaded?: boolean;
+        }>("fetch_route_models", {
+          routeId: savedRoute.id,
+          expectedRevision: savedConfig.settingsRevision,
+        });
+        applyRouteResult(result);
+        openModelPicker(
+          { ...result.routeModelState, officialModels: [] },
+          "",
+          savedRoute.id,
+          result.config.profiles.find((profile) => profile.id === savedRoute.id)
+            ?.supportsAutoReview === true,
+        );
+        setNotice({
+          tone: "success",
+          text: `已同步「${savedRoute.name}」的 ${result.models.length} 个模型，请勾选要启用的模型`,
+        });
+      } catch (error) {
+        const warning = `自动同步失败：${errorText(error)}。仍可手动录入当前线路支持的模型 ID。`;
+        openModelPicker(
+          thirdPartyRouteModelState(savedConfig, savedRoute, modelState),
+          warning,
+          savedRoute.id,
+          savedRoute.supportsAutoReview === true,
+        );
+        setNotice({
+          tone: "error",
+          text: "模型同步失败，已打开手动配置",
+        });
+      }
+    });
+  }
+
+  async function saveOfficialRouteSettings(
+    routeId: string,
+    models: string[],
+    showAccountUsageInHeader: boolean,
+  ) {
+    if (!config) return false;
+    const profile = config.profiles.find((candidate) => candidate.id === routeId);
+    if (!profile || profile.authMode !== "officialAccount") return false;
+    if (models.length === 0) {
+      setNotice({ tone: "info", text: "官方账号线路至少需要保留一个模型" });
+      return false;
+    }
+    let saved = false;
+    await runOperation("save-official-route-settings", async () => {
+      const modelResult = await invoke<{
+        config: Config;
+        modelState: ModelState;
+        restartRequired?: boolean;
+        modelHotReloaded?: boolean;
+      }>("save_official_route_models", { routeId, models });
+      applyRouteResult(modelResult);
+      const result = modelResult.config.showAccountUsageInHeader === showAccountUsageInHeader
+        ? modelResult
+        : await persist({
+            ...modelResult.config,
+            showAccountUsageInHeader,
+          });
+      saved = true;
+      setNotice({
+        tone: result.restartRequired ? "info" : "success",
+        text: result.restartRequired
+          ? "官方账号设置已保存，重启 Codex 后完全生效"
+          : "官方账号设置已保存，模型与额度展示已更新",
+      });
+    });
+    return saved;
+  }
+
+  async function setRouteDefaultModel(routeId: string, model: string) {
+    if (!config) return;
+    const profile = config.profiles.find((candidate) => candidate.id === routeId);
+    if (!profile) return;
+    const providerId = profile.sourceProviderId || profile.id;
+    const configuredOfficialModels = config.selectedModelsByProvider[providerId] || [];
+    const enabledModels = profile.authMode === "officialAccount"
+      ? configuredOfficialModels.length > 0
+        ? configuredOfficialModels
+        : modelState.officialModelIds
+      : [
+          ...(config.selectedModelsByProvider[providerId] || []),
+          ...(config.declaredOfficialModelsByProvider[providerId] || []),
+        ];
+    if (!enabledModels.some((candidate) => modelIdsEqual(candidate, model))) {
+      setNotice({ tone: "error", text: `模型 ${model} 不属于该线路` });
+      return;
+    }
+    await runOperation("save-default-model", async () => {
+      const result = await invoke<{
+        config: Config;
+        modelState: ModelState;
+        restartRequired?: boolean;
+      }>("save_default_model", {
+        routeId,
+        model,
+      });
+      applyRouteResult(result);
+      setNotice({
+        tone: result.restartRequired ? "info" : "success",
+        text: `已将全局默认模型设为「${profile.name} / ${model}」`,
+      });
+    });
   }
 
   async function saveCurrent() {
     if (!config) return;
     await runOperation("save", async () => {
       const result = await persist(config);
-      const subagentHotReloaded = Boolean(
-        result.subagentConfigHotReloaded ??
-          result.subagentDefaultsHotReloaded,
-      );
-      const subagentHotReloadFailed = Boolean(
-        result.subagentConfigHotReloadError ??
-          result.subagentDefaultsHotReloadError,
-      );
+      const subagentHotReloaded = Boolean(result.subagentConfigHotReloaded);
+      const subagentHotReloadFailed = Boolean(result.subagentConfigHotReloadError);
+      const subagentConfigRepaired = Boolean(result.subagentConfigRepaired);
       setNotice({
         tone:
           result.restartRequired || subagentHotReloadFailed
             ? "info"
             : "success",
-        text: subagentHotReloaded
-          ? "Codey 设置已保存；子代理模型和思考深度已实时更新"
+        text: subagentConfigRepaired
+          ? "Codey 设置已保存；已校验并修复子代理运行配置，下一次派生将使用当前角色映射"
+          : subagentHotReloaded
+            ? "Codey 设置已保存；子代理模型和思考深度已实时更新"
           : subagentHotReloadFailed
             ? "Codey 设置已保存；子代理配置暂未能热更新，重启 Codex 后生效"
             : result.restartRequired
@@ -494,7 +738,7 @@ export function App({
   }
 
   function askRemoveNotificationChannel(channel: NotificationChannel) {
-    const channelName = channel.kind === "telegram" ? "Telegram" : "飞书";
+    const channelName = getNotificationChannelDefinition(channel.kind).addLabel;
     setConfirmation({
       action: "delete-notification-channel",
       title: `删除${channelName}通知渠道？`,
@@ -553,6 +797,7 @@ export function App({
         traceCleanup?: TraceLogCleanup;
         crashpadCleanup: CrashpadCleanup;
         traceProtectionEnabled: boolean;
+        traceLogWriteProtectionActive: boolean;
         crashpadProtectionEnabled: boolean;
         errors: string[];
         traceLogStats: TraceLogStats;
@@ -562,8 +807,9 @@ export function App({
         ...current,
         traceLogStats: result.traceLogStats,
         crashpadPendingStats: result.crashpadPendingStats,
+        traceLogWriteProtectionActive:
+          result.traceLogWriteProtectionActive,
       }));
-      setTraceSnapshotStale(false);
       const traceCleanup = result.traceCleanup;
       const crashpadCleanup = result.crashpadCleanup;
       if (
@@ -616,7 +862,6 @@ export function App({
         setNotice({ tone: "info", text: "诊断存储正在统计，请稍候" });
         return;
       }
-      setTraceSnapshotStale(false);
       setNotice({ tone: "success", text: "诊断存储统计已更新" });
     });
   }
@@ -646,14 +891,24 @@ export function App({
   const handleSyncCurrentProvider = useStableEvent(
     () => void syncCurrentProvider(),
   );
-  const handleSyncPromptOptimizationCurrentProvider = useStableEvent(
-    syncPromptOptimizationCurrentProvider,
+  const handleSaveRoute = useStableEvent(saveRoute);
+  const handleDeleteRoute = useStableEvent(requestDeleteRoute);
+  const handleFetchRouteModels = useStableEvent((route: Profile) => {
+    void fetchRouteModels(route);
+  });
+  const handleToggleAccountUsage = useStableEvent((checked: boolean) => {
+    if (!config) return;
+    editConfig({
+      ...config,
+      showAccountUsageInHeader: checked,
+    });
+  });
+  const handleSaveOfficialRouteSettings = useStableEvent(
+    saveOfficialRouteSettings,
   );
-  const handleShowAccountUsageInHeaderChange = useStableEvent(
-    (checked: boolean) => {
-      if (config) {
-        editConfig({ ...config, showAccountUsageInHeader: checked });
-      }
+  const handleSetRouteDefaultModel = useStableEvent(
+    (routeId: string, model: string) => {
+      void setRouteDefaultModel(routeId, model);
     },
   );
   const handleClearTraceLogs = useStableEvent(askClearTraceLogs);
@@ -676,7 +931,7 @@ export function App({
           </p>
         </div>
         <LoaderCircle
-          className="spinner loading-spinner"
+          className="animate-spin loading-animate-spin"
           size={16}
           aria-hidden="true"
         />
@@ -697,87 +952,153 @@ export function App({
     );
   }
 
+  const hasUpdate =
+    updateCheck?.updateAvailable === true &&
+    Boolean(updateCheck.selectedAsset);
+  const isCheckingUpdate = busy === "check-update";
+  const isDownloadingUpdate = busy === "download-update";
+  const isInstallingUpdate = busy === "install-update";
+  const updateTooltipText = downloadedUpdate
+    ? `新版本 v${downloadedUpdate.latestVersion} 已下载，点击安装并重启`
+    : hasUpdate
+      ? `发现新版本 v${updateCheck?.latestVersion}，点击下载更新`
+      : isCheckingUpdate
+        ? "正在检查更新…"
+        : updateResult?.text
+          ? `${updateResult.text}（点击再次检查）`
+          : "检查 Codey 在线更新";
+
   const configHeaderContent = (
-    <div className="config-header-inner">
-      <div className="config-brand">
+    <div className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-5 max-[760px]:grid-cols-[minmax(0,1fr)_auto_auto] max-[760px]:gap-2.5">
+      <div className="flex min-w-0 items-center gap-3 justify-self-start max-[760px]:gap-2">
         <CodeyBrandMark />
-        <div className="config-brand-copy">
-          <div className="config-brand-title-row">
-            <h1 id={embedded ? "semi-modal-title" : undefined}>Codey 控制台</h1>
-            <span className="app-version-tag">
+        <div className="flex min-w-0 flex-col">
+          <div className="flex min-w-0 items-center gap-2">
+            <h1 className="m-0 whitespace-nowrap text-base font-bold tracking-[-0.02em] text-[#1d1d1f]">Codey 控制台</h1>
+            <span className="whitespace-nowrap text-[11px] font-medium tracking-[0.01em] text-[#8e8e93]">
               v{status.appVersion || "0.2.0"}
             </span>
+
+            <Tooltip
+              content={updateTooltipText}
+              getPopupContainer={getTooltipContainer}
+              position="bottom"
+            >
+              <span className="header-update-btn-wrap">
+                <button
+                  type="button"
+                  className={`header-update-pill ${
+                    hasUpdate
+                      ? "has-update"
+                      : downloadedUpdate
+                        ? "has-downloaded"
+                        : ""
+                  }`}
+                  disabled={isBusy}
+                  aria-label={updateTooltipText}
+                  onClick={() => {
+                    if (downloadedUpdate) {
+                      handleInstallDownloadedUpdate();
+                    } else if (hasUpdate) {
+                      handleDownloadUpdate();
+                    } else {
+                      handleCheckForUpdates();
+                    }
+                  }}
+                >
+                  {isCheckingUpdate || isDownloadingUpdate || isInstallingUpdate ? (
+                    <LoaderCircle className="animate-spin" size={12} aria-hidden="true" />
+                  ) : downloadedUpdate ? (
+                    <IconCheck size={12} aria-hidden="true" />
+                  ) : (
+                    <IconCircleArrowUp size={13} aria-hidden="true" />
+                  )}
+                  {downloadedUpdate ? (
+                    <span className="header-update-pill-label">
+                      v{downloadedUpdate.latestVersion} 已下载
+                    </span>
+                  ) : hasUpdate ? (
+                    <span className="header-update-pill-label">
+                      v{updateCheck?.latestVersion} 可更新
+                    </span>
+                  ) : null}
+                </button>
+              </span>
+            </Tooltip>
+
             {dirty && (
-              <Badge variant="warning" className="unsaved-badge">
+              <Badge variant="warning">
                 未保存更改
               </Badge>
             )}
           </div>
-          <p>管理 Codex 线路、模型服务、运行策略与诊断日志</p>
+          <p className="m-0 mt-0.5 text-[11px] text-[#6e6e73] max-[760px]:hidden">管理 Codex 线路、模型服务、运行策略与诊断日志</p>
         </div>
       </div>
 
       {embedded && (
-        <div className="config-header-feedback">
+        <div className="config-header-feedback justify-self-center">
           <Button
             aria-describedby="codey-feedback-qr-description"
             aria-label="问题反馈群，悬浮或聚焦查看二维码"
-            className="feedback-group-trigger"
+            className="whitespace-nowrap max-[520px]:w-8! max-[520px]:px-0!"
             size="sm"
-            variant="outline"
+            variant="brand-outline"
           >
             <IconMessageCircleQuestion aria-hidden="true" />
-            <span className="feedback-group-label">问题反馈群</span>
+            <span className="max-[520px]:hidden">问题反馈群</span>
           </Button>
           <div className="feedback-qr-popover" role="tooltip">
-            <img src={FEEDBACK_GROUP_QR_URL} alt="问题反馈群二维码" />
+            <img src={feedbackGroupQrUrl} alt="问题反馈群二维码" />
             <span id="codey-feedback-qr-description">扫码加入问题反馈群</span>
           </div>
         </div>
       )}
 
-      <div className="config-header-right">
-        <div className="config-header-actions">
+      <div className="flex min-w-0 items-center gap-4 justify-self-end">
+        <div className="flex items-center gap-2">
           {embedded && (
             <Button
               aria-label={status.running ? "重启 Codex" : "Codex 未运行"}
-              className="title-restart-button"
+              className="max-[520px]:w-8! max-[520px]:px-0!"
               disabled={isBusy || status.restartInProgress || !status.running}
               onClick={handleRestartCodex}
               size="sm"
               variant="warning"
             >
               {busy === "restart" || status.restartInProgress ? (
-                <LoaderCircle className="spinner" aria-hidden="true" />
+                <LoaderCircle className="animate-spin" aria-hidden="true" />
               ) : (
                 <RefreshCw aria-hidden="true" />
               )}
-              <span className="title-action-label">
+              <span className="max-[520px]:hidden">
                 {status.running ? "重启 Codex" : "未运行"}
               </span>
             </Button>
           )}
-          <SaveButton
+          <Button
             aria-label={dirty ? "保存更改" : "已保存"}
-            className={`save-button${embedded ? " title-save-button" : ""}${dirty ? " dirty" : ""}`}
+            className="h-8 min-w-[88px] px-3.5 text-xs max-[520px]:min-w-8! max-[520px]:w-8! max-[520px]:px-0!"
             disabled={!dirty || isBusy}
             onClick={handleSaveCurrent}
+            size="sm"
+            variant={dirty ? "default" : "secondary"}
           >
             {busy === "save" ? (
-              <LoaderCircle className="spinner" aria-hidden="true" />
+              <LoaderCircle className="animate-spin" aria-hidden="true" />
             ) : dirty ? (
               <Save aria-hidden="true" />
             ) : (
               <Check aria-hidden="true" />
             )}
-            <span className="title-action-label">
+            <span className="max-[520px]:hidden">
               {dirty ? "保存更改" : "已保存"}
             </span>
-          </SaveButton>
+          </Button>
           {embedded && (
             <Button
               aria-label="关闭配置"
-              className="codey-settings-modal-close"
+              className="flex-none max-[520px]:h-8! max-[520px]:w-8! max-[520px]:p-0!"
               onClick={handleCloseSettings}
               size="icon-sm"
               variant="ghost"
@@ -805,21 +1126,21 @@ export function App({
             <Button
               variant="ghost"
               size="icon"
-              className="traffic-light close"
+              className="size-3! min-w-3! rounded-full! border! border-black/15! bg-[#ff5f56]! p-0! shadow-none! hover:opacity-85"
               title="关闭"
               aria-label="关闭窗口"
             />
             <Button
               variant="ghost"
               size="icon"
-              className="traffic-light minimize"
+              className="size-3! min-w-3! rounded-full! border! border-black/15! bg-[#ffbd2e]! p-0! shadow-none! hover:opacity-85"
               title="最小化"
               aria-label="最小化窗口"
             />
             <Button
               variant="ghost"
               size="icon"
-              className="traffic-light zoom"
+              className="size-3! min-w-3! rounded-full! border! border-black/15! bg-[#27c93f]! p-0! shadow-none! hover:opacity-85"
               title="缩放"
               aria-label="全屏缩放"
             />
@@ -835,14 +1156,17 @@ export function App({
       )}
 
       {!embedded && (
-        <header className="config-header">{configHeaderContent}</header>
+        <header className="z-30 flex flex-col border-b border-black/8 bg-white/75 px-5 py-2.5 backdrop-blur-xl">
+          {configHeaderContent}
+        </header>
       )}
 
       <div className="page-scroll">
         <div className="page" id="codey-settings-content">
-          {/* 最上方：运行状态 (Codex 运行与维护，含 Codex 应用路径) */}
+          {/* 最上方：运行状态 (Codex 运行与维护) */}
           <OperationsPanel
-            config={config}
+            codexAppPath={config.codexAppPath}
+            fastContextToolsStatus={fastContextToolsStatus}
             status={operationsStatus}
             busy={busy}
             isBusy={isBusy}
@@ -852,95 +1176,88 @@ export function App({
             showRestartAction={!embedded}
           />
 
-          {/* 中间区域：分左右两栏 (左侧: 应用更新; 右侧: 消息通知与功能策略) */}
-          <div className="upper-dashboard-grid">
-            {/* 左侧栏：应用更新 */}
-            <div className="dashboard-column upper-left-column">
-              <AppUpdateCard
-                appVersion={status.appVersion}
-                updateResult={updateResult}
-                updateCheck={updateCheck}
-                downloadedUpdate={downloadedUpdate}
-                busy={busy}
-                isBusy={isBusy}
-                onCheckUpdates={handleCheckForUpdates}
-                onDownloadUpdate={handleDownloadUpdate}
-                onInstallUpdate={handleInstallDownloadedUpdate}
-              />
-            </div>
-
-            {/* 右侧栏：消息通知 */}
-            <div className="dashboard-column upper-right-column">
-              <NotificationChannelsCard
-                config={config}
-                container={portalContainer}
-                popupContainer={popupContainer}
-                isBusy={isBusy}
-                onAddChannel={handleAddNotificationChannel}
-                onChannelChange={handleNotificationChannelChange}
-                onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
-              />
-            </div>
-          </div>
-
-          {/* Codey 功能策略：整行独占排布 */}
-          <div className="full-row-section feature-full-section">
-            <FeaturePolicyCard
-              config={config}
-              fastContextToolsStatus={fastContextToolsStatus}
-              isMacClient={status.clientPlatform === "macos"}
-              popupContainer={popupContainer}
-              tooltipContainer={portalContainer}
-              isBusy={isBusy}
-              subagentModelOptions={subagentModelOptions}
-              defaultSubagentGuidance={defaultSubagentGuidance}
-              onConfigChange={handleConfigChange}
-              onSubagentOptimizationChange={handleSubagentOptimizationChange}
-            />
-          </div>
-
-          {/* 提示词优化：整行独占排布 */}
-          <div className="full-row-section prompt-optimization-full-section">
-            <PromptOptimizationCard
-              config={config}
-              provider={provider}
-              busy={busy}
-              isBusy={isBusy}
-              popupContainer={popupContainer}
-              onConfigChange={handleConfigChange}
-              onSyncCurrentProvider={
-                handleSyncPromptOptimizationCurrentProvider
-              }
-            />
-          </div>
-
-          {/* 线路与模型：整行独占排布 */}
-          <div className="full-row-section model-full-section">
+          {/* 线路与模型：单独一行展示 */}
+          <div className="full-row-section">
             <ModelSection
-              provider={provider}
+              config={config}
+              officialAccountAvailable={status.officialAccountAvailable === true}
+              popupContainer={popupContainer}
               modelState={modelState}
               dirty={dirty}
               isBusy={isBusy}
               busy={busy}
               showAccountUsageInHeader={config.showAccountUsageInHeader}
               onSyncCurrentProvider={handleSyncCurrentProvider}
-              onFetchCurrentModels={fetchCurrentModels}
-              onSetDefaultModel={setDefaultModel}
-              onDeleteThirdPartyModel={deleteThirdPartyModel}
-              manualThirdPartyModelKeys={manualThirdPartyModelKeys}
-              onShowAccountUsageInHeaderChange={
-                handleShowAccountUsageInHeaderChange
-              }
+              onSaveRoute={handleSaveRoute}
+              onDeleteRoute={handleDeleteRoute}
+              onFetchRouteModels={handleFetchRouteModels}
+              onToggleAccountUsage={handleToggleAccountUsage}
+              onSaveOfficialRouteSettings={handleSaveOfficialRouteSettings}
+              onSetDefaultModel={handleSetRouteDefaultModel}
+            />
+          </div>
+
+          {/* 提示词优化 与 Codey 子代理角色与调度增强：放在一行 */}
+          <div className="prompt-subagent-grid">
+            {/* 左侧：提示词优化 */}
+            <div className="prompt-column">
+              <PromptOptimizationCard
+                config={config}
+                isBusy={isBusy}
+                popupContainer={popupContainer}
+                subagentModelOptions={subagentModelOptions}
+                onConfigChange={handleConfigChange}
+                onNotice={setNotice}
+              />
+            </div>
+
+            {/* 右侧：Codey 子代理角色与调度增强 */}
+            <div className="subagent-column">
+              <SubagentPolicyCard
+                config={config}
+                popupContainer={popupContainer}
+                tooltipContainer={portalContainer}
+                isBusy={isBusy}
+                subagentModelOptions={subagentModelOptions}
+                onConfigChange={handleConfigChange}
+                onSubagentOptimizationChange={handleSubagentOptimizationChange}
+              />
+            </div>
+          </div>
+
+          {/* Codex 功能策略：整行排列 */}
+          <div className="full-row-section">
+            <FeaturePolicyCard
+              config={config}
+              fastContextToolsStatus={fastContextToolsStatus}
+              isMacClient={status.clientPlatform === "macos"}
+              isWindowsClient={status.clientPlatform === "windows"}
+              popupContainer={popupContainer}
+              tooltipContainer={portalContainer}
+              isBusy={isBusy}
+              onConfigChange={handleConfigChange}
+            />
+          </div>
+
+          {/* 消息通知：整行排列，每个渠道 item 占一半 */}
+          <div className="full-row-section">
+            <NotificationChannelsCard
+              config={config}
+              container={portalContainer}
+              popupContainer={popupContainer}
+              isBusy={isBusy}
+              onAddChannel={handleAddNotificationChannel}
+              onChannelChange={handleNotificationChannelChange}
+              onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
             />
           </div>
 
           {/* 诊断存储保护：整行独占排布 */}
-          <div className="full-row-section trace-full-section">
+          <div className="full-row-section">
             <TraceLogModule
               stats={status.traceLogStats}
               crashpadStats={status.crashpadPendingStats}
               crashpadSupported={status.clientPlatform === "macos"}
-              snapshotStale={traceSnapshotStale}
               traceProtectionEnabled={config.disableTraceLogWrites}
               crashpadProtectionEnabled={config.protectCrashpadPending}
               clearBusy={busy === "clear-trace-logs"}
@@ -954,7 +1271,7 @@ export function App({
       </div>
 
       <NoticeToast
-        autoDismissEnabled={Boolean(config && provider)}
+        autoDismissEnabled
         controller={noticeController}
       />
 
@@ -966,8 +1283,9 @@ export function App({
         customModelInput={customModelInput}
         modelInputError={modelInputError}
         modelSyncWarning={modelSyncWarning}
+        autoReviewSupported={draftAutoReviewSupported}
         thirdPartyModelOptions={thirdPartyModelOptions}
-        modelState={modelState}
+        modelState={modelEditorState}
         draftModelSet={draftModelSet}
         manualThirdPartyModelKeys={draftManualThirdPartyModelKeys}
         onOpenChange={handleModelPickerOpenChange}
@@ -975,6 +1293,7 @@ export function App({
         onAddCustomModel={addCustomModel}
         onToggleDraftModel={toggleDraftModel}
         onDeleteThirdPartyModel={deleteDraftThirdPartyModel}
+        onAutoReviewSupportedChange={setDraftAutoReviewSupported}
         onSave={saveModelSelection}
       />
 
@@ -989,7 +1308,7 @@ export function App({
       afterClose={onAfterClose}
       container={modalContainer}
       header={
-        <div className="semi-modal-header codey-settings-modal-header">
+        <div className="relative z-[2] flex w-full items-center overflow-visible">
           {configHeaderContent}
         </div>
       }

@@ -3,24 +3,17 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const source = readFileSync(
   new URL("../public/prompt-optimize.js", import.meta.url),
   "utf8",
 );
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(tagName = "div", { visible = true, rect = null } = {}) {
-    this.tagName = tagName.toUpperCase();
-    this.children = [];
-    this.dataset = {};
-    this.id = "";
-    this.parentElement = null;
-    this.style = {};
-    this.textContent = "";
-    this.attributes = new Map();
-    this.listeners = new Map();
+    super(tagName);
     this.visible = visible;
-    this.isConnected = false;
     this.value = "";
     this.innerText = "";
     this.disabled = false;
@@ -28,49 +21,6 @@ class FakeElement {
     this.readOnly = false;
     this.offsetWidth = 0;
     this.rect = rect;
-  }
-
-  addEventListener(type, handler) {
-    if (typeof handler !== "function") return;
-    const handlers = this.listeners.get(type) || [];
-    handlers.push(handler);
-    this.listeners.set(type, handlers);
-  }
-
-  dispatchEvent(event) {
-    if (!event?.type) return true;
-    if (!event.target) event.target = this;
-    event.currentTarget = this;
-    for (const handler of [...(this.listeners.get(event.type) || [])]) {
-      handler.call(this, event);
-    }
-    return true;
-  }
-
-  appendChild(child) {
-    child.remove();
-    child.parentElement = this;
-    child.isConnected = true;
-    this.children.push(child);
-    return child;
-  }
-
-  insertBefore(child, reference) {
-    child.remove();
-    const index = this.children.indexOf(reference);
-    if (index < 0) return this.appendChild(child);
-    child.parentElement = this;
-    child.isConnected = true;
-    this.children.splice(index, 0, child);
-    return child;
-  }
-
-  remove() {
-    if (!this.parentElement) return;
-    const index = this.parentElement.children.indexOf(this);
-    if (index >= 0) this.parentElement.children.splice(index, 1);
-    this.parentElement = null;
-    this.isConnected = false;
   }
 
   closest(selector) {
@@ -101,11 +51,6 @@ class FakeElement {
     return null;
   }
 
-  contains(node) {
-    if (node === this) return true;
-    return this.children.some((child) => child.contains(node));
-  }
-
   querySelectorAll() {
     return [];
   }
@@ -124,13 +69,8 @@ class FakeElement {
       : { bottom: 0, height: 0, left: 0, right: 0, top: 0, width: 0 };
   }
 
-  getAttribute(name) {
-    return this.attributes.has(name) ? this.attributes.get(name) : null;
-  }
-
   setAttribute(name, value) {
-    this.attributes.set(name, String(value));
-    if (name === "id") this.id = String(value);
+    super.setAttribute(name, value);
     if (name === "contenteditable") {
       this.isContentEditable = String(value) === "true";
     }
@@ -176,10 +116,12 @@ const createEnvironment = (options = {}) => {
   const inputEvents = [];
   const documentListeners = new Map();
   const windowListeners = new Map();
+  const statusEvents = [];
   let config = {
     promptOptimization: {
       enabled: options.enabled ?? true,
       apiKeyConfigured: options.apiKeyConfigured ?? true,
+      mode: options.mode ?? "manual",
     },
   };
   let composerQueryCount = 0;
@@ -200,6 +142,19 @@ const createEnvironment = (options = {}) => {
   const newChatInput = new FakeElement("div");
   newChatInput.setAttribute("contenteditable", "true");
   newChatInput.setAttribute("role", "textbox");
+  newChatInput.innerText = options.newChatInitialText ?? "";
+  const composerInnerControl = new FakeElement("button", {
+    rect: {
+      bottom: 290,
+      height: 30,
+      left: 650,
+      right: 790,
+      top: 260,
+      width: 140,
+    },
+  });
+  composerInnerControl.textContent = "model-2026 链接";
+  composerInnerControl.setAttribute("aria-haspopup", "menu");
   const toolbar = new FakeElement("div");
   const accessButton = new FakeElement("button", {
     rect: {
@@ -295,21 +250,59 @@ const createEnvironment = (options = {}) => {
     },
   });
   slashGoalCommand.textContent = "目标";
+  const settingsPanel = new FakeElement("section");
+  settingsPanel.setAttribute("data-testid", "settings-panel");
+  const settingsInput = new FakeElement("div", {
+    rect: {
+      bottom: 300,
+      height: 120,
+      left: 100,
+      right: 800,
+      top: 180,
+      width: 700,
+    },
+  });
+  settingsInput.setAttribute("contenteditable", "true");
+  settingsInput.setAttribute("role", "textbox");
+  settingsInput.innerText = options.settingsInitialText ?? "自定义语气";
+  const settingsToneControl = new FakeElement("button", {
+    rect: {
+      bottom: 290,
+      height: 36,
+      left: 980,
+      right: 1120,
+      top: 254,
+      width: 140,
+    },
+  });
+  settingsToneControl.textContent = "亲和";
+  settingsToneControl.setAttribute("aria-haspopup", "menu");
+  settingsPanel.appendChild(settingsInput);
+  settingsPanel.appendChild(settingsToneControl);
   slashCommandList.appendChild(slashModelCommand);
   slashCommandList.appendChild(slashGoalCommand);
   let slashCommandsOpen = options.slashCommands === true;
+  const includeComposer = options.composerDom !== false;
   documentElement.appendChild(body);
   body.appendChild(scope);
-  scope.appendChild(anchor);
-  scope.appendChild(textarea);
-  scope.appendChild(newChatInput);
-  scope.appendChild(toolbar);
-  toolbar.appendChild(accessButton);
-  toolbar.appendChild(modelButton);
-  toolbar.appendChild(microphoneButton);
-  toolbar.appendChild(sendButton);
+  if (includeComposer) {
+    scope.appendChild(anchor);
+    scope.appendChild(textarea);
+    scope.appendChild(newChatInput);
+    scope.appendChild(toolbar);
+    toolbar.appendChild(accessButton);
+    toolbar.appendChild(modelButton);
+    toolbar.appendChild(microphoneButton);
+    toolbar.appendChild(sendButton);
+    if (options.composerInnerControl) {
+      newChatInput.appendChild(composerInnerControl);
+    }
+  }
   if (slashCommandsOpen) {
     scope.appendChild(slashCommandList);
+  }
+  if (options.settingsPanel) {
+    scope.appendChild(settingsPanel);
   }
   if (options.dialogComposer || options.dialogControl) {
     scope.appendChild(dialog);
@@ -321,7 +314,16 @@ const createEnvironment = (options = {}) => {
     dialog.appendChild(dialogToolbar);
     dialogToolbar.appendChild(dialogControl);
   }
-  let fallbackInputs = options.newChatComposer ? [newChatInput] : [textarea];
+  let fallbackInputs = options.newChatComposer
+    ? [newChatInput]
+    : includeComposer
+      ? [textarea]
+      : [];
+  if (options.settingsPanel) {
+    fallbackInputs = options.onlySettingsPanel
+      ? [settingsInput]
+      : [...fallbackInputs, settingsInput];
+  }
   if (options.dialogComposer) {
     fallbackInputs = options.onlyDialogComposer
       ? [dialogInput]
@@ -329,16 +331,15 @@ const createEnvironment = (options = {}) => {
   }
   scope.querySelectorAll = (selector) => {
     if (selector === "textarea, [contenteditable='true'], [role='textbox']") {
-      return [textarea];
+      return includeComposer ? [textarea] : [];
     }
     if (selector === "button, [role='button']") {
-      const controls = [
-        accessButton,
-        modelButton,
-        microphoneButton,
-        sendButton,
-      ];
+      const controls = includeComposer
+        ? [accessButton, modelButton, microphoneButton, sendButton]
+        : [];
+      if (options.composerInnerControl) controls.push(composerInnerControl);
       if (options.dialogControl) controls.push(dialogControl);
+      if (options.settingsPanel) controls.push(settingsToneControl);
       if (slashCommandsOpen) {
         controls.push(slashModelCommand, slashGoalCommand);
       }
@@ -387,10 +388,23 @@ const createEnvironment = (options = {}) => {
     innerHeight: 800,
     innerWidth: 1280,
     location: { href: options.locationHref ?? "codex://conversation/1" },
+    __codeyInjectionStatus: {
+      "prompt-optimize": { status: "executed", detail: null, error: null },
+    },
     addEventListener(type, handler) {
       const handlers = windowListeners.get(type) || [];
       handlers.push(handler);
       windowListeners.set(type, handlers);
+    },
+    CustomEvent: class {
+      constructor(type, init = {}) {
+        this.type = type;
+        this.detail = init.detail;
+      }
+    },
+    dispatchEvent(event) {
+      statusEvents.push(event);
+      return true;
     },
     getComputedStyle: () => ({ display: "block", visibility: "visible" }),
   };
@@ -431,7 +445,13 @@ const createEnvironment = (options = {}) => {
     dialogControl,
     dialogInput,
     inputEvents,
+    injectionStatus: window.__codeyInjectionStatus["prompt-optimize"],
+    statusEvents,
     newChatInput,
+    composerInnerControl,
+    settingsPanel,
+    settingsInput,
+    settingsToneControl,
     textarea,
     toolbar,
     accessButton,
@@ -517,6 +537,18 @@ test("mounts the optimize button when enabled and an API key is configured", asy
     disconnectCalls: 0,
     observeCalls: 1,
   });
+});
+
+test("mounts the optimize button for an enabled Codey route without a manual key", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: false,
+    mode: "codeyRoute",
+  });
+  await flush();
+
+  assert.ok(env.getElementById("codey-prompt-optimize-button"));
+  assert.equal(env.snapshot().enabled, true);
 });
 
 test("keeps the original dark treatment at a 26px height", async () => {
@@ -608,6 +640,36 @@ test("keeps the button hidden when no composer input is found", async () => {
   assert.equal(env.getElementById("codey-prompt-optimize-button"), null);
 });
 
+test("does not mount the button for settings textboxes", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    anchors: false,
+    composerDom: false,
+    settingsPanel: true,
+    onlySettingsPanel: true,
+  });
+  await flush();
+
+  assert.equal(env.getElementById("codey-prompt-optimize-button"), null);
+  assert.equal(env.snapshot().hasInput, false);
+});
+
+test("does not use settings controls as insertion targets", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    settingsPanel: true,
+  });
+  await flush();
+
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.ok(button, "the normal composer should still receive the button");
+  assert.equal(button.parentElement, env.toolbar);
+  assert.equal(env.settingsToneControl.parentElement, env.settingsPanel);
+  assert.equal(env.settingsToneControl.parentElement.contains(button), false);
+});
+
 test("ignores Git commit textboxes inside modal dialogs", async () => {
   const env = createEnvironment({
     enabled: true,
@@ -682,7 +744,57 @@ test("mounts the optimize button for a new-chat contenteditable composer", async
   const button = env.getElementById("codey-prompt-optimize-button");
   assert.ok(button, "new-chat composer should receive the optimize button");
   assert.equal(button.style.display, "inline-flex");
+  assert.equal(button.getAttribute("contenteditable"), "false");
   assert.equal(env.snapshot().hasInput, true);
+});
+
+test("does not insert the optimize button into contenteditable link controls", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    anchors: false,
+    newChatComposer: true,
+    newChatInitialText: "第一段\n第二段\nhttps://example.com/model-2026",
+    composerInnerControl: true,
+  });
+  await flush();
+
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.ok(button, "contenteditable composer should still receive the button");
+  assert.equal(button.parentElement, env.toolbar);
+  assert.equal(env.newChatInput.contains(button), false);
+  assert.equal(env.composerInnerControl.parentElement, env.newChatInput);
+});
+
+test("removes the optimize button if rich paste moves its toolbar into the contenteditable composer", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    anchors: false,
+    newChatComposer: true,
+    newChatInitialText: "第一段\n第二段\nhttps://example.com/model-2026",
+  });
+  await flush();
+
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.ok(button, "button starts in the safe composer toolbar");
+  assert.equal(button.parentElement, env.toolbar);
+  assert.equal(env.newChatInput.contains(button), false);
+
+  env.newChatInput.appendChild(env.toolbar);
+  env.emitMutation([
+    {
+      type: "childList",
+      target: env.newChatInput,
+      addedNodes: [env.toolbar],
+      removedNodes: [],
+    },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+
+  assert.equal(env.getElementById("codey-prompt-optimize-button"), null);
+  assert.equal(env.newChatInput.contains(button), false);
+  assert.equal(env.snapshot().hasButton, false);
 });
 
 test("rescans when a connected composer is replaced during navigation", async () => {
@@ -967,6 +1079,7 @@ test("re-applies the switch when the console saves config", async () => {
   const env = createEnvironment({ enabled: false, apiKeyConfigured: true });
   await flush();
   assert.equal(env.getElementById("codey-prompt-optimize-button"), null);
+  assert.equal(env.injectionStatus.status, "inactive");
 
   env.setConfig({
     promptOptimization: { enabled: true, apiKeyConfigured: true },
@@ -976,6 +1089,11 @@ test("re-applies the switch when the console saves config", async () => {
 
   assert.ok(env.getElementById("codey-prompt-optimize-button"));
   assert.equal(env.snapshot().enabled, true);
+  assert.equal(env.injectionStatus.status, "effective");
+  assert.deepEqual(
+    { ...env.statusEvents.at(-1).detail },
+    { id: "prompt-optimize", status: "effective" },
+  );
   assert.equal(env.getObserverState().active, true);
   assert.equal(env.getObserverState().observeCalls, 1);
 });

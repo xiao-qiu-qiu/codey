@@ -1,7 +1,82 @@
 (() => {
   const disablePet = __DISABLE_PET__;
-  const fastCodexStartup = __FAST_CODEX_STARTUP__;
+  const requireAppServerRuntimeOverrideValidation =
+    __REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__;
   const codeyErrorLoggerExecutable = "__CODEY_ERROR_LOGGER_EXECUTABLE__";
+  const maxOptionalPatchFailureBatchSize = 64;
+  const optionalPatchFailureQueue = [];
+  let optionalPatchFailureFlushScheduled = false;
+  const reportPatchLogError = (error) => {
+    try {
+      console.error("[Codey] failed to write patch error log", error);
+    } catch {}
+  };
+  const writeCodeyPatchFailureSync = (record) => {
+    const result = process.getBuiltinModule("child_process").spawnSync(
+      codeyErrorLoggerExecutable,
+      ["--codey-record-error"],
+      {
+        input: JSON.stringify(record),
+        encoding: "utf8",
+        maxBuffer: 64 * 1024,
+        timeout: 2000,
+        windowsHide: true,
+      },
+    );
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      throw new Error(
+        `Codey error log helper exited with ${result.status}: ${String(result.stderr || "").trim()}`,
+      );
+    }
+  };
+  const writeCodeyPatchFailuresAsync = (records) => {
+    try {
+      const child = process.getBuiltinModule("child_process").spawn(
+        codeyErrorLoggerExecutable,
+        ["--codey-record-error"],
+        {
+          stdio: ["pipe", "ignore", "ignore"],
+          windowsHide: true,
+        },
+      );
+      const timeout = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {}
+      }, 2000);
+      timeout.unref?.();
+      const clearKillTimeout = () => clearTimeout(timeout);
+      child.once("exit", clearKillTimeout);
+      child.once("error", (error) => {
+        clearKillTimeout();
+        reportPatchLogError(error);
+      });
+      child.stdin?.once("error", reportPatchLogError);
+      child.stdin?.end(JSON.stringify(records), "utf8");
+      child.unref();
+    } catch (error) {
+      reportPatchLogError(error);
+    }
+  };
+  const scheduleOptionalPatchFailureFlush = () => {
+    if (optionalPatchFailureFlushScheduled) return;
+    optionalPatchFailureFlushScheduled = true;
+    setImmediate(() => {
+      optionalPatchFailureFlushScheduled = false;
+      const records = optionalPatchFailureQueue.splice(
+        0,
+        maxOptionalPatchFailureBatchSize,
+      );
+      if (records.length) writeCodeyPatchFailuresAsync(records);
+      if (optionalPatchFailureQueue.length) scheduleOptionalPatchFailureFlush();
+    });
+  };
+  const queueOptionalPatchFailure = (record) => {
+    if (optionalPatchFailureQueue.length >= maxOptionalPatchFailureBatchSize) return;
+    optionalPatchFailureQueue.push(record);
+    scheduleOptionalPatchFailureFlush();
+  };
   const recordCodeyPatchFailure = (operation, error, context = {}) => {
     const unresolvedExecutable =
       ["__CODEY", "ERROR_LOGGER_EXECUTABLE__"].join("_");
@@ -22,53 +97,36 @@
             : process.platform;
       const optionalPatch =
         operation.startsWith("renderer_patch:") ||
-        operation.startsWith("optional_main_bundle_patch:");
-      const stage = operation.startsWith("renderer_patch:")
+        operation.startsWith("optional_main_bundle_patch:") ||
+        operation === "patch_codex_renderer_asset";
+      const stage = operation.startsWith("renderer_patch:") ||
+        operation === "patch_codex_renderer_asset"
         ? "startup.renderer_asset_patch"
         : operation.startsWith("optional_main_bundle_patch:")
           ? "startup.optional_main_bundle_patch"
           : "startup.main_process_patch";
-      const result = process.getBuiltinModule("child_process").spawnSync(
-        codeyErrorLoggerExecutable,
-        ["--codey-record-error"],
-        {
-          input: JSON.stringify({
-            timestamp: now.toISOString(),
-            platform,
-            versions: {
-              electron: process.versions?.electron || undefined,
-              chrome: process.versions?.chrome || undefined,
-              node: process.versions?.node || undefined,
-            },
-            event: "patch_failed",
-            operation,
-            error: message,
-            stage,
-            recoverable: optionalPatch,
-            context,
-          }),
-          encoding: "utf8",
-          maxBuffer: 64 * 1024,
-          timeout: 2000,
-          windowsHide: true,
+      const record = {
+        timestamp: now.toISOString(),
+        platform,
+        versions: {
+          electron: process.versions?.electron || undefined,
+          chrome: process.versions?.chrome || undefined,
+          node: process.versions?.node || undefined,
         },
-      );
-      if (result.error) throw result.error;
-      if (result.status !== 0) {
-        throw new Error(
-          `Codey error log helper exited with ${result.status}: ${String(result.stderr || "").trim()}`,
-        );
-      }
+        event: "patch_failed",
+        operation,
+        error: message,
+        stage,
+        recoverable: optionalPatch,
+        context,
+      };
+      if (optionalPatch) queueOptionalPatchFailure(record);
+      else writeCodeyPatchFailureSync(record);
     } catch (logError) {
-      try {
-        console.error("[Codey] failed to write patch error log", logError);
-      } catch {}
+      reportPatchLogError(logError);
     }
   };
-  const statsigBootstrapTimeoutMs = 1500;
   const threadOwnerDiscoveryTimeoutMs = 150;
-  const statsigStartupRemainingMs =
-    `Math.max(0,(globalThis.__CODEY_STATSIG_STARTUP_DEADLINE_MS__??=Date.now()+${statsigBootstrapTimeoutMs})-Date.now())`;
   const disableWindowsOptimizations = process.platform === "win32";
   const disableMicro = disableWindowsOptimizations;
   const disableWindowsWmiSampler = disableWindowsOptimizations;
@@ -84,7 +142,7 @@
   const rendererMessageChannel = "codex_desktop:message-for-view";
   const windowsWmiSamplerInstalledAtMs = Date.now();
   const windowsWmiSamplerEvidence = {
-    version: 3,
+    version: 4,
     enabled: disableWindowsWmiSampler,
     workerWrapperPatched: false,
     esmExportsSynchronized: false,
@@ -163,12 +221,14 @@
     };
     const stringPart = (value) =>
       typeof value === "string" ? value.slice(0, 2048) : "";
-    const requestInfo = (message) => {
+    const requestInfo = (message, channel = "") => {
       if (
         !message ||
         typeof message !== "object" ||
         message.type !== "worker-request" ||
-        message.workerId !== "git"
+        (message.workerId != null && message.workerId !== "git") ||
+        (message.workerId == null &&
+          !/(?:^|[:/_-])git(?:$|[:/_-])/i.test(channel))
       ) {
         return null;
       }
@@ -195,7 +255,7 @@
         query && typeof query.method === "string"
           ? query.method
           : workerMethod;
-      if (!targetMethods.has(method)) return null;
+      if (!targetMethods.has(method) && query == null) return null;
       const params =
         query?.params && typeof query.params === "object"
           ? query.params
@@ -385,7 +445,7 @@
       tokenRefillMs,
       perKeyIntervalMs,
     });
-    const wrapGitHandler = (handler) => {
+    const wrapGitHandler = (handler, channel = "") => {
       if (typeof handler !== "function") return handler;
       if (handler.__codeyMainGitRequestGuardOwner === api) {
         gitHandlerPatched = true;
@@ -397,7 +457,9 @@
         const message = args[1];
         if (
           message?.type === "worker-request-cancel" &&
-          message.workerId === "git"
+          (message.workerId === "git" ||
+            (message.workerId == null &&
+              /(?:^|[:/_-])git(?:$|[:/_-])/i.test(channel)))
         ) {
           const queued = queuedByRequestId.get(message.id);
           if (queued) {
@@ -408,7 +470,7 @@
             return Promise.resolve(undefined);
           }
         }
-        const info = requestInfo(message);
+        const info = requestInfo(message, channel);
         if (!info) return Reflect.apply(handler, this, args);
         return sendGuarded(handler, this, args, info);
       };
@@ -460,7 +522,7 @@
     const wrapIpcHandler = (handler, channel = "") => {
       if (typeof handler !== "function") return handler;
       if (handler.__codeyMainIpcGuardOwner === api) return handler;
-      const wrapped = wrapStatusHandler(wrapGitHandler(handler));
+      const wrapped = wrapStatusHandler(wrapGitHandler(handler, channel));
       Object.defineProperty(wrapped, "__codeyMainIpcGuardOwner", {
         value: api,
       });
@@ -492,13 +554,95 @@
   });
   const isInspectorArgument = (argument) =>
     typeof argument === "string" && /^--inspect(?:-brk)?(?:=|$)/.test(argument);
+  const maxRendererPatchFingerprints = 64;
+  const rendererPatchFailuresByFingerprint = new Map();
+  let activeRendererPatchFailures = null;
+  const rendererPatchFingerprint = (source) => {
+    try {
+      return process
+        .getBuiltinModule("crypto")
+        .createHash("sha256")
+        .update(source)
+        .digest("base64url");
+    } catch {
+      // Fingerprinting is only an optimization. If crypto is unavailable, keep
+      // the existing compatibility behavior instead of risking a false cache hit.
+      return null;
+    }
+  };
+  const rendererPatchFailuresForSource = (source) => {
+    const fingerprint = rendererPatchFingerprint(source);
+    if (fingerprint == null) return null;
+    const existing = rendererPatchFailuresByFingerprint.get(fingerprint);
+    if (existing) {
+      // Refresh insertion order so the bounded map behaves as an LRU.
+      rendererPatchFailuresByFingerprint.delete(fingerprint);
+      rendererPatchFailuresByFingerprint.set(fingerprint, existing);
+      return existing;
+    }
+    const failures = new Set();
+    rendererPatchFailuresByFingerprint.set(fingerprint, failures);
+    while (rendererPatchFailuresByFingerprint.size > maxRendererPatchFingerprints) {
+      const oldest = rendererPatchFailuresByFingerprint.keys().next().value;
+      rendererPatchFailuresByFingerprint.delete(oldest);
+    }
+    return failures;
+  };
   // Each renderer gate is optional and independent. Codex bundles are minified
   // and reshape between releases, so a single drifted anchor must skip only its
   // own gate — never discard the sibling gates that are still compatible. That
   // is what previously hid the whole Fast/service-tier control on the builds
   // where one unrelated anchor moved: an exception here aborted every gate on
   // the asset. Log and return the source unchanged so the rest still apply.
+  // Field builds ship minified bundles whose shapes drift between platforms
+  // and releases. When a gate matches nothing, these are the neighborhood
+  // markers every gate sits near; capturing printable windows around them lets
+  // a field diagnostic log be turned into the next compatible variant without
+  // reproducing that exact bundle locally.
+  const rendererGateDiagnosticAnchors = [
+    "`composer.toggleFastMode`",
+    "composer.speedSlashCommand.disableDescription",
+    "isServiceTierAllowed",
+    "selectedServiceTier",
+    "featureRequirements?.fast_mode",
+    "useHiddenModels",
+    "availableOptions.length",
+    "includeUltraReasoningEffort",
+    "isCustomModelProvider",
+  ];
+  const rendererGateFailureExcerpts = (source) => {
+    const excerpts = [];
+    for (const anchor of rendererGateDiagnosticAnchors) {
+      if (excerpts.length >= 2) break;
+      const index = source.indexOf(anchor);
+      if (index < 0) continue;
+      excerpts.push(
+        source
+          .slice(Math.max(0, index - 150), index + anchor.length + 190)
+          .replace(/[^\x20-\x7E]/g, "?"),
+      );
+    }
+    return excerpts;
+  };
+  const recordIncompatibleRendererGate = (source, name, matchCount) => {
+    activeRendererPatchFailures?.add(name);
+    const message =
+      `Codey skipped an incompatible Codex renderer patch: ${name} gate matched ${matchCount} times`;
+    const context = { matchCount };
+    const excerpts = rendererGateFailureExcerpts(source);
+    if (excerpts.length) context.excerpts = excerpts;
+    recordCodeyPatchFailure(`renderer_patch:${name}`, message, context);
+    try {
+      console.error(message);
+    } catch {}
+    return source;
+  };
   const replaceUniqueRendererGate = (source, pattern, replacement, name) => {
+    // app:// assets can be requested repeatedly during reloads or renderer
+    // recovery. A gate already known to be incompatible with the exact same
+    // source must remain skipped without rerunning its full-bundle regexes or
+    // spawning another error-log helper.
+    if (activeRendererPatchFailures?.has(name)) return source;
     const gates = Array.isArray(pattern) ? pattern : [{ pattern, replacement }];
     let matchCount = 0;
     let patched = source;
@@ -514,16 +658,72 @@
       matchCount += gateCount;
     }
     if (matchCount !== 1) {
-      const message =
-        `Codey skipped an incompatible Codex renderer patch: ${name} gate matched ${matchCount} times`;
-      recordCodeyPatchFailure(`renderer_patch:${name}`, message, { matchCount });
-      try {
-        console.error(message);
-      } catch {}
-      return source;
+      return recordIncompatibleRendererGate(source, name, matchCount);
     }
     return patched;
   };
+  const replaceNearestRendererGateBeforeAnchor = (
+    source,
+    pattern,
+    replacement,
+    name,
+    anchor,
+    maximumDistance,
+  ) => {
+    if (activeRendererPatchFailures?.has(name)) return source;
+    const anchorIndexes = [];
+    for (
+      let index = source.indexOf(anchor);
+      index >= 0;
+      index = source.indexOf(anchor, index + anchor.length)
+    ) anchorIndexes.push(index);
+    if (anchorIndexes.length !== 1) {
+      return recordIncompatibleRendererGate(source, name, anchorIndexes.length);
+    }
+
+    const anchorIndex = anchorIndexes[0];
+    const scopeStart = Math.max(0, anchorIndex - maximumDistance);
+    const scope = source.slice(scopeStart, anchorIndex + anchor.length);
+    const gates = Array.isArray(pattern) ? pattern : [{ pattern, replacement }];
+    const candidates = [];
+    for (const gate of gates) {
+      scope.replace(gate.pattern, (...args) => {
+        candidates.push({ args, gate, offset: args.at(-2) });
+        return args[0];
+      });
+    }
+    if (candidates.length === 0) {
+      return recordIncompatibleRendererGate(source, name, 0);
+    }
+
+    const nearestOffset = Math.max(
+      ...candidates.map((candidate) => candidate.offset),
+    );
+    const nearestCandidates = candidates.filter(
+      (candidate) => candidate.offset === nearestOffset,
+    );
+    if (nearestCandidates.length !== 1) {
+      return recordIncompatibleRendererGate(
+        source,
+        name,
+        nearestCandidates.length,
+      );
+    }
+
+    const [{ args, gate, offset }] = nearestCandidates;
+    const effectiveReplacement = gate.replacement ?? replacement;
+    const replaced = typeof effectiveReplacement === "function"
+      ? effectiveReplacement(...args)
+      : effectiveReplacement;
+    const absoluteOffset = scopeStart + offset;
+    return source.slice(0, absoluteOffset) +
+      replaced +
+      source.slice(absoluteOffset + args[0].length);
+  };
+  const rendererHasNativeCustomProviderModelAccess = (source) =>
+    /function\s+[$A-Z_a-z][$\w]*\(\{[^}]*isCustomModelProvider\s*:\s*([$A-Z_a-z][$\w]*)[^}]*model\s*:\s*([$A-Z_a-z][$\w]*)[^}]*useHiddenModels\s*:\s*([$A-Z_a-z][$\w]*)[^}]*\}\)\s*\{\s*return[\s\S]{0,512}?\3\s*&&\s*!\s*\1\s*&&[\s\S]{0,256}?\?\s*[$A-Z_a-z][$\w]*\.has\(\s*\2\.model\s*\)\s*:\s*!\s*\2\.hidden\s*\)*\s*\}/.test(
+      source,
+    );
   const replacePetRendererImportWithStubs = (match, importClause) => {
     if (typeof importClause !== "string" || importClause.trim() === "") {
       return "";
@@ -599,6 +799,52 @@
     ].join("");
   const patchCodexRendererAsset = (source) => {
     let patched = source;
+    let nativeCustomProviderModelAccess = false;
+    if (
+      source.includes("codex-message-from-view")
+      && source.includes("sendMessageFromView")
+      && source.includes("Failed to send message from view")
+    ) {
+      // The native renderer forwards the request through Electron before it
+      // emits codex-message-from-view. Event-only injections therefore see an
+      // already-sent payload. Invoke Codey's synchronous route rewrite at the
+      // actual bridge boundary so thread/start is born with modelProvider.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /if\(([$A-Z_a-z][$\w]*)\?\.sendMessageFromView\)\{let ([$A-Z_a-z][$\w]*)=([$A-Z_a-z][$\w]*);\1\.sendMessageFromView\(\2\)\.catch\(([$A-Z_a-z][$\w]*)=>\{/g,
+        (_match, bridgeName, messageName, sourceName, errorName) =>
+          `if(${bridgeName}?.sendMessageFromView){let ${messageName}=globalThis.__codeyModelWhitelistPatch?.rewriteOutgoingMessage?.(${sourceName})??${sourceName};if(globalThis.__codeyModelWhitelistPatch?.isBlockedOutgoingMessage?.(${messageName})){globalThis.__codeyModelWhitelistPatch?.notifyBlockedOutgoingMessage?.(${messageName});return}${bridgeName}.sendMessageFromView(${messageName}).catch(${errorName}=>{`,
+        "model route bridge preflight",
+      );
+    }
+    if (
+      source.includes("AppServerRequestClient is missing a message dispatcher")
+      && source.includes("mcp_request_enqueued")
+      && source.includes("this.dispatchMessage?.(`mcp-request`")
+    ) {
+      // Current Codex can create threads through AppServerRequestClient without
+      // touching the renderer bridge helper above. Rewrite at enqueue time so
+      // thread/start and prewarm requests bind the selected Codey route before
+      // they reach the app server.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(enqueueRequest\(([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*=>\{this\.dispatchMessage\?\.\(`mcp-request`,\{request:[$A-Z_a-z][$\w]*,hostId:this\.hostId,[\s\S]{0,700}?widget:\4\?\.widget\}\)\},[$A-Z_a-z][$\w]*=null\)\{)let /g,
+        (_match, prefix, methodName, paramsName) =>
+          `${prefix}let __codeyRoute=globalThis.__codeyModelWhitelistPatch?.rewriteOutgoingMessage?.({type:\`mcp-request\`,request:{method:${methodName},params:${paramsName}}});if(__codeyRoute?.request){if(globalThis.__codeyModelWhitelistPatch?.isBlockedOutgoingMessage?.(__codeyRoute)){globalThis.__codeyModelWhitelistPatch?.notifyBlockedOutgoingMessage?.(__codeyRoute);return Promise.reject(Error(\`Codey blocked cross-provider model request\`))}${methodName}=__codeyRoute.request.method??${methodName},${paramsName}=__codeyRoute.request.params??${paramsName}}let `,
+        "app server request route preflight",
+      );
+      // AppServerRequestClient runs the preflight before createRequest assigns
+      // an id. Register the concrete request afterwards so a successful legacy
+      // OpenAI resume is remembered as a codey_router migration when its reply
+      // still exposes the rollout's persisted `openai` provider.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(let\{request:([$A-Z_a-z][$\w]*),promise:[$A-Z_a-z][$\w]*\}=this\.createRequest\([^;]{1,256}\);)/g,
+        (_match, createRequest, requestName) =>
+          `${createRequest}globalThis.__codeyModelWhitelistPatch?.trackOutgoingMessage?.({type:\`mcp-request\`,request:${requestName}});`,
+        "app server request identity tracking",
+      );
+    }
     if (
       disablePet
       && /settings\.(?:(?:appearance|personalization)\.)?pets(?:[."`]|$)/.test(source)
@@ -666,23 +912,47 @@
       );
     }
     if (
+      source.includes("assistantMessage.hookStats.label")
+      && source.includes("assistantMessage.hookStats.title")
+      && source.includes("tooltipMaxWidth:")
+    ) {
+      // Hook details can exceed the collision-limited tooltip height. Opt this
+      // one rich tooltip into Codex's native hover handoff so the pointer can
+      // enter its scrollable content without closing it on trigger leave.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(\{\s*)(tooltipContent\s*:\s*[$A-Z_a-z][$\w]*\s*,\s*tooltipClassName\s*:\s*`px-3 py-2`\s*,\s*tooltipMaxWidth\s*:\s*`min\(32rem,\s*var\(--radix-tooltip-content-available-width\),\s*calc\(100vw - 16px\)\)`)/g,
+        (_match, objectStart, tooltipProps) =>
+          `${objectStart}interactive:!0,${tooltipProps}`,
+        "hook details interactivity",
+      );
+    }
+    if (
       source.includes("useHiddenModels:") &&
       source.includes("availableModels:") &&
       source.includes("includeUltraReasoningEffort") &&
       source.includes("amazonBedrock")
     ) {
-      patched = replaceUniqueRendererGate(
-        patched,
-        /if\s*\(\s*\(*\s*(?:[$A-Z_a-z][$\w]*\s*(?:\?\.|\.)\s*has\(\s*[$A-Z_a-z][$\w]*\.model\s*\)\s*(?:===\s*!0)?\s*\|\|\s*)?\(?\s*([$A-Z_a-z][$\w]*)\s*\?\s*([$A-Z_a-z][$\w]*)\.has\(\s*([$A-Z_a-z][$\w]*)\.model\s*\)\s*:\s*(?:!\s*\3\.hidden|\3\.hidden\s*!==\s*!0|\3\.hidden\s*===\s*!1)\s*\)?\s*\)*\s*\)/g,
-        (_match, useAllowlistName, allowlistName, modelName) =>
-          `if(${useAllowlistName}?(${allowlistName}.has(${modelName}.model)||!${modelName}.hidden):!${modelName}.hidden)`,
-        "model allowlist",
-      );
+      // Newer Codex builds already bypass the native allowlist for custom
+      // providers and fall back to the model's own visibility bit. Recognize
+      // that semantic shape as compatible instead of logging a false failure.
+      nativeCustomProviderModelAccess =
+        rendererHasNativeCustomProviderModelAccess(source);
+      if (!nativeCustomProviderModelAccess) {
+        patched = replaceUniqueRendererGate(
+          patched,
+          /if\s*\(\s*\(*\s*(?:[$A-Z_a-z][$\w]*\s*(?:\?\.|\.)\s*has\(\s*[$A-Z_a-z][$\w]*\.model\s*\)\s*(?:===\s*!0)?\s*\|\|\s*)?\(?\s*([$A-Z_a-z][$\w]*)\s*\?\s*([$A-Z_a-z][$\w]*)\.has\(\s*([$A-Z_a-z][$\w]*)\.model\s*\)\s*:\s*(?:!\s*\3\.hidden|\3\.hidden\s*!==\s*!0|\3\.hidden\s*===\s*!1)\s*\)?\s*\)*\s*\)/g,
+          (_match, useAllowlistName, allowlistName, modelName) =>
+            `if(${useAllowlistName}?(${allowlistName}.has(${modelName}.model)||!${modelName}.hidden):!${modelName}.hidden)`,
+          "model allowlist",
+        );
+      }
     }
     if (
       source.includes("useHiddenModels:") &&
       source.includes("includeUltraReasoningEffort") &&
-      source.includes("amazonBedrock")
+      source.includes("amazonBedrock") &&
+      !nativeCustomProviderModelAccess
     ) {
       patched = replaceUniqueRendererGate(
         patched,
@@ -745,20 +1015,100 @@
       source.includes("availableOptions.length")
     ) {
       // The current model's options decide whether the speed control exists.
-      patched = replaceUniqueRendererGate(
+      patched = replaceNearestRendererGateBeforeAnchor(
         patched,
-        /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
-        (_match, assignment, _resultName, settingsName) =>
-          `${assignment}${settingsName}.availableOptions.length>1`,
+        [
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
+            replacement: (_match, assignment, _resultName, settingsName, draftName) =>
+              `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
+            replacement: (_match, assignment, _resultName, settingsName, draftName) =>
+              `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?!\s*&&\s*!)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
+            replacement: (_match, assignment, _resultName, settingsName) =>
+              `${assignment}${settingsName}.availableOptions.length>1`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
+            replacement: (
+              _match,
+              preservedPrefix,
+              _resultName,
+              _draftName,
+              settingsName,
+            ) => `${preservedPrefix}${settingsName}.availableOptions.length>1`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
+            replacement: (
+              _match,
+              assignment,
+              _resultName,
+              draftName,
+              settingsName,
+            ) => `${assignment}!${draftName}&&${settingsName}.availableOptions.length>1`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
+            replacement: (
+              _match,
+              assignment,
+              _resultName,
+              settingsName,
+              draftName,
+            ) => `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
+            replacement: (_match, assignment, _resultName, settingsName) =>
+              `${assignment}${settingsName}.availableOptions.length>1`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
+            replacement: (
+              _match,
+              preservedPrefix,
+              _resultName,
+              _draftName,
+              settingsName,
+            ) => `${preservedPrefix}${settingsName}.availableOptions.length>1`,
+          },
+        ],
+        undefined,
         "model-aware service tier control",
+        "`composer.toggleFastMode`",
+        8192,
       );
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(`composer\.toggleFastMode`[\s\S]{0,512}?\{\s*enabled\s*:\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null/g,
-        (_match, prefix, loadingName, fastOptionName) =>
-          `${prefix}!${loadingName}&&${fastOptionName}!=null`,
-        "model-aware Fast toggle",
-      );
+      if (source.includes("!=null")) {
+        patched = replaceUniqueRendererGate(
+          patched,
+          [
+            {
+              pattern: /(`composer\.toggleFastMode`[\s\S]{0,4096}?\{\s*enabled\s*:\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null/g,
+              replacement: (_match, prefix, loadingName, fastOptionName) =>
+                `${prefix}!${loadingName}&&${fastOptionName}!=null`,
+            },
+            {
+              pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null(?=\s*[,;][\s\S]{0,4096}?\{\s*enabled\s*:\s*\2\s*\}[\s\S]{0,4096}?`composer\.toggleFastMode`)/g,
+              replacement: (
+                _match,
+                preservedPrefix,
+                _resultName,
+                _draftName,
+                loadingName,
+                fastOptionName,
+              ) => `${preservedPrefix}!${loadingName}&&${fastOptionName}!=null`,
+            },
+          ],
+          undefined,
+          "model-aware Fast toggle",
+        );
+      }
     }
     if (
       source.includes("composer.speedSlashCommand.disableDescription") &&
@@ -825,13 +1175,27 @@
       // indicator and avoids falling back to the legacy outlined model icon.
       patched = replaceUniqueRendererGate(
         patched,
-        /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*,[\s\S]{0,8192}?modelPickerTriggerConfig\s*:\s*\2\s*\?)/g,
-        (
-          _match,
-          assignment,
-          _triggerConfigName,
-          hideLabelName,
-        ) => `${assignment}!${hideLabelName}`,
+        [
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*,[\s\S]{0,8192}?modelPickerTriggerConfig\s*:\s*\2\s*\?)/g,
+            replacement: (
+              _match,
+              assignment,
+              _triggerConfigName,
+              hideLabelName,
+            ) => `${assignment}!${hideLabelName}`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*,[\s\S]{0,4096}?\b([$A-Z_a-z][$\w]*)\s*=\s*\2\s*\?\s*\{[\s\S]{0,1024}?selectedServiceTierIconKind\s*:[\s\S]{0,1024}?showFastServiceTierIndicator\s*:[\s\S]{0,8192}?modelPickerTriggerConfig\s*:\s*\4\b)/g,
+            replacement: (
+              _match,
+              assignment,
+              _triggerConfigName,
+              hideLabelName,
+            ) => `${assignment}!${hideLabelName}`,
+          },
+        ],
+        undefined,
         "fast model trigger availability",
       );
       // Preserve Codex's native Fast indicators. Its own model/tier support
@@ -844,49 +1208,6 @@
             ? "if(modelPickerTriggerConfig!=null)"
             : `${aliasedPrefix}if(${triggerConfigName}!=null)`,
         "fast model trigger fallback",
-      );
-    }
-    if (
-      fastCodexStartup &&
-      source.includes(
-        "CODEX_POST_LOGIN_STATSIG_BOOTSTRAP_FAILURE_TYPE_CLIENT_INITIALIZATION_FAILED",
-      ) &&
-      source.includes("Statsig: error while bootstrapping post-login client") &&
-      source.includes("CodexStatsigProvider.sync")
-    ) {
-      // Keep the bootstrap call outside the inner StatsigClient block. Minified
-      // bundles often reuse the bootstrap argument name for the client binding;
-      // moving both into one block would put the argument in that binding's TDZ.
-      // A timeout still rejects the mutation and enters the provider fallback.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /let\s+([$A-Z_a-z][$\w]*)\s*=\s*await\s+([$A-Z_a-z][$\w]*)\(\s*([$A-Z_a-z][$\w]*)\s*\)\s*;\s*try\s*\{\s*let\s+([$A-Z_a-z][$\w]*)\s*=\s*new\s+([$A-Z_a-z][$\w]*)\.StatsigClient\s*\(/g,
-        (
-          _match,
-          payloadName,
-          bootstrapName,
-          bootstrapInputName,
-          clientName,
-          statsigModuleName,
-        ) =>
-          `let ${payloadName}=await Promise.race([${bootstrapName}(${bootstrapInputName}),new Promise((_,reject)=>globalThis.setTimeout(()=>reject(new Error("Codey Statsig bootstrap timeout")),${statsigStartupRemainingMs}))]);try{let ${clientName}=new ${statsigModuleName}.StatsigClient(`,
-        "post-login Statsig bootstrap timeout",
-      );
-    }
-    if (
-      fastCodexStartup &&
-      source.includes("useStatsigInternalClientFactoryAsync") &&
-      source.includes("_getInstance") &&
-      source.includes("loadingStatus")
-    ) {
-      // The SDK's anonymous-client hook otherwise keeps the entire route tree
-      // behind its loading placeholder until initializeAsync settles.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /([$A-Z_a-z][$\w]*)\.loadingStatus\s*!==\s*`Ready`\s*&&\s*\1\.initializeAsync\(\)\.catch\s*\(/g,
-        (_match, clientName) =>
-          `${clientName}.loadingStatus!==\`Ready\`&&Promise.race([${clientName}.initializeAsync(),new Promise((_,reject)=>globalThis.setTimeout(()=>reject(new Error("Codey Statsig async initialization timeout")),${statsigStartupRemainingMs}))]).catch(`,
-        "Statsig async client initialization timeout",
       );
     }
     if (
@@ -916,6 +1237,41 @@
     }
     return patched;
   };
+  const discoveredCodexRendererAssets = new Set();
+  const maximumDiscoveredCodexRendererAssets = 128;
+  const rememberCodexRendererAsset = (baseUrl, specifier) => {
+    try {
+      const url = new URL(specifier, baseUrl);
+      if (
+        url.protocol !== "app:" ||
+        !url.pathname.includes("/assets/") ||
+        !/\.(?:c|m)?js$/i.test(url.pathname)
+      ) return;
+      discoveredCodexRendererAssets.delete(url.pathname);
+      discoveredCodexRendererAssets.add(url.pathname);
+      while (
+        discoveredCodexRendererAssets.size >
+        maximumDiscoveredCodexRendererAssets
+      ) {
+        const oldest = discoveredCodexRendererAssets.keys().next().value;
+        if (oldest === undefined) break;
+        discoveredCodexRendererAssets.delete(oldest);
+      }
+    } catch {}
+  };
+  const discoverCodexRendererAssets = (baseUrl, source) => {
+    for (const match of source.matchAll(
+      /\bsrc\s*=\s*(["'])([^"']+\.(?:c|m)?js(?:[?#][^"']*)?)\1/gi,
+    )) rememberCodexRendererAsset(baseUrl, match[2]);
+  };
+  const isCodexRendererBootstrapRequest = (request) => {
+    try {
+      const url = new URL(request?.url);
+      return url.protocol === "app:" && /\/index\.html$/i.test(url.pathname);
+    } catch {
+      return false;
+    }
+  };
   const isCodexRendererAssetRequest = (request) => {
     try {
       const url = new URL(request?.url);
@@ -923,15 +1279,16 @@
         url.protocol === "app:" &&
         url.pathname.includes("/assets/") &&
         (
-          /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request)(?:[~-][^/]*)?)\.js$/i.test(
+          /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
             url.pathname,
-          )
-          || (
-            disablePet
-            && /\/(?:(?:appearance-settings|pet-settings|pets-settings)(?:[~-][^/]*)?)\.js$/i.test(
+          ) ||
+          (
+            disablePet &&
+            /\/(?:(?:appearance-settings|pet-settings|pets-settings)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
               url.pathname,
             )
-          )
+          ) ||
+          discoveredCodexRendererAssets.has(url.pathname)
         )
       );
     } catch {
@@ -939,9 +1296,30 @@
     }
   };
   const patchCodexRendererResponse = async (request, response) => {
-    if (!isCodexRendererAssetRequest(request) || response?.ok !== true) return response;
-    const source = await response.clone().text();
+    if (response?.ok !== true) return response;
+    if (isCodexRendererBootstrapRequest(request)) {
+      try {
+        discoverCodexRendererAssets(request.url, await response.clone().text());
+      } catch (error) {
+        recordCodeyPatchFailure("renderer_patch:asset discovery", error, {
+          requestUrl: request?.url,
+        });
+      }
+      return response;
+    }
+    if (!isCodexRendererAssetRequest(request)) return response;
+    let source;
+    try {
+      source = await response.clone().text();
+    } catch (error) {
+      recordCodeyPatchFailure("renderer_patch:asset read", error, {
+        requestUrl: request?.url,
+      });
+      return response;
+    }
     let patched;
+    const previousRendererPatchFailures = activeRendererPatchFailures;
+    activeRendererPatchFailures = rendererPatchFailuresForSource(source);
     try {
       patched = patchCodexRendererAsset(source);
     } catch (error) {
@@ -956,10 +1334,19 @@
         console.error("Codey skipped an incompatible Codex renderer patch", error);
       } catch {}
       return response;
+    } finally {
+      activeRendererPatchFailures = previousRendererPatchFailures;
     }
     if (patched === source) return response;
     const headers = new Headers(response.headers);
-    headers.delete("content-length");
+    for (const header of [
+      "content-encoding",
+      "content-length",
+      "content-md5",
+      "digest",
+      "etag",
+      "last-modified",
+    ]) headers.delete(header);
     return new Response(patched, {
       headers,
       status: response.status,
@@ -997,14 +1384,247 @@
   const wslOnlyRuntimeConfigOverrides = validRuntimeConfigOverrides
     .filter((entry) => entry.startsWith(wslOnlyRuntimeOverridePrefix))
     .map((entry) => entry.slice(wslOnlyRuntimeOverridePrefix.length));
-  const appServerRuntimeConfigs = [
+  const runtimeOverrideKey = (config) => {
+    if (typeof config !== "string") return "";
+    const separatorIndex = config.indexOf("=");
+    return (separatorIndex < 0 ? config : config.slice(0, separatorIndex)).trim();
+  };
+  const uniqueRuntimeConfigsByKey = (configs) => {
+    const uniqueConfigs = [];
+    const indexesByKey = new Map();
+    for (const config of configs) {
+      const key = runtimeOverrideKey(config);
+      if (key.length === 0) continue;
+      const existingIndex = indexesByKey.get(key);
+      if (existingIndex == null) {
+        indexesByKey.set(key, uniqueConfigs.length);
+        uniqueConfigs.push(config);
+      } else {
+        uniqueConfigs[existingIndex] = config;
+      }
+    }
+    return uniqueConfigs;
+  };
+  const appServerRuntimeConfigs = uniqueRuntimeConfigsByKey([
     appServerAnalyticsConfig,
-    ...nativeRuntimeConfigOverrides,
-  ];
+    ...nativeRuntimeConfigOverrides.filter(
+      (config) => runtimeOverrideKey(config) !== runtimeOverrideKey(appServerAnalyticsConfig),
+    ),
+  ]);
+  const appServerRuntimeOverrideVerifiedResult =
+    "codey-app-server-runtime-overrides-verified";
+  const appServerRuntimeOverrideTimeoutMs = 8_000;
+  const appServerRuntimeOverrideEvidence = {
+    version: 1,
+    observed: false,
+    complete: appServerRuntimeConfigs.length === 0,
+    attempts: 0,
+    mode: "",
+    command: "",
+    argumentCount: 0,
+    missingRuntimeConfigs: [...appServerRuntimeConfigs],
+    requiredRuntimeConfigs: [...appServerRuntimeConfigs],
+  };
+  let resolveAppServerRuntimeOverrideValidation = null;
+  const appServerRuntimeOverrideValidationPromise = new Promise((resolve) => {
+    resolveAppServerRuntimeOverrideValidation = resolve;
+  });
+  const formatAppServerRuntimeOverrideError = (status) => {
+    const missing = status.missingRuntimeConfigs?.length
+      ? `；缺失：${status.missingRuntimeConfigs
+          .map(runtimeOverrideKey)
+          .join(", ")}`
+      : "";
+    const observed = status.observed
+      ? `；已观察到 ${status.mode || "unknown"} 启动：${status.command || ""}（参数 ${status.argumentCount ?? 0} 个）`
+      : "；未观察到 app-server 启动调用";
+    return (
+      "当前 Codex 版本的 app-server 启动参数结构与 Codey 不兼容，" +
+      `未能确认注入 model_provider=codey_router 与 model_providers.codey_router.*${missing}${observed}`
+    );
+  };
+  const finishAppServerRuntimeOverrideValidation = (status) => {
+    if (appServerRuntimeOverrideEvidence.complete) return;
+    Object.assign(appServerRuntimeOverrideEvidence, status);
+    if (status.complete) {
+      appServerRuntimeOverrideEvidence.complete = true;
+      resolveAppServerRuntimeOverrideValidation?.(
+        appServerRuntimeOverrideVerifiedResult,
+      );
+      return;
+    }
+    resolveAppServerRuntimeOverrideValidation?.(status);
+  };
+  const collectRuntimeConfigArgsAfterAppServer = (args) => {
+    const appServerIndex = args.indexOf("app-server");
+    if (appServerIndex < 0) return [];
+    const configs = [];
+    for (let index = appServerIndex + 1; index < args.length; index += 1) {
+      const argument = args[index];
+      if (
+        (argument === "-c" || argument === "--config") &&
+        typeof args[index + 1] === "string"
+      ) {
+        configs.push(args[index + 1]);
+        index += 1;
+        continue;
+      }
+      if (typeof argument === "string" && argument.startsWith("--config=")) {
+        configs.push(argument.slice("--config=".length));
+      }
+    }
+    return configs;
+  };
+  const validateRuntimeConfigSet = (configs, requiredConfigs) => {
+    const observed = new Set(configs);
+    return requiredConfigs.filter((config) => !observed.has(config));
+  };
+  const recordCodexAppServerRuntimeOverrideAttempt = (status) => {
+    const normalized = {
+      version: 1,
+      observed: true,
+      complete: status.missingRuntimeConfigs.length === 0,
+      attempts: appServerRuntimeOverrideEvidence.attempts + 1,
+      mode: status.mode,
+      command: String(status.command ?? "").slice(0, 512),
+      argumentCount: Array.isArray(status.args) ? status.args.length : 0,
+      missingRuntimeConfigs: status.missingRuntimeConfigs,
+      requiredRuntimeConfigs: [...status.requiredRuntimeConfigs],
+    };
+    finishAppServerRuntimeOverrideValidation(normalized);
+  };
+  const inspectCodexAppServerRuntimeOverrides = (command, args) => {
+    if (!Array.isArray(args)) return null;
+    const commandName = String(command ?? "");
+    const appServerArgCount = args
+      .filter((argument) => argument === "app-server")
+      .length;
+    const directCodexCommand = /(?:^|[/\\])codex(?:\.exe)?$/i.test(commandName);
+    const runtimeManagedAppServer =
+      nativeRuntimeConfigOverrides.length > 0 && appServerArgCount === 1;
+    if (
+      appServerArgCount === 1 &&
+      (directCodexCommand || runtimeManagedAppServer)
+    ) {
+      const configs = collectRuntimeConfigArgsAfterAppServer(args);
+      return {
+        mode: "argv",
+        command,
+        args,
+        requiredRuntimeConfigs: appServerRuntimeConfigs,
+        missingRuntimeConfigs: validateRuntimeConfigSet(
+          configs,
+          appServerRuntimeConfigs,
+        ),
+      };
+    }
+    if (!/(?:^|[/\\])wsl(?:\.exe)?$/i.test(commandName)) return null;
+    const shellFlagIndexes = args
+      .map((argument, index) => argument === "-lc" ? index : -1)
+      .filter((index) => index >= 0);
+    if (shellFlagIndexes.length !== 1) return null;
+    const shellFlagIndex = shellFlagIndexes[0];
+    const shellCommand = args[shellFlagIndex + 1];
+    if (
+      !/(?:^|[/\\])bash$/i.test(String(args[shellFlagIndex - 1] ?? "")) ||
+      typeof shellCommand !== "string"
+    ) {
+      return null;
+    }
+    const execMatches = [...shellCommand.matchAll(/(?:^|;)\s*exec\s+/g)];
+    if (execMatches.length !== 1) return null;
+    const execCommandOffset = execMatches[0].index + execMatches[0][0].length;
+    const execCommand = shellCommand.slice(execCommandOffset);
+    const executableToken = /^(?:"[^"]+"|'[^']+'|(?:\\.|[^\s;&|])+)/.exec(
+      execCommand,
+    )?.[0];
+    if (executableToken == null) return null;
+    const normalizedExecutable = executableToken
+      .replace(/^(["'])|(["'])$/g, "")
+      .replace(/\\ /g, " ");
+    if (!/(?:^|[/\\])codex(?:\.exe)?$/i.test(normalizedExecutable)) {
+      return null;
+    }
+    const appServerOffset = execCommand.search(/\bapp-server\b/);
+    if (appServerOffset < 0) return null;
+    const afterAppServer = execCommand.slice(
+      appServerOffset + "app-server".length,
+    );
+    const wslReplacementKeys = new Set(
+      wslOnlyRuntimeConfigOverrides.map(runtimeOverrideKey),
+    );
+    const requiredRuntimeConfigs = uniqueRuntimeConfigsByKey([
+      appServerAnalyticsConfig,
+      ...nativeRuntimeConfigOverrides.filter(
+        (config) =>
+          runtimeOverrideKey(config) !== runtimeOverrideKey(appServerAnalyticsConfig) &&
+          !wslReplacementKeys.has(runtimeOverrideKey(config)),
+      ),
+      ...wslOnlyRuntimeConfigOverrides,
+    ]).map(rewriteTomlWindowsPathsForWsl);
+    return {
+      mode: "wsl-shell",
+      command,
+      args,
+      requiredRuntimeConfigs,
+      missingRuntimeConfigs: requiredRuntimeConfigs.filter(
+        (config) => !hasShellConfigArg(afterAppServer, config),
+      ),
+    };
+  };
+  const awaitCodexAppServerRuntimeOverrides = async () => {
+    if (appServerRuntimeOverrideEvidence.complete) {
+      return appServerRuntimeOverrideVerifiedResult;
+    }
+    if (appServerRuntimeOverrideEvidence.observed) {
+      throw new Error(
+        formatAppServerRuntimeOverrideError(appServerRuntimeOverrideEvidence),
+      );
+    }
+    let timeout = null;
+    try {
+      const result = await Promise.race([
+        appServerRuntimeOverrideValidationPromise,
+        new Promise((_resolve, reject) => {
+          timeout = setTimeout(() => {
+            reject(
+              new Error(
+                formatAppServerRuntimeOverrideError(
+                  appServerRuntimeOverrideEvidence,
+                ),
+              ),
+            );
+          }, appServerRuntimeOverrideTimeoutMs);
+          timeout.unref?.();
+        }),
+      ]);
+      if (result === appServerRuntimeOverrideVerifiedResult) return result;
+      throw new Error(formatAppServerRuntimeOverrideError(result));
+    } finally {
+      if (timeout != null) clearTimeout(timeout);
+      setImmediate(() => {
+        try { process.getBuiltinModule("inspector").close(); } catch {}
+      });
+    }
+  };
+  Object.defineProperty(
+    globalThis,
+    "__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__",
+    {
+      configurable: false,
+      value: awaitCodexAppServerRuntimeOverrides,
+      writable: false,
+    },
+  );
   const subagentGateRuntimeEnv = "CODEY_SUBAGENT_GATE_ACTIVE";
+  const subagentGateRuntimeIdEnv = "CODEY_SUBAGENT_GATE_RUNTIME_ID";
   const subagentGateRuntimeActive =
     typeof __SUBAGENT_GATE_ACTIVE__ === "boolean" &&
     __SUBAGENT_GATE_ACTIVE__;
+  const randomUuid = process.getBuiltinModule("crypto")?.randomUUID;
+  const subagentGateRuntimeId = typeof randomUuid === "function"
+    ? randomUuid()
+    : `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const rewriteTomlWindowsPathsForWsl = (config) => {
     if (typeof config !== "string") return config;
     return config.replace(/"(?:\\.|[^"\\])*"/g, (literal) => {
@@ -1021,60 +1641,49 @@
       }
     });
   };
-  const hasAppServerConfigArg = (args, config) => {
-    for (let index = 0; index < args.length; index += 1) {
-      const argument = args[index];
-      if (
-        (argument === "-c" || argument === "--config") &&
-        args[index + 1] === config
-      ) {
-        return true;
-      }
-      if (argument === `--config=${config}`) return true;
-    }
-    return false;
-  };
   const rewriteCodexAppServerArgs = (args) => {
     if (!Array.isArray(args)) return args;
     const appServerIndexes = args
       .map((argument, index) => argument === "app-server" ? index : -1)
       .filter((index) => index >= 0);
-    const analyticsFlagCount = args
-      .filter((argument) => argument === "--analytics-default-enabled")
-      .length;
-    if (appServerIndexes.length !== 1 || analyticsFlagCount > 1) return args;
+    if (appServerIndexes.length !== 1) return args;
 
-    const rewritten = args.filter(
-      (argument) => argument !== "--analytics-default-enabled",
+    const managedConfigKeys = new Set(
+      appServerRuntimeConfigs.map(runtimeOverrideKey),
     );
-    let hasAnalyticsConfig = false;
-    for (let index = 0; index < rewritten.length; index += 1) {
-      const argument = rewritten[index];
+    const rewritten = [];
+    for (let index = 0; index < args.length; index += 1) {
+      const argument = args[index];
+      if (argument === "--analytics-default-enabled") continue;
       if (
         (argument === "-c" || argument === "--config") &&
-        /^analytics\.enabled=/.test(String(rewritten[index + 1] ?? ""))
+        typeof args[index + 1] === "string"
       ) {
-        rewritten[index + 1] = appServerAnalyticsConfig;
-        hasAnalyticsConfig = true;
-      } else if (/^--config=analytics\.enabled=/.test(String(argument))) {
-        rewritten[index] = `--config=${appServerAnalyticsConfig}`;
-        hasAnalyticsConfig = true;
+        const config = args[index + 1];
+        if (managedConfigKeys.has(runtimeOverrideKey(config))) {
+          index += 1;
+          continue;
+        }
+        rewritten.push(argument, config);
+        index += 1;
+        continue;
       }
+      if (typeof argument === "string" && argument.startsWith("--config=")) {
+        const config = argument.slice("--config=".length);
+        if (managedConfigKeys.has(runtimeOverrideKey(config))) continue;
+      }
+      rewritten.push(argument);
     }
     const appServerIndex = rewritten.indexOf("app-server");
-    const missingRuntimeConfigs = appServerRuntimeConfigs.filter(
-      (config) => !hasAppServerConfigArg(rewritten, config),
+    // Keep Codey's overrides in the app-server command's own config layer.
+    // The desktop app appends mcp_servers.codex_app after the subcommand; placing
+    // Codey's mcp_servers entries in the global layer lets that later table mask
+    // FastCtx and the subagent-control server.
+    rewritten.splice(
+      appServerIndex + 1,
+      0,
+      ...appServerRuntimeConfigs.flatMap((config) => ["-c", config]),
     );
-    if (!hasAnalyticsConfig && !missingRuntimeConfigs.includes(appServerAnalyticsConfig)) {
-      missingRuntimeConfigs.unshift(appServerAnalyticsConfig);
-    }
-    if (missingRuntimeConfigs.length > 0) {
-      rewritten.splice(
-        appServerIndex,
-        0,
-        ...missingRuntimeConfigs.flatMap((config) => ["-c", config]),
-      );
-    }
     if (
       rewritten.length === args.length &&
       rewritten.every((argument, index) => argument === args[index])
@@ -1119,55 +1728,44 @@
     }
 
     const appServerMatches = execCommand.match(/\bapp-server\b/g);
-    const analyticsFlagMatches = execCommand.match(
-      /(?:^|[\s;])--analytics-default-enabled(?=$|[\s;&|])/g,
-    );
-    if (appServerMatches?.length !== 1 || (analyticsFlagMatches?.length ?? 0) > 1) {
+    if (appServerMatches?.length !== 1) {
       return command;
     }
 
-    let hasAnalyticsConfig = hasShellConfigArg(
-      execCommand,
-      appServerAnalyticsConfig,
-    );
     let rewritten = execCommand.replace(
       /(^|[\s;])(-c|--config)\s+analytics\.enabled=[^\s;&|]+(?=$|[\s;&|])/g,
-      (_match, prefix, configFlag) => {
-        hasAnalyticsConfig = true;
-        return `${prefix}${configFlag} ${appServerAnalyticsConfig}`;
-      },
+      (_match, prefix) => prefix,
     );
     rewritten = rewritten.replace(
       /(^|[\s;])--config=analytics\.enabled=[^\s;&|]+(?=$|[\s;&|])/g,
-      (_match, prefix) => {
-        hasAnalyticsConfig = true;
-        return `${prefix}--config=${appServerAnalyticsConfig}`;
-      },
+      (_match, prefix) => prefix,
     );
     rewritten = rewritten.replace(
       /(^|[\s;])--analytics-default-enabled(?=$|[\s;&|])/g,
       (_match, prefix) => prefix,
     );
-    const missingRuntimeConfigs = runtimeConfigs.filter(
-      (config) =>
-        config !== appServerAnalyticsConfig &&
-        !hasShellConfigArg(rewritten, config),
+    const rewrittenAppServerOffset = rewritten.search(/\bapp-server\b/);
+    const afterAppServer = rewritten.slice(
+      rewrittenAppServerOffset + "app-server".length,
     );
-    const injectedConfigs = [
-      ...(!hasAnalyticsConfig ? [appServerAnalyticsConfig] : []),
-      ...missingRuntimeConfigs,
-    ];
+    const injectedConfigs = runtimeConfigs.filter(
+      (config) => !hasShellConfigArg(afterAppServer, config),
+    );
     if (injectedConfigs.length > 0) {
       rewritten = rewritten.replace(
         /\bapp-server\b/,
-        `${injectedConfigs.map((config) => `-c ${shellQuote(config)}`).join(" ")} app-server`,
+        `app-server ${injectedConfigs.map((config) => `-c ${shellQuote(config)}`).join(" ")}`,
       );
     }
     let commandPrefix = command.slice(0, execCommandOffset);
-    if (subagentGateRuntimeActive) {
+    if (
+      subagentGateRuntimeActive &&
+      !commandPrefix.includes(`${subagentGateRuntimeEnv}=1 `)
+    ) {
       const execKeywordIndex = commandPrefix.lastIndexOf("exec");
       commandPrefix =
         commandPrefix.slice(0, execKeywordIndex) +
+        `${subagentGateRuntimeIdEnv}=${shellQuote(subagentGateRuntimeId)} ` +
         `${subagentGateRuntimeEnv}=1 ` +
         commandPrefix.slice(execKeywordIndex);
     }
@@ -1176,7 +1774,16 @@
   const rewriteCodexAppServerSpawnArgs = (command, args) => {
     if (!Array.isArray(args)) return args;
     const commandName = String(command ?? "");
-    if (/(?:^|[/\\])codex(?:\.exe)?$/i.test(commandName)) {
+    const appServerArgCount = args
+      .filter((argument) => argument === "app-server")
+      .length;
+    const directCodexCommand = /(?:^|[/\\])codex(?:\.exe)?$/i.test(commandName);
+    const runtimeManagedAppServer =
+      nativeRuntimeConfigOverrides.length > 0 && appServerArgCount === 1;
+    if (
+      appServerArgCount === 1 &&
+      (directCodexCommand || runtimeManagedAppServer)
+    ) {
       return rewriteCodexAppServerArgs(args);
     }
     if (!/(?:^|[/\\])wsl(?:\.exe)?$/i.test(commandName)) return args;
@@ -1192,18 +1799,18 @@
     ) {
       return args;
     }
-    const runtimeOverrideKey = (config) =>
-      config.slice(0, Math.max(0, config.indexOf("=")));
     const wslReplacementKeys = new Set(
       wslOnlyRuntimeConfigOverrides.map(runtimeOverrideKey),
     );
-    const wslRuntimeConfigs = [
+    const wslRuntimeConfigs = uniqueRuntimeConfigsByKey([
       appServerAnalyticsConfig,
       ...nativeRuntimeConfigOverrides.filter(
-        (config) => !wslReplacementKeys.has(runtimeOverrideKey(config)),
+        (config) =>
+          runtimeOverrideKey(config) !== runtimeOverrideKey(appServerAnalyticsConfig) &&
+          !wslReplacementKeys.has(runtimeOverrideKey(config)),
       ),
       ...wslOnlyRuntimeConfigOverrides,
-    ].map(rewriteTomlWindowsPathsForWsl);
+    ]).map(rewriteTomlWindowsPathsForWsl);
     const rewrittenCommand = rewriteCodexAppServerShellCommand(
       args[shellFlagIndex + 1],
       wslRuntimeConfigs,
@@ -1223,11 +1830,14 @@
   const childProcess = process.getBuiltinModule("child_process");
   const NativeSpawn = childProcess.spawn;
   if (!NativeSpawn.__codeyAppServerAnalyticsDisabled) {
-    const isDirectCodexAppServerSpawn = (command, args) =>
+    const isManagedCodexAppServerSpawn = (command, args) =>
       subagentGateRuntimeActive &&
-      /(?:^|[/\\])codex(?:\.exe)?$/i.test(String(command ?? "")) &&
       Array.isArray(args) &&
-      args.filter((argument) => argument === "app-server").length === 1;
+      args.filter((argument) => argument === "app-server").length === 1 &&
+      (
+        /(?:^|[/\\])codex(?:\.exe)?$/i.test(String(command ?? "")) ||
+        nativeRuntimeConfigOverrides.length > 0
+      );
     const withSubagentGateEnvironment = (rest) => {
       const options = rest[0];
       if (options == null) {
@@ -1235,6 +1845,7 @@
           env: {
             ...process.env,
             [subagentGateRuntimeEnv]: "1",
+            [subagentGateRuntimeIdEnv]: subagentGateRuntimeId,
           },
         }];
       }
@@ -1245,14 +1856,22 @@
         env: {
           ...inheritedEnvironment,
           [subagentGateRuntimeEnv]: "1",
+          [subagentGateRuntimeIdEnv]: subagentGateRuntimeId,
         },
       }, ...rest.slice(1)];
     };
     const codeyAnalyticsDisabledSpawn = function (command, args, ...rest) {
       const rewritten = rewriteCodexAppServerSpawnArgs(command, args);
-      const rewrittenRest = isDirectCodexAppServerSpawn(command, rewritten)
+      const rewrittenRest = isManagedCodexAppServerSpawn(command, rewritten)
         ? withSubagentGateEnvironment(rest)
         : rest;
+      const runtimeOverrideStatus = inspectCodexAppServerRuntimeOverrides(
+        command,
+        rewritten,
+      );
+      if (runtimeOverrideStatus != null) {
+        recordCodexAppServerRuntimeOverrideAttempt(runtimeOverrideStatus);
+      }
       if (rewritten === args && rewrittenRest === rest) {
         return Reflect.apply(NativeSpawn, this, arguments);
       }
@@ -1474,13 +2093,34 @@
   const patchCodexAvatarOverlayPrewarm = (source) => {
     if (!disablePet) return source;
     let count = 0;
-    const patched = source.replace(
-      /async prewarm\(([$A-Z_a-z][$\w]*)\)\{if\(this\.window!=null\|\|this\.openingWindowPromise!=null\|\|this\.isAppQuitting\)return;let ([$A-Z_a-z][$\w]*)=this\.windowVisibilitySequence,([$A-Z_a-z][$\w]*)=await this\.ensureWindow\(\2\);/g,
-      (match) => {
-        count += 1;
-        return match.replace("{", "{return;");
-      },
-    );
+    let patched = "";
+    let lastIndex = 0;
+    const prewarmMethodPattern = /async\s+prewarm\s*\([^)]*\)\s*\{/g;
+    for (const match of source.matchAll(prewarmMethodPattern)) {
+      const bodyStart = match.index + match[0].length;
+      // The native prewarm body is a flat minified method. Stop at its first
+      // closing brace so an unrelated prewarm method cannot borrow semantic
+      // anchors from a later class in the monolithic bundle.
+      const bodyEnd = source.indexOf("}", bodyStart);
+      if (bodyEnd < 0) continue;
+      const bodyPreview = source.slice(
+        bodyStart,
+        Math.min(bodyEnd, bodyStart + 1600),
+      );
+      if (
+        !bodyPreview.includes("this.windowVisibilitySequence") ||
+        !bodyPreview.includes("this.openingWindowPromise") ||
+        !bodyPreview.includes("this.isAppQuitting") ||
+        !bodyPreview.includes("this.ensureWindow(") ||
+        !bodyPreview.includes("this.positionWindow(")
+      ) {
+        continue;
+      }
+      count += 1;
+      patched += source.slice(lastIndex, bodyStart) + "return;";
+      lastIndex = bodyStart;
+    }
+    patched += source.slice(lastIndex);
     if (count !== 1) {
       throw new Error(`Codey avatar overlay prewarm matches ${count}`);
     }
@@ -1553,7 +2193,7 @@
       win32Process: /\bWin32_Process\b/i.test(source),
       perfProcess:
         /\bWin32_Perf(?:Formatted|Raw)Data_PerfProc_Process\b/i.test(source),
-      powershell: /powershell(?:\.exe)?/i.test(source),
+      powershell: /\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(source),
       workerMessaging:
         /(?:worker_threads|parentPort|postMessage|workerData)/.test(source),
     });
@@ -1586,11 +2226,11 @@
       }
       return specifier.replace(/[?#].*$/, "");
     };
-    const readWorkerSource = (filename, options) => {
+    const describeWorkerSource = (filename, options) => {
       if (options?.eval === true) {
         return {
           cacheKey: null,
-          source: String(filename ?? "").slice(
+          load: () => String(filename ?? "").slice(
             0,
             maximumWmiWorkerSourceBytes,
           ),
@@ -1600,15 +2240,23 @@
       if (/^data:/i.test(specifier)) {
         return {
           cacheKey: null,
-          source: decodeDataWorkerSource(specifier),
+          load: () => decodeDataWorkerSource(specifier),
         };
       }
       const path = workerFilePath(filename);
       if (!path) return null;
+      const fs = process.getBuiltinModule("fs");
+      const stats = fs.statSync(path, { bigint: true });
       return {
-        cacheKey: path,
-        source: process
-          .getBuiltinModule("fs")
+        cacheKey: [
+          path,
+          stats.dev,
+          stats.ino,
+          stats.size,
+          stats.mtimeNs,
+          stats.ctimeNs,
+        ].join("\0"),
+        load: () => fs
           .readFileSync(path, "utf8")
           .slice(0, maximumWmiWorkerSourceBytes),
       };
@@ -1631,44 +2279,39 @@
         return { reason: "worker-option-name", workerName };
       }
 
-      const specifier = workerSpecifierText(filename);
-      const cacheKey =
-        options?.eval === true || /^data:/i.test(specifier)
-          ? null
-          : specifier;
-      if (cacheKey && workerSourceMatchCache.has(cacheKey)) {
-        const cached = workerSourceMatchCache.get(cacheKey);
-        return cached ? { ...cached, workerName } : null;
-      }
-
       try {
-        const loaded = readWorkerSource(filename, options);
-        if (!loaded) {
-          rememberWorkerSourceMatch(cacheKey, null);
-          return null;
+        const descriptor = describeWorkerSource(filename, options);
+        if (!descriptor) return null;
+        if (
+          descriptor.cacheKey &&
+          workerSourceMatchCache.has(descriptor.cacheKey)
+        ) {
+          const cached = workerSourceMatchCache.get(descriptor.cacheKey);
+          windowsWmiSamplerEvidence.lastObservedSourceSignals =
+            cached?.sourceSignals ?? [];
+          return cached ? { ...cached, workerName } : null;
         }
         windowsWmiSamplerEvidence.sourceInspections += 1;
-        const sourceSignals = wmiSnapshotSourceSignals(loaded.source);
-        windowsWmiSamplerEvidence.lastObservedSourceSignals = Object.entries(
+        const sourceSignals = wmiSnapshotSourceSignals(descriptor.load());
+        const matchedSourceSignals = Object.entries(
           sourceSignals,
         )
           .filter(([, matched]) => matched)
           .map(([signal]) => signal);
+        windowsWmiSamplerEvidence.lastObservedSourceSignals =
+          matchedSourceSignals;
         const matched = hasWmiSnapshotSourceSignature(sourceSignals);
         if (matched) {
           windowsWmiSamplerEvidence.sourceSignatureMatches += 1;
-          const match = { reason: "source-signature", workerName };
-          rememberWorkerSourceMatch(loaded.cacheKey, match);
-          if (cacheKey && cacheKey !== loaded.cacheKey) {
-            rememberWorkerSourceMatch(cacheKey, match);
-          }
-          return match;
+          const match = {
+            reason: "source-signature",
+            sourceSignals: matchedSourceSignals,
+          };
+          rememberWorkerSourceMatch(descriptor.cacheKey, match);
+          return { ...match, workerName };
         }
         windowsWmiSamplerEvidence.sourceSignatureMisses += 1;
-        rememberWorkerSourceMatch(loaded.cacheKey, null);
-        if (cacheKey && cacheKey !== loaded.cacheKey) {
-          rememberWorkerSourceMatch(cacheKey, null);
-        }
+        rememberWorkerSourceMatch(descriptor.cacheKey, null);
       } catch {
         windowsWmiSamplerEvidence.sourceReadFailures += 1;
       }
@@ -1734,6 +2377,23 @@
       "__codeyRunWmiSamplerSelfTest",
       {
         value() {
+          const sourceProbe = [
+            'const { parentPort } = require("node:worker_threads");',
+            'const executable = "powershell.exe";',
+            'const command = "Get-CimInstance Win32_Process Win32_PerfFormattedData_PerfProc_Process";',
+            "parentPort.postMessage({ executable, command });",
+          ].join("\n");
+          const recognizersPassed =
+            isKnownWmiSnapshotWorkerName(
+              "child-process-snapshot-worker-codey-self-test.js",
+            ) &&
+            isKnownWmiSnapshotWorkerThreadName({
+              name: "child-process-snapshot",
+            }) &&
+            hasWmiSnapshotSourceSignature(
+              wmiSnapshotSourceSignals(sourceProbe),
+            );
+          if (!recognizersPassed) return false;
           const probe = new CodeyNoInspectWorker(
             "codey-wmi-sampler-self-test.js",
             { [windowsWmiSamplerSelfTest]: true },
@@ -1778,6 +2438,194 @@
     }
   }
 
+  const executionProcessEvidence = {
+    version: 1,
+    snapshotWorkerConfigured: false,
+    snapshots: 0,
+    snapshotFailures: 0,
+    terminationAttempts: 0,
+    terminated: 0,
+    lastError: "",
+  };
+  let executionProcessSnapshotWorkerPath = "";
+  const normalizeExecutionProcessSnapshot = (processes) => {
+    if (!Array.isArray(processes)) return [];
+    const observedAtMs = Date.now();
+    const normalizedInput = processes.flatMap((processInfo) => {
+      const pid = Number(processInfo?.pid);
+      const parentPid = Number(processInfo?.parentPid);
+      if (
+        !Number.isSafeInteger(pid) || pid <= 1 ||
+        !Number.isSafeInteger(parentPid) || parentPid < 0
+      ) return [];
+      const ageSeconds = Number.isFinite(processInfo?.ageSeconds)
+        ? Math.max(0, Number(processInfo.ageSeconds))
+        : null;
+      const providedStartedAtMs = Number(processInfo?.startedAtMs);
+      const startedAtMs = Number.isFinite(providedStartedAtMs)
+        ? providedStartedAtMs
+        : ageSeconds == null
+          ? null
+          : observedAtMs - ageSeconds * 1000;
+      return [{
+        ...processInfo,
+        ageSeconds,
+        command: String(processInfo?.command ?? "").trim(),
+        parentPid,
+        pid,
+        startedAtMs,
+      }];
+    });
+    const byPid = new Map(
+      normalizedInput.map((processInfo) => [processInfo.pid, processInfo]),
+    );
+    const normalized = [];
+    for (const processInfo of byPid.values()) {
+      let cursor = processInfo;
+      let rootChild = processInfo;
+      let relativeDepth = 1;
+      const visited = new Set([processInfo.pid]);
+      while (true) {
+        const parent = byPid.get(cursor.parentPid);
+        if (parent == null || visited.has(parent.pid)) break;
+        if (parent.kind === "app_server") {
+          normalized.push({
+            ...processInfo,
+            appServerPid: parent.pid,
+            depth: relativeDepth,
+            rootChildPid: rootChild.pid,
+          });
+          break;
+        }
+        visited.add(parent.pid);
+        cursor = parent;
+        rootChild = parent;
+        relativeDepth += 1;
+      }
+    }
+    return normalized;
+  };
+  const configureExecutionProcessSnapshotWorker = (mainBundleFilename) => {
+    const path = process.getBuiltinModule("path");
+    executionProcessSnapshotWorkerPath = path.join(
+      path.dirname(mainBundleFilename),
+      "child-process-snapshot-worker.js",
+    );
+    executionProcessEvidence.snapshotWorkerConfigured = true;
+  };
+  const snapshotExecutionProcesses = () => {
+    executionProcessEvidence.snapshots += 1;
+    return new Promise((resolve, reject) => {
+      if (!executionProcessSnapshotWorkerPath) {
+        const error = new Error("Codey execution snapshot worker is not configured");
+        executionProcessEvidence.snapshotFailures += 1;
+        executionProcessEvidence.lastError = error.message;
+        reject(error);
+        return;
+      }
+      let settled = false;
+      let worker = null;
+      let timer = null;
+      const finish = (error, processes) => {
+        if (settled) return;
+        settled = true;
+        if (timer != null) clearTimeout(timer);
+        if (worker != null) {
+          try { Promise.resolve(worker.terminate()).catch(() => {}); } catch {}
+        }
+        if (error != null) {
+          executionProcessEvidence.snapshotFailures += 1;
+          executionProcessEvidence.lastError =
+            error instanceof Error ? error.message.slice(0, 240) : String(error);
+          reject(error);
+          return;
+        }
+        executionProcessEvidence.lastError = "";
+        resolve(normalizeExecutionProcessSnapshot(processes));
+      };
+      try {
+        worker = new NativeWorker(executionProcessSnapshotWorkerPath, {
+          name: "codey-execution-process-reaper",
+          workerData: process.pid,
+        });
+        worker.once("message", (message) => {
+          if (message?.type === "ok" && Array.isArray(message.value)) {
+            finish(null, message.value);
+          } else {
+            finish(new Error(
+              message?.error?.message || "Codey execution snapshot worker failed",
+            ));
+          }
+        });
+        worker.once("error", (error) => finish(error));
+        worker.once("exit", (code) => {
+          if (!settled) {
+            finish(new Error(`Codey execution snapshot worker exited with ${code}`));
+          }
+        });
+        worker.unref?.();
+        timer = setTimeout(() => {
+          finish(new Error("Codey execution snapshot worker timed out"));
+        }, 10 * 1000);
+        timer.unref?.();
+      } catch (error) {
+        finish(error);
+      }
+    });
+  };
+  const isStandaloneNodeReplProcess = (processInfo) => {
+    const command = String(processInfo?.command ?? "");
+    const pid = Number(processInfo?.pid);
+    return (
+      processInfo?.kind === "other" &&
+      Number.isSafeInteger(pid) &&
+      pid === Number(processInfo?.rootChildPid) &&
+      Number(processInfo?.depth) === 1 &&
+      Number(processInfo?.parentPid) === Number(processInfo?.appServerPid) &&
+      /(?:^|[/\\])cua_node[/\\](?:bin[/\\])?node_repl(?:\.exe)?(?:\s|$)/i.test(command)
+    );
+  };
+  const terminateExecutionProcess = async (pid, expectedProcess) => {
+    const normalizedPid = Number(pid);
+    const appServerPid = Number(expectedProcess?.appServerPid);
+    if (
+      !Number.isSafeInteger(normalizedPid) || normalizedPid <= 1 ||
+      normalizedPid === process.pid ||
+      expectedProcess?.pid !== normalizedPid ||
+      !isStandaloneNodeReplProcess(expectedProcess) ||
+      !Number.isSafeInteger(appServerPid) || appServerPid <= 1 ||
+      normalizedPid === appServerPid
+    ) return false;
+    executionProcessEvidence.terminationAttempts += 1;
+    try {
+      process.kill(normalizedPid, "SIGTERM");
+      executionProcessEvidence.terminated += 1;
+      return true;
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        executionProcessEvidence.terminated += 1;
+        return true;
+      }
+      executionProcessEvidence.lastError =
+        error instanceof Error ? error.message.slice(0, 240) : String(error);
+      return false;
+    }
+  };
+  const executionProcessLifecycle = Object.freeze({
+    configure: configureExecutionProcessSnapshotWorker,
+    normalizeSnapshot: normalizeExecutionProcessSnapshot,
+    snapshot: snapshotExecutionProcesses,
+    terminate: terminateExecutionProcess,
+    get status() {
+      return { ...executionProcessEvidence };
+    },
+  });
+  Object.defineProperty(globalThis, "__CODEY_EXECUTION_PROCESS_LIFECYCLE__", {
+    configurable: false,
+    value: executionProcessLifecycle,
+    writable: false,
+  });
+
   const temporaryWebViews = new WeakMap();
   const temporaryWebViewLifecycle = Object.freeze({
     close(owner, partition) {
@@ -1815,8 +2663,10 @@
     completionGraceMs: configuredCompletionGraceMs,
   }) => {
     const activeTurns = new Map();
-    const completionGraceMs = configuredCompletionGraceMs ?? 1000;
+    const completionGraceMs = Math.max(0, configuredCompletionGraceMs ?? 1000);
     const reclaimRetryMs = 60 * 1000;
+    const subagentUnsubscribeRetryMs = 60 * 1000;
+    const maxSubagentUnsubscribeAttempts = 3;
     const terminalTurnStates = new Set([
       "completed",
       "aborted",
@@ -1834,6 +2684,14 @@
       "thread/closed",
       "thread/deleted",
     ]);
+    const successfulThreadUnsubscribeStates = new Set([
+      "unsubscribed",
+      "notSubscribed",
+      "notLoaded",
+    ]);
+    const subagentThreadIds = new Set();
+    const subagentUnsubscribeAttempts = new Map();
+    const subagentUnsubscribeTimers = new Map();
     let cleanupPromise = null;
     let reclaimTimer = null;
     let reclaimBarrier = null;
@@ -1842,12 +2700,38 @@
     let lastTurnActivityAt = Date.now();
     let turnStateVersion = 0;
 
-    const isReclaimable = (processInfo) => {
-      const command = String(processInfo?.command ?? "");
-      // Configured MCP servers belong to the app-server session, not to one
-      // turn. Killing them here forces Codex to reconnect and repeat capability
-      // discovery (including resources/list) after every completed turn.
-      return /(?:^|[/\\])node_repl(?:\.exe)?(?:\s|$)/i.test(command);
+    const processCommandIdentity = (processInfo) => {
+      let command = String(processInfo?.command ?? "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (process.platform === "win32") command = command.toLowerCase();
+      return command;
+    };
+    const sameProcessIdentity = (left, right) => {
+      if (
+        left?.pid !== right?.pid ||
+        left?.parentPid !== right?.parentPid ||
+        left?.appServerPid !== right?.appServerPid ||
+        left?.rootChildPid !== right?.rootChildPid ||
+        left?.kind !== right?.kind ||
+        processCommandIdentity(left) !== processCommandIdentity(right) ||
+        !Number.isFinite(left?.startedAtMs) ||
+        !Number.isFinite(right?.startedAtMs)
+      ) return false;
+      return Math.abs(left.startedAtMs - right.startedAtMs) <= 2500;
+    };
+    const selectReclaimCandidates = (processes) => {
+      const candidates = new Map();
+      for (const processInfo of processes) {
+        if (!isStandaloneNodeReplProcess(processInfo)) continue;
+        const pid = Number(processInfo?.pid);
+        if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) continue;
+        candidates.set(pid, { processInfo, reclaimClass: "node-repl" });
+      }
+      return Array.from(candidates.values()).sort(
+        (left, right) =>
+          (right.processInfo?.depth ?? 0) - (left.processInfo?.depth ?? 0),
+      );
     };
 
     const clearReclaimTimer = () => {
@@ -1925,18 +2809,30 @@
           if (!await waitForReclaimBarrier(expectedVersion, completionGraceMs)) {
             return { reason, reclaimed: 0 };
           }
-          const candidates = processes
-            .filter(isReclaimable)
-            .sort((left, right) => (right.depth ?? 0) - (left.depth ?? 0));
+          let candidates = selectReclaimCandidates(processes);
+          if (candidates.length > 0) {
+            const originalCandidates = new Map(
+              candidates.map((candidate) => [candidate.processInfo.pid, candidate]),
+            );
+            const freshProcesses = await snapshot();
+            if (!isReclaimSafe(expectedVersion)) {
+              return { reason, reclaimed: 0 };
+            }
+            candidates = selectReclaimCandidates(freshProcesses).filter((candidate) => {
+              const original = originalCandidates.get(candidate.processInfo.pid);
+              return original?.reclaimClass === candidate.reclaimClass &&
+                sameProcessIdentity(original.processInfo, candidate.processInfo);
+            });
+          }
           let reclaimed = 0;
           let allKillsSucceeded = true;
-          for (const processInfo of candidates) {
+          for (const { processInfo } of candidates) {
             // Yield once more immediately before each irreversible operation.
             if (!await waitForReclaimBarrier(expectedVersion, 0)) {
               break;
             }
             try {
-              if (await kill(processInfo.pid) !== false) reclaimed += 1;
+              if (await kill(processInfo.pid, processInfo) !== false) reclaimed += 1;
               else allKillsSucceeded = false;
             } catch {
               allKillsSucceeded = false;
@@ -1987,6 +2883,73 @@
       }
       return changed;
     };
+    const hasActiveThreadTurn = (threadId) => {
+      for (const turn of activeTurns.values()) {
+        if (turn.threadId === threadId) return true;
+      }
+      return false;
+    };
+    const clearSubagentUnsubscribeTimer = (threadId) => {
+      const timer = subagentUnsubscribeTimers.get(threadId);
+      if (timer == null) return;
+      subagentUnsubscribeTimers.delete(threadId);
+      clearTimeout(timer);
+    };
+    const forgetSubagentThread = (threadId) => {
+      clearSubagentUnsubscribeTimer(threadId);
+      subagentThreadIds.delete(threadId);
+      subagentUnsubscribeAttempts.delete(threadId);
+    };
+    const markSubagentThread = (value) => {
+      const threadId = normalizedId(value);
+      if (threadId != null) subagentThreadIds.add(threadId);
+      return threadId;
+    };
+    const scheduleSubagentUnsubscribe = (threadId, delayMs = completionGraceMs) => {
+      if (
+        disposed ||
+        !subagentThreadIds.has(threadId) ||
+        hasActiveThreadTurn(threadId)
+      ) return;
+      if (typeof connection?.unsubscribeThread !== "function") {
+        forgetSubagentThread(threadId);
+        return;
+      }
+      clearSubagentUnsubscribeTimer(threadId);
+      const timer = setTimeout(async () => {
+        if (subagentUnsubscribeTimers.get(threadId) !== timer) return;
+        subagentUnsubscribeTimers.delete(threadId);
+        if (
+          disposed ||
+          !subagentThreadIds.has(threadId) ||
+          hasActiveThreadTurn(threadId)
+        ) return;
+        try {
+          const result = await Reflect.apply(
+            connection.unsubscribeThread,
+            connection,
+            [threadId],
+          );
+          const status = result?.status ?? result?.result?.status;
+          if (
+            typeof status === "string" &&
+            !successfulThreadUnsubscribeStates.has(status)
+          ) throw new Error(`Unexpected thread unsubscribe status: ${status}`);
+          if (!disposed) forgetSubagentThread(threadId);
+        } catch {
+          if (disposed) return;
+          const attempts = (subagentUnsubscribeAttempts.get(threadId) ?? 0) + 1;
+          subagentUnsubscribeAttempts.set(threadId, attempts);
+          if (attempts < maxSubagentUnsubscribeAttempts) {
+            scheduleSubagentUnsubscribe(threadId, subagentUnsubscribeRetryMs);
+          } else {
+            forgetSubagentThread(threadId);
+          }
+        }
+      }, Math.max(1, delayMs));
+      timer.unref?.();
+      subagentUnsubscribeTimers.set(threadId, timer);
+    };
 
     let unsubscribe = connection.registerInternalNotificationHandler((notification) => {
       if (disposed) return;
@@ -2005,8 +2968,41 @@
       const terminalTurnState =
         method.startsWith("turn/") && terminalTurnStates.has(method.slice(5));
       const terminalThread = terminalThreadMethods.has(method);
+      const item = params?.item;
+      if (method === "thread/started") {
+        const source = params?.thread?.source;
+        if (
+          (typeof source === "string" && source.toLowerCase().startsWith("subagent")) ||
+          (source != null && typeof source === "object" && "subAgent" in source)
+        ) markSubagentThread(threadId);
+      }
+      if (
+        (method === "item/started" || method === "item/completed") &&
+        item != null && typeof item === "object"
+      ) {
+        if (item.type === "subAgentActivity") {
+          markSubagentThread(item.agentThreadId);
+        }
+        if (item.type === "collabAgentToolCall") {
+          const receiverThreadIds = Array.isArray(item.receiverThreadIds)
+            ? item.receiverThreadIds
+            : [];
+          for (const receiverThreadId of receiverThreadIds) {
+            if (receiverThreadId === threadId) continue;
+            const subagentThreadId = markSubagentThread(receiverThreadId);
+            if (
+              subagentThreadId != null &&
+              method === "item/completed" &&
+              item.tool === "closeAgent" &&
+              item.status === "completed"
+            ) scheduleSubagentUnsubscribe(subagentThreadId);
+          }
+        }
+      }
 
       if (method === "turn/started" && threadId != null && turnId != null) {
+        clearSubagentUnsubscribeTimer(threadId);
+        subagentUnsubscribeAttempts.delete(threadId);
         recordTurnStateChange(now);
         activeTurns.set(turnKey(threadId, turnId), { threadId, turnId, lastSeen: now });
         return;
@@ -2020,6 +3016,15 @@
           changed = activeTurns.delete(turnKey(threadId, turnId));
         } else if (threadId != null) {
           changed = removeThreadTurns(threadId);
+        }
+        if (terminalThread && threadId != null) {
+          forgetSubagentThread(threadId);
+        } else if (
+          threadId != null &&
+          subagentThreadIds.has(threadId) &&
+          !hasActiveThreadTurn(threadId)
+        ) {
+          scheduleSubagentUnsubscribe(threadId);
         }
         // A terminal event that does not match a turn observed by this
         // subscription cannot prove that the connection is globally idle.
@@ -2043,6 +3048,10 @@
       clearReclaimTimer();
       cancelReclaimBarrier();
       activeTurns.clear();
+      for (const timer of subagentUnsubscribeTimers.values()) clearTimeout(timer);
+      subagentUnsubscribeTimers.clear();
+      subagentUnsubscribeAttempts.clear();
+      subagentThreadIds.clear();
       const disposeNotifications = unsubscribe;
       unsubscribe = null;
       try { disposeNotifications?.(); } catch {}
@@ -2055,6 +3064,9 @@
   });
 
   const optionalMainBundlePatchFailures = [];
+  let mainBundleSourcePatchAttempted = false;
+  let mainBundleSourcePatched = false;
+  let mainBundleFilename = "";
   const hasOptionalMainBundlePatchFailure = (name) =>
     optionalMainBundlePatchFailures.some((failure) => failure.name === name);
   const applyOptionalMainBundlePatch = (name, patch, source) => {
@@ -2102,15 +3114,28 @@
   {
     const originalJsExtension = Module._extensions[".js"];
     Module._extensions[".js"] = function codeyMainBundleCompileHook(module, filename) {
-      const isCodexMainBundle =
-        /[\\/]\.vite[\\/]build[\\/]main-[^\\/]+\.js$/i.test(filename);
-      if (!isCodexMainBundle) {
+      const isCodexBuildScript =
+        /[\\/]\.vite[\\/]build[\\/][^\\/]+\.(?:cjs|js)$/i.test(filename);
+      if (!isCodexBuildScript) {
         return Reflect.apply(originalJsExtension, this, arguments);
       }
 
-      try {
       const fs = process.getBuiltinModule("fs");
       let source = fs.readFileSync(filename, "utf8");
+      const hasMainBundleName =
+        /[\\/]\.vite[\\/]build[\\/]main(?:[-.][^\\/]*)?\.(?:cjs|js)$/i.test(filename);
+      const hasMainBundleSignature =
+        source.includes("checkout-webview-presentation-changed") &&
+        source.includes("will-attach-webview") &&
+        source.includes("did-attach-webview");
+      if (!hasMainBundleName && !hasMainBundleSignature) {
+        return Reflect.apply(originalJsExtension, this, arguments);
+      }
+
+      mainBundleSourcePatchAttempted = true;
+      mainBundleFilename = filename.split(/[\\/]/).at(-1)?.slice(0, 160) ?? "";
+      try {
+      executionProcessLifecycle.configure(filename);
       source = applyOptionalMainBundlePatch(
         "desktopCesAnalytics",
         patchCodexMainDesktopAnalytics,
@@ -2198,20 +3223,13 @@
       if (!reaperAnchor) {
         throw new Error("Codey execution reaper completion anchor not found");
       }
-      const reaperTail = source.slice(reaperAnchor.index, reaperAnchor.index + 5000);
-      const processManagerReference =
-        /new [$A-Z_a-z][$\w]*\(([$A-Z_a-z][$\w]*)\.getBrowserSessionRegistry\(\)\)/.exec(reaperTail);
-      if (!processManagerReference) {
-        throw new Error("Codey execution process manager anchor not found");
-      }
       const disposerName = reaperAnchor[1];
       const connectionFactoryName = reaperAnchor[3];
-      const processManagerName = processManagerReference[1];
       const reaperInstall =
         `${disposerName}.add(globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({` +
         `connection:${connectionFactoryName}(),` +
-        `snapshot:()=>${processManagerName}.listProcessManagerSnapshot(),` +
-        `kill:async pid=>(await ${processManagerName}.handlers["child-process-kill"]({pid})).killed` +
+        `snapshot:()=>globalThis.__CODEY_EXECUTION_PROCESS_LIFECYCLE__.snapshot(),` +
+        `kill:(pid,processInfo)=>globalThis.__CODEY_EXECUTION_PROCESS_LIFECYCLE__.terminate(pid,processInfo)` +
         `}));`;
       const reaperOffset = reaperAnchor.index + reaperAnchor[0].length;
       source = source.slice(0, reaperOffset) + reaperInstall + source.slice(reaperOffset);
@@ -2224,6 +3242,7 @@
         !hasOptionalMainBundlePatchFailure("desktopCesAnalytics");
       globalThis.__CODEY_APP_STATE_HEARTBEAT_SOURCE_PATCHED__ =
         !hasOptionalMainBundlePatchFailure("appStateHeartbeat");
+      mainBundleSourcePatched = true;
       module._compile(source, filename);
       } catch (error) {
         recordCodeyPatchFailure("patch_codex_main_bundle", error, { filename });
@@ -2261,24 +3280,12 @@
   let electronProxy = null;
   let electronProtocolProxy = null;
   let electronIpcMainProxy = null;
+  let electronBrowserWindowProxy = null;
   const electronMainRequests = new Set(["electron", "electron/main"]);
   const installNativeIpcMainGuards = (ipcMain) => {
     if (!ipcMain) return false;
     let installed = false;
-    for (const property of ["handle", "handleOnce"]) {
-      const original = ipcMain[property];
-      if (typeof original !== "function") continue;
-      if (original.__codeyMainIpcRegistrationGuard === true) {
-        installed = true;
-        continue;
-      }
-      const guarded = function (channel, handler, ...rest) {
-        return Reflect.apply(original, ipcMain, [
-          channel,
-          mainGitRequestGuard.wrapIpcHandler(handler, channel),
-          ...rest,
-        ]);
-      };
+    const installRegistrationGuard = (property, guarded) => {
       Object.defineProperty(guarded, "__codeyMainIpcRegistrationGuard", {
         value: true,
       });
@@ -2295,6 +3302,80 @@
         } catch {}
       }
       installed ||= ipcMain[property] === guarded;
+    };
+    for (const property of ["handle", "handleOnce"]) {
+      const original = ipcMain[property];
+      if (typeof original !== "function") continue;
+      if (original.__codeyMainIpcRegistrationGuard === true) {
+        installed = true;
+        continue;
+      }
+      const guarded = function (channel, handler, ...rest) {
+        return Reflect.apply(original, ipcMain, [
+          channel,
+          mainGitRequestGuard.wrapIpcHandler(handler, channel),
+          ...rest,
+        ]);
+      };
+      installRegistrationGuard(property, guarded);
+    }
+
+    const eventRegistrations = new Map(
+      ["on", "addListener", "once"].map((property) => [
+        property,
+        ipcMain[property],
+      ]),
+    );
+    const originalOn =
+      eventRegistrations.get("on") ?? eventRegistrations.get("addListener");
+    for (const property of ["on", "addListener"]) {
+      const original = eventRegistrations.get(property);
+      if (typeof original !== "function") continue;
+      if (original.__codeyMainIpcRegistrationGuard === true) {
+        installed = true;
+        continue;
+      }
+      const guarded = function (channel, handler, ...rest) {
+        const effectiveHandler =
+          mainGitRequestGuard.wrapIpcHandler(handler, channel);
+        if (effectiveHandler !== handler) {
+          Object.defineProperty(effectiveHandler, "listener", {
+            configurable: true,
+            value: handler,
+          });
+        }
+        return Reflect.apply(original, ipcMain, [
+          channel,
+          effectiveHandler,
+          ...rest,
+        ]);
+      };
+      installRegistrationGuard(property, guarded);
+    }
+    const originalOnce = eventRegistrations.get("once");
+    if (
+      typeof originalOnce === "function" &&
+      typeof originalOn === "function" &&
+      originalOnce.__codeyMainIpcRegistrationGuard !== true
+    ) {
+      const guardedOnce = function (channel, handler, ...rest) {
+        const effectiveHandler =
+          mainGitRequestGuard.wrapIpcHandler(handler, channel);
+        const onceHandler = function (...args) {
+          ipcMain.removeListener?.(channel, onceHandler);
+          return Reflect.apply(effectiveHandler, this, args);
+        };
+        Object.defineProperty(onceHandler, "listener", {
+          configurable: true,
+          value: handler,
+        });
+        return Reflect.apply(originalOn, ipcMain, [
+          channel,
+          onceHandler,
+          ...rest,
+        ]);
+      };
+      installRegistrationGuard("once", guardedOnce);
     }
     return installed;
   };
@@ -2348,10 +3429,52 @@
             },
           });
     }
+    if (disablePet && typeof loaded.BrowserWindow === "function") {
+      electronBrowserWindowProxy = new Proxy(loaded.BrowserWindow, {
+        construct(target, args, newTarget) {
+          const [options, ...rest] = args;
+          const isHiddenAvatarOverlay =
+            options?.alwaysOnTop === true &&
+            options?.transparent === true &&
+            options?.focusable === false &&
+            options?.frame === false &&
+            options?.skipTaskbar === true &&
+            options?.show === false;
+          const restoreVisibleFrameRate =
+            options?.webPreferences?.backgroundThrottling === false;
+          const effectiveOptions = isHiddenAvatarOverlay
+            ? {
+                ...options,
+                webPreferences: {
+                  ...options.webPreferences,
+                  backgroundThrottling: true,
+                },
+              }
+            : options;
+          const window = Reflect.construct(
+            target,
+            [effectiveOptions, ...rest],
+            newTarget,
+          );
+          if (isHiddenAvatarOverlay && restoreVisibleFrameRate) {
+            window.on?.("show", () => {
+              window.webContents?.setBackgroundThrottling?.(false);
+            });
+            window.on?.("hide", () => {
+              window.webContents?.setBackgroundThrottling?.(true);
+            });
+          }
+          return window;
+        },
+      });
+    }
     electronProxy = new Proxy(loaded, {
       get(target, property, receiver) {
         if (property === "protocol" && electronProtocolProxy) return electronProtocolProxy;
         if (property === "ipcMain" && electronIpcMainProxy) return electronIpcMainProxy;
+        if (property === "BrowserWindow" && electronBrowserWindowProxy) {
+          return electronBrowserWindowProxy;
+        }
         return Reflect.get(target, property, receiver);
       },
     });
@@ -2368,14 +3491,15 @@
     disableWindowsOptimizations,
     disableMicro,
     disablePet,
-    fastCodexStartup,
-    statsigBootstrapTimeoutMs,
     disableAppServerAnalytics: true,
     get disableDesktopCesAnalytics() {
       return !hasOptionalMainBundlePatchFailure("desktopCesAnalytics");
     },
     get appServerAnalyticsPatchCount() {
       return appServerAnalyticsPatchCount;
+    },
+    get appServerRuntimeOverrides() {
+      return { ...appServerRuntimeOverrideEvidence };
     },
     get throttleExternalPluginFocusReconcile() {
       return !hasOptionalMainBundlePatchFailure(
@@ -2391,9 +3515,20 @@
     get optionalMainBundlePatchFailures() {
       return optionalMainBundlePatchFailures.map((failure) => ({ ...failure }));
     },
+    get mainBundleSourcePatch() {
+      return {
+        attempted: mainBundleSourcePatchAttempted,
+        filename: mainBundleFilename,
+        patched: mainBundleSourcePatched,
+      };
+    },
     reclaimExecutionEnvironments: true,
+    get executionResourceCleanup() {
+      return executionProcessLifecycle.status;
+    },
     restoreNativeModelAndSpeedControls: true,
     destroyTemporaryWebViews: true,
+    throttleHiddenAvatarOverlay: disablePet,
     disableWindowsWmiSampler,
     get windowsWmiSampler() {
       return windowsWmiSamplerSnapshot();
@@ -2403,7 +3538,8 @@
     },
   });
   setImmediate(() => {
+    if (requireAppServerRuntimeOverrideValidation) return;
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v22";
+  return "codey-startup-patch-installed-v37";
 })()

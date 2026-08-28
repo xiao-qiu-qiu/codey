@@ -11,8 +11,7 @@ use codey_runtime_core::app_paths::{
 use codey_runtime_core::app_paths::{codex_runtime_version, resolve_codex_runtime_version};
 use codey_runtime_core::launcher::{
     CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
-    build_codex_arguments, build_codex_arguments_for_settings,
-    build_codex_arguments_with_native_menu_inspector, build_codex_command,
+    build_codex_arguments, build_codex_arguments_with_native_menu_inspector, build_codex_command,
     build_codex_command_with_native_menu_inspector, build_macos_cleanup_command,
     build_macos_open_command, build_macos_open_command_with_native_menu_inspector,
     build_packaged_activation, build_packaged_activation_with_native_menu_inspector,
@@ -25,7 +24,7 @@ use codey_runtime_core::launcher::{
 use codey_runtime_core::ports::{
     select_packaged_codex_debug_port_with, select_platform_loopback_port_with,
 };
-use codey_runtime_core::settings::{BackendSettings, RelayProfile, RelayProtocol};
+use codey_runtime_core::settings::{BackendSettings, RelayProfile};
 use codey_runtime_core::status::StatusStore;
 
 #[test]
@@ -249,7 +248,7 @@ fn app_paths_finds_the_runtime_bundled_with_each_desktop_layout() {
 
 #[cfg(unix)]
 #[test]
-fn app_paths_reads_the_runtime_version_from_the_desktop_bundle() {
+fn app_paths_retries_runtime_version_after_a_transient_bundle_launch_failure() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -258,7 +257,12 @@ fn app_paths_reads_the_runtime_version_from_the_desktop_bundle() {
     std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
     std::fs::write(
         &runtime,
-        "#!/bin/sh\nprintf 'codex-cli 0.147.0-alpha.8\\n'\n",
+        "#!/bin/sh\nmarker=\"$0.started\"\n\
+         if [ ! -e \"$marker\" ]; then\n\
+           : > \"$marker\"\n\
+           exit 1\n\
+         fi\n\
+         printf 'codex-cli 0.147.0-alpha.8\\n'\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
@@ -559,46 +563,6 @@ fn launcher_appends_extra_codex_arguments_after_debug_arguments() {
     assert_eq!(command[2], "--remote-allow-origins=http://127.0.0.1:9229");
     assert_eq!(command[3], "--force_high_performance_gpu");
     assert_eq!(command[4], "--enable-features=UseOzonePlatform");
-}
-
-#[test]
-fn launcher_fast_startup_adds_statsig_fast_fail_argument_when_enabled() {
-    let settings = BackendSettings {
-        codex_app_fast_startup: true,
-        ..BackendSettings::default()
-    };
-    let args = build_codex_arguments_for_settings(9229, &settings);
-
-    assert!(args.iter().any(|arg| {
-        arg.starts_with("--host-resolver-rules=")
-            && arg.contains("MAP ab.chatgpt.com 127.0.0.1")
-            && arg.contains("MAP featureassets.org 127.0.0.1")
-            && arg.contains("MAP cloudflare-dns.com 127.0.0.1")
-    }));
-
-    let settings = BackendSettings {
-        codex_app_fast_startup: true,
-        codex_extra_args: vec!["--host-resolver-rules=MAP example.test 127.0.0.1".to_string()],
-        ..BackendSettings::default()
-    };
-    let args = build_codex_arguments_for_settings(9229, &settings);
-    assert_eq!(
-        args.iter()
-            .filter(|arg| arg.starts_with("--host-resolver-rules="))
-            .count(),
-        1
-    );
-
-    let settings = BackendSettings {
-        codex_app_fast_startup: false,
-        ..BackendSettings::default()
-    };
-    let args = build_codex_arguments_for_settings(9229, &settings);
-    assert!(
-        !args
-            .iter()
-            .any(|arg| arg.starts_with("--host-resolver-rules="))
-    );
 }
 
 #[test]
@@ -1343,68 +1307,6 @@ async fn launch_lifecycle_cleans_helper_when_launch_fails_after_helper_started()
             "status:failed",
         ]
     );
-}
-
-#[tokio::test]
-async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
-    let temp = tempfile::tempdir().unwrap();
-    let app_dir = temp.path().join("Codex.app");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
-    let events = Arc::new(Mutex::new(Vec::<String>::new()));
-    let settings = BackendSettings {
-        enhancements_enabled: false,
-        relay_profiles: vec![RelayProfile {
-            id: "relay-chat".to_string(),
-            name: "Chat".to_string(),
-            model: String::new(),
-            base_url: "https://chat-only.example.test/v1".to_string(),
-            upstream_base_url: "https://chat-only.example.test/v1".to_string(),
-            api_key: "sk-test".to_string(),
-            protocol: RelayProtocol::ChatCompletions,
-            relay_mode: codey_runtime_core::settings::RelayMode::MixedApi,
-            official_mix_api_key: false,
-            test_model: String::new(),
-            config_contents: String::new(),
-            auth_contents: String::new(),
-            use_common_config: true,
-            context_selection: codey_runtime_core::settings::RelayContextSelection::default(),
-            context_selection_initialized: false,
-            context_window: String::new(),
-            auto_compact_limit: String::new(),
-            model_insert_mode: codey_runtime_core::settings::RelayModelInsertMode::default(),
-            model_list: String::new(),
-            model_windows: String::new(),
-            user_agent: String::new(),
-            chat_completions_models: Vec::new(),
-        }],
-        active_relay_id: "relay-chat".to_string(),
-        ..BackendSettings::default()
-    };
-    let hooks = FakeHooks::new(events.clone()).with_settings(settings);
-
-    let handle = launch_and_inject_with_hooks(
-        LaunchOptions {
-            app_dir: Some(app_dir),
-            debug_port: 9229,
-            helper_port: 58000,
-            status_store,
-        },
-        &hooks,
-    )
-    .await
-    .unwrap();
-
-    let before_stop = events.lock().unwrap().clone();
-    assert!(before_stop.contains(&"select-helper:58000".to_string()));
-    assert!(before_stop.contains(&"start-helper:57321".to_string()));
-    assert!(!before_stop.contains(&"inject:9229:57321".to_string()));
-
-    handle.wait_for_codex_exit().await.unwrap();
-
-    let after_stop = events.lock().unwrap().clone();
-    assert!(after_stop.contains(&"wait-codex".to_string()));
-    assert!(after_stop.contains(&"shutdown-helper:57321".to_string()));
 }
 
 #[tokio::test]

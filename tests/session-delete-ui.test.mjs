@@ -3,41 +3,18 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const source = readFileSync(new URL("../public/codey-inject.js", import.meta.url), "utf8");
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(tagName = "div", attributes = {}) {
-    this.tagName = tagName.toUpperCase();
-    this.attributes = new Map(Object.entries(attributes));
-    this.children = [];
-    this.dataset = {};
-    this.disabled = false;
-    this.listeners = new Map();
-    this.parentElement = null;
+    super(tagName, { attributes });
     this.innerHTML = "";
-    this.style = {
-      setProperty: (name, value) => {
-        this.style[name] = value;
-      },
-    };
-    this.textContent = "";
   }
 
   append(...children) {
     children.forEach((child) => this.appendChild(child));
-  }
-
-  appendChild(child) {
-    child.remove();
-    child.parentElement = this;
-    this.children.push(child);
-    return child;
-  }
-
-  addEventListener(type, listener) {
-    const listeners = this.listeners.get(type) || [];
-    listeners.push(listener);
-    this.listeners.set(type, listeners);
   }
 
   click() {
@@ -56,11 +33,6 @@ class FakeElement {
 
   focus() {}
 
-  getAttribute(name) {
-    if (name === "id" && this.id) return this.id;
-    return this.attributes.get(name) ?? null;
-  }
-
   getBoundingClientRect() {
     if (this.hasAttribute("data-codey-session-delete")) {
       return { bottom: 124, height: 24, left: 230, right: 254, top: 100, width: 24 };
@@ -78,11 +50,6 @@ class FakeElement {
     return [this.getBoundingClientRect()];
   }
 
-  hasAttribute(name) {
-    if (name === "id" && this.id) return true;
-    return this.attributes.has(name);
-  }
-
   insertAdjacentElement(position, element) {
     assert.ok(position === "beforebegin" || position === "afterend");
     const siblings = this.parentElement.children;
@@ -93,58 +60,13 @@ class FakeElement {
     return element;
   }
 
-  matches(selector) {
-    const tag = selector.match(/^[a-z]+/i)?.[0];
-    if (tag && this.tagName !== tag.toUpperCase()) return false;
-    const attributes = [...selector.matchAll(/\[([^\]=\]]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\]]+)))?\]/g)];
-    if (attributes.length) {
-      return attributes.every((match) => {
-        if (!this.hasAttribute(match[1])) return false;
-        const expected = match[2] ?? match[3] ?? match[4];
-        return expected === undefined || this.getAttribute(match[1]) === expected;
-      });
-    }
-    if (tag) return true;
-    return false;
-  }
-
-  querySelector(selector) {
-    return this.querySelectorAll(selector)[0] || null;
-  }
-
-  querySelectorAll(selector) {
-    const selectors = selector.split(",").map((item) => item.trim());
-    const matches = [];
-    const visit = (node) => {
-      for (const child of node.children) {
-        if (selectors.some((candidate) => child.matches(candidate))) matches.push(child);
-        visit(child);
-      }
-    };
-    visit(this);
-    return matches;
-  }
-
-  remove() {
-    if (!this.parentElement) return;
-    const siblings = this.parentElement.children;
-    const index = siblings.indexOf(this);
-    if (index >= 0) siblings.splice(index, 1);
-    this.parentElement = null;
-  }
-
-  removeAttribute(name) {
-    this.attributes.delete(name);
-  }
-
-  setAttribute(name, value) {
-    this.attributes.set(name, String(value));
-  }
 }
 
 function loadInjection({
   bridge,
+  sessionController,
   dispatcher,
+  now = () => Date.now(),
   tasksSectionHeading = "Tasks",
   tasksSectionLabel = "",
   tasksOptionsLabel = "任务侧边栏选项",
@@ -276,6 +198,7 @@ function loadInjection({
       return 1;
     },
   };
+  if (sessionController) window.__codeyCodexSessionController = sessionController;
   if (dispatcher) {
     window.__codeyCodexSignalDispatcher = async (signal, payload) => {
       dispatcherCalls.push({ signal, payload });
@@ -292,10 +215,16 @@ function loadInjection({
       this.detail = init?.detail;
     }
   }
+  class FakeDate extends Date {
+    static now() {
+      return now();
+    }
+  }
 
   vm.runInNewContext(source, {
     Blob,
     CustomEvent,
+    Date: FakeDate,
     Error,
     HTMLElement: FakeElement,
     MutationObserver,
@@ -415,6 +344,61 @@ test("matches native sidebar actions and deletes after popover confirmation", as
     "已删除会话“待删除会话”",
   );
   assert.equal(runtime.thread.parentElement, runtime.document.body);
+  assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "deleted");
+});
+
+test("uses AppServerManager cache eviction and deletion notification on current Codex", async () => {
+  const events = [];
+  const runtime = loadInjection({
+    bridge: async (path) => {
+      events.push(`bridge:${path}`);
+      if (path === "/session/delete") return { status: "ok", deleted: true };
+      return { status: "ok" };
+    },
+    sessionController: {
+      kind: "manager",
+      async discardConversation(sessionId) {
+        events.push(`manager:discard:${sessionId}`);
+      },
+      async notifyConversationDeleted(sessionId) {
+        events.push(`manager:deleted:${sessionId}`);
+      },
+      async refreshRecentConversations() {
+        events.push("manager:refresh");
+      },
+      async resumeConversation() {},
+    },
+  });
+  events.length = 0;
+
+  runtime.thread.querySelector("[data-codey-session-delete]").click();
+  runtime.document.body
+    .querySelector("[data-codey-session-delete-confirm]")
+    .click();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(events, [
+    "manager:discard:thread-1",
+    "bridge:/session/delete",
+    "manager:deleted:thread-1",
+    "manager:refresh",
+  ]);
+});
+
+test("keeps permanently deleted virtualized sidebar rows hidden for the renderer lifetime", async () => {
+  let nowMs = 1_000;
+  const runtime = loadInjection({ now: () => nowMs });
+
+  runtime.thread.querySelector("[data-codey-session-delete]").click();
+  runtime.document.body
+    .querySelector("[data-codey-session-delete-confirm]")
+    .click();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  nowMs += 24 * 60 * 60 * 1000;
+  runtime.thread.removeAttribute("data-codey-session-delete-state");
+
+  assert.equal(runtime.window.__codeyPruneDeletedSidebarSessions(runtime.thread), true);
   assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "deleted");
 });
 

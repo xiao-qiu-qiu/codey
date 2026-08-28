@@ -1,24 +1,41 @@
 import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
 import type { NotificationChannel } from "./notifications/types";
 
+export type UpstreamProtocol =
+  | "official"
+  | "openaiResponses"
+  | "openaiChatCompletions"
+  | "anthropicMessages";
+
 export type Profile = {
   id: string;
   name: string;
+  shortName: string;
   baseUrl: string;
   apiKey: string;
-  protocol: "responses" | "chatCompletions";
-  ccSwitchProviderId?: string;
-  ccSwitchReadOnly: boolean;
+  upstreamProtocol: UpstreamProtocol;
+  authMode: "officialAccount" | "apiKey";
+  apiKeyConfigured: boolean;
+  clearApiKey?: boolean;
+  sourceProviderId?: string;
+  officialAccount: boolean;
+  supportsRemoteCompaction?: boolean;
+  supportsWebsockets?: boolean;
+  supportsAutoReview?: boolean;
 };
 
 export type PromptOptimizationConfig = {
   enabled: boolean;
+  mode: "codeyRoute" | "manual";
   baseUrl: string;
   apiKey: string;
   apiKeyConfigured: boolean;
   clearApiKey?: boolean;
   model: string;
-  protocol: "responses" | "chatCompletions";
+  upstreamProtocol:
+    | "openaiResponses"
+    | "openaiChatCompletions"
+    | "anthropicMessages";
   instruction: string;
 };
 
@@ -31,6 +48,7 @@ export type SubagentRoleId =
   | "default";
 
 export type SubagentRoleConfig = {
+  enabled: boolean;
   model: string;
   reasoningEffort: string;
 };
@@ -39,6 +57,7 @@ export type Config = {
   settingsRevision: number;
   activeProfileId: string;
   profiles: Profile[];
+  initialRouteImportCompleted: boolean;
   webhook: { channels: NotificationChannel[] };
   promptOptimization: PromptOptimizationConfig;
   codexAppPath: string;
@@ -47,13 +66,12 @@ export type Config = {
   manualThirdPartyModelsByProvider: Record<string, string[]>;
   declaredOfficialModelsByProvider: Record<string, string[]>;
   upstreamModelsByProvider: Record<string, string[]>;
-  defaultModelByProvider: Record<string, string>;
+  defaultModel: string;
   disableTraceLogWrites: boolean;
   protectCrashpadPending: boolean;
   slimCodexPet: boolean;
   gpuLaunchMode: "off" | "disableGpu" | "disableGpuRasterization";
   fastContextTools: boolean;
-  fastCodexStartup: boolean;
   subagentOptimization: boolean;
   subagentGuidance: string;
   subagentModel: string;
@@ -72,10 +90,17 @@ export type OfficialModelState = {
   defaultReasoningEffort: string;
 };
 
+export type ThirdPartyModelState = {
+  slug: string;
+  supportedReasoningEfforts: string[];
+  defaultReasoningEffort: string;
+};
+
 export type ModelState = {
   officialModels: OfficialModelState[];
   officialModelIds: string[];
   thirdPartyModels: string[];
+  thirdPartyModelMetadata?: ThirdPartyModelState[];
   manualThirdPartyModels: string[];
   upstreamModels: string[];
   defaultModel: string;
@@ -100,7 +125,8 @@ export type InjectionScriptStatus = {
   id: string;
   name: string;
   source: "builtin" | "user";
-  status: "effective" | "executed" | "failed" | "unknown";
+  visibility: "feature" | "internal";
+  status: "effective" | "executed" | "inactive" | "failed" | "unknown";
   detail?: string;
   error?: string;
 };
@@ -115,10 +141,17 @@ export type RuntimeStatus = {
   restartInProgress?: boolean;
   activeProfileId?: string;
   activeProfileName?: string;
+  officialAccountAvailable?: boolean;
   startupError?: string;
   codexAppPath?: string;
   maintenance?: Maintenance;
   injectionScripts?: InjectionScriptStatus[];
+  fastContextToolsActive?: boolean;
+  subagentOptimizationActive?: boolean;
+  notificationChannelsActive?: boolean;
+  activeNotificationChannelCount?: number;
+  traceLogWriteProtectionActive?: boolean;
+  crashpadDiskProtectionActive?: boolean;
   traceLogStats?: TraceLogStats;
   crashpadPendingStats?: CrashpadPendingStats;
 };
@@ -139,14 +172,13 @@ export type PluginMarketplaceStatus = {
   message?: string;
 };
 
-export type CcSwitchStatus = {
+export type ProviderStatus = {
   changed: boolean;
   provider: {
     id: string;
     name: string;
     official: boolean;
     baseUrl: string;
-    protocol: "responses" | "chatCompletions";
   };
 };
 
@@ -157,7 +189,12 @@ export type InlineResult = {
 };
 
 export type Confirmation = {
-  action: "clear" | "restart" | "install-update" | "delete-notification-channel";
+  action:
+    | "clear"
+    | "restart"
+    | "install-update"
+    | "delete-notification-channel"
+    | "delete-route";
   title: string;
   description: string;
   confirmLabel: string;

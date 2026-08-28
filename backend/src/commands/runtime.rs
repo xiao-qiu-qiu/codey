@@ -13,15 +13,14 @@ use super::webhooks::{
     start_waiting_webhook_watcher, stop_waiting_webhook_watcher, webhook_watcher_should_run,
 };
 use super::{
-    AppState, RestartInProgressGuard, ScheduledRestart, config_requires_restart,
-    current_update_platform, make_bridge_handler, sync_provider_models_for_launch,
+    AppState, RestartInProgressGuard, ScheduledRestart, config_requires_restart_with_route_status,
+    current_update_platform, make_bridge_handler, prepare_routes_for_current_launch,
+    provider_route_restart_required_for_runtime, sync_provider_models_for_launch,
 };
 use crate::codex_config::codex_home;
 use crate::error_log;
 use crate::launcher::{CodeyRuntime, restore_previous_runtime_state, restore_runtime_config};
 
-pub(crate) const CC_SWITCH_ROUTE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
-pub(crate) const CC_SWITCH_ROUTE_RECOVERY_STABLE_READS: u8 = 2;
 const CODEX_APP_VERSION_CACHE_TTL: Duration = Duration::from_secs(30);
 
 pub(super) struct CodexAppVersionCache {
@@ -32,31 +31,21 @@ pub(super) struct CodexAppVersionCache {
     checked_at: Instant,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RestartTrigger {
-    Manual,
-    RouteChange,
-}
-
-pub(crate) fn is_cc_switch_route_recovery_error(error: &str) -> bool {
-    error.contains("CC Switch") || error.contains("Codex Live")
-}
-
-fn observe_route_recovery_readiness(ready_streak: &mut u8, ready: bool) -> bool {
-    if ready {
-        *ready_streak = ready_streak.saturating_add(1);
-    } else {
-        *ready_streak = 0;
-    }
-    *ready_streak >= CC_SWITCH_ROUTE_RECOVERY_STABLE_READS
-}
-
-pub(crate) async fn cc_switch_route_ready_for_recovery() -> bool {
-    let home = codex_home();
-    matches!(
-        tokio::task::spawn_blocking(move || crate::cc_switch::startup_route_state(&home)).await,
-        Ok(Ok(route)) if !route.takeover.managed || route.takeover.live
-    )
+fn runtime_feature_status_value(
+    fast_context_tools_active: bool,
+    subagent_optimization_active: bool,
+    active_notification_channel_count: usize,
+    trace_log_write_protection_active: bool,
+    crashpad_disk_protection_active: bool,
+) -> Value {
+    json!({
+        "fastContextToolsActive": fast_context_tools_active,
+        "subagentOptimizationActive": subagent_optimization_active,
+        "notificationChannelsActive": active_notification_channel_count > 0,
+        "activeNotificationChannelCount": active_notification_channel_count,
+        "traceLogWriteProtectionActive": trace_log_write_protection_active,
+        "crashpadDiskProtectionActive": crashpad_disk_protection_active,
+    })
 }
 
 pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
@@ -78,9 +67,23 @@ pub(super) async fn runtime_status_with_options(
         Some(runtime) => Some(runtime.applied_subagent_config().await),
         None => None,
     };
+    let crashpad_disk_protection_active = match runtime.as_ref() {
+        Some(runtime) => runtime.crashpad_pending_protection_active().await,
+        None => false,
+    };
     let config = state.config.read().await;
     let profile = config.active_profile();
+    let active_profile_id = profile
+        .as_ref()
+        .map(|profile| profile.id.clone())
+        .unwrap_or_default();
+    let active_profile_name = profile
+        .as_ref()
+        .map(|profile| profile.name.clone())
+        .unwrap_or_default();
     let configured_codex_app_path = config.codex_app_path.clone();
+    let official_account_available = config.official_account_available_this_launch;
+    let official_account_status = config.official_account_status_this_launch;
     let runtime_codex_app_path = runtime
         .as_ref()
         .map(|runtime| runtime.codex_app_path.clone());
@@ -89,24 +92,64 @@ pub(super) async fn runtime_status_with_options(
         applied_models.as_ref(),
         applied_subagent.as_ref(),
     ) {
-        (Some(runtime), Some(applied_models), Some(applied_subagent)) => config_requires_restart(
-            &runtime.applied_config,
-            applied_models,
-            applied_subagent,
-            &config,
-        ),
+        (Some(runtime), Some(applied_models), Some(applied_subagent)) => {
+            config_requires_restart_with_route_status(
+                provider_route_restart_required_for_runtime(runtime, &config),
+                &runtime.applied_config,
+                applied_models,
+                applied_subagent,
+                &config,
+            )
+        }
         _ => false,
+    };
+    let fast_context_tools_active = runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.applied_config.fast_context_tools);
+    let subagent_optimization_active = runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.applied_config.subagent_optimization);
+    let configured_notification_channel_count = config.webhook.enabled_channel_count();
+    let trace_log_write_protection_active = state
+        .trace_log_write_protection_active
+        .load(Ordering::Acquire);
+    drop(config);
+    let notification_watcher_active = runtime.is_some()
+        && state
+            .waiting_watcher_task
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+    let active_notification_channel_count = if notification_watcher_active {
+        configured_notification_channel_count
+    } else {
+        0
     };
     let mut status = json!({
         "running": runtime.is_some(),
         "appVersion": env!("CARGO_PKG_VERSION"),
         "clientPlatform": current_update_platform(),
-        "activeProfileId": profile.as_ref().map(|profile| profile.id.as_str()).unwrap_or_default(),
-        "activeProfileName": profile.as_ref().map(|profile| profile.name.as_str()).unwrap_or_default(),
+        "activeProfileId": active_profile_id,
+        "activeProfileName": active_profile_name,
+        "officialAccountAvailable": official_account_available,
+        "officialAccountStatus": official_account_status,
         "restartRequired": restart_required,
         "restartInProgress": state.restart_in_progress.load(Ordering::Acquire),
     });
-    drop(config);
+    if let (Some(status), Some(feature_status)) = (
+        status.as_object_mut(),
+        runtime_feature_status_value(
+            fast_context_tools_active,
+            subagent_optimization_active,
+            active_notification_channel_count,
+            trace_log_write_protection_active,
+            crashpad_disk_protection_active,
+        )
+        .as_object(),
+    ) {
+        status.extend(feature_status.clone());
+    }
     let codex_app_version =
         codex_app_version_for_status(state, runtime_codex_app_path, configured_codex_app_path)
             .await;
@@ -123,7 +166,7 @@ pub(super) async fn runtime_status_with_options(
     {
         object.insert(
             "availableUpdate".into(),
-            serde_json::to_value(update).unwrap_or(Value::Null),
+            serde_json::to_value(update).expect("update metadata must be JSON-serializable"),
         );
     }
     if let Some(runtime) = runtime.as_ref()
@@ -135,27 +178,30 @@ pub(super) async fn runtime_status_with_options(
         );
         object.insert(
             "maintenance".into(),
-            serde_json::to_value(&runtime.maintenance).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(&runtime.maintenance)
+                .expect("maintenance status must be JSON-serializable"),
         );
         let injection_statuses = if refresh_injection_status {
             runtime.refresh_injection_statuses().await
         } else {
             runtime.injection_statuses.read().await.clone()
         };
-        let injection_statuses = runtime.injection_statuses_for_display(injection_statuses);
         object.insert(
             "injectionScripts".into(),
-            serde_json::to_value(injection_statuses.as_ref()).unwrap_or_else(|_| json!([])),
+            serde_json::to_value(injection_statuses.as_ref())
+                .expect("injection statuses must be JSON-serializable"),
         );
     }
     if let Some(object) = status.as_object_mut() {
         object.insert(
             "traceLogStats".into(),
-            serde_json::to_value(&state.trace_log_stats).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(&state.trace_log_stats)
+                .expect("trace log stats must be JSON-serializable"),
         );
         object.insert(
             "crashpadPendingStats".into(),
-            serde_json::to_value(&state.crashpad_pending_stats).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(&state.crashpad_pending_stats)
+                .expect("Crashpad stats must be JSON-serializable"),
         );
     }
     Ok(status)
@@ -226,15 +272,6 @@ async fn codex_app_version_for_status(
     version
 }
 
-pub(super) async fn refresh_injection_status(state: &Arc<AppState>) -> Result<Value, String> {
-    let runtime = state.runtime.lock().await.clone();
-    let Some(runtime) = runtime else {
-        return Ok(json!([]));
-    };
-    let statuses = runtime.refresh_injection_statuses().await;
-    serde_json::to_value(statuses.as_ref()).map_err(|error| error.to_string())
-}
-
 fn ensure_runtime_can_start(state: &AppState) -> Result<(), String> {
     if state.is_shutting_down() {
         Err("Codey 正在退出，无法启动 Codex".to_string())
@@ -253,24 +290,28 @@ async fn reclaim_initial_session_scan(
     }
 }
 
-fn spawn_route_change_restart(state: Arc<AppState>, route_changed: oneshot::Receiver<()>) {
-    tokio::spawn(async move {
-        if route_changed.await.is_err() || state.is_shutting_down() {
-            return;
+async fn forward_codex_exit_to_codey_shutdown(
+    exit_state: Arc<AppState>,
+    codex_exit: oneshot::Receiver<()>,
+    runtime_generation: u64,
+) {
+    if codex_exit.await.is_err() {
+        return;
+    }
+    while exit_state.restart_in_progress.load(Ordering::Acquire) {
+        let settled = exit_state.restart_settled.notified();
+        if !exit_state.restart_in_progress.load(Ordering::Acquire) {
+            break;
         }
-        eprintln!("检测到 CC Switch Live 路由变化，正在安全重启 Codex");
-        if let Err(error) =
-            schedule_restart_codey_runtime_with_trigger(&state, RestartTrigger::RouteChange).await
-        {
-            error_log::record_failure(
-                "runtime_restart_failed",
-                "restart_after_cc_switch_route_change",
-                error.clone(),
-                json!({}),
-            );
-            eprintln!("CC Switch 路由变化后的自动重启失败：{error}");
-        }
-    });
+        // 兜底超时只是防丢通知，正常路径由 RestartInProgressGuard
+        // 的析构即时唤醒。
+        let _ = tokio::time::timeout(Duration::from_millis(250), settled).await;
+    }
+    // 重启期间旧 Codex 的退出不能关闭新一代运行时；只有当前受控
+    // Codex 的自然退出才联动关闭 Codey 主进程。
+    if exit_state.runtime_generation.load(Ordering::Acquire) == runtime_generation {
+        exit_state.request_shutdown();
+    }
 }
 
 async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, String> {
@@ -281,15 +322,12 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     #[cfg(windows)]
     ensure_windows_codex_app_path(state).await?;
     stop_waiting_webhook_watcher(state).await;
-    crate::subagent_gate::cleanup_stale_state()
-        .map_err(|error| format!("清理上一代 Codey 子代理状态失败：{error:#}"))?;
-    restore_previous_runtime_state(&codex_home())
+    restore_previous_runtime_state(codex_home())
         .await
         .map_err(|error| format!("恢复上次 Codey 临时 Codex 配置失败：{error}"))?;
-    super::sync_cc_switch_state(state)
-        .await
-        .map_err(|error| format!("重新读取当前 Codex 线路失败：{error}"))?;
-    let config = sync_provider_models_for_launch(state).await;
+    prepare_routes_for_current_launch(state).await?;
+    let imported_default_route = super::ensure_default_route_imported(state).await;
+    let config = sync_provider_models_for_launch(state, imported_default_route).await;
     let initial_scan_task = if webhook_watcher_should_run(&config) {
         let initial_event_cache = state
             .recent_session_event_cache
@@ -306,14 +344,20 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
         return Err(error);
     }
     let handler = make_bridge_handler(state);
-    let (runtime, codex_exit, route_changed) =
-        match CodeyRuntime::start(&config, handler, state.crashpad_pending_stats.clone()).await {
-            Ok(started) => started,
-            Err(error) => {
-                reclaim_initial_session_scan(state, initial_scan_task).await;
-                return Err(error.to_string());
-            }
-        };
+    let (runtime, codex_exit) = match CodeyRuntime::start(
+        &config,
+        handler,
+        &state.trace_log_write_protection_active,
+        state.crashpad_pending_stats.clone(),
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(error) => {
+            reclaim_initial_session_scan(state, initial_scan_task).await;
+            return Err(error.to_string());
+        }
+    };
     if state.is_shutting_down() {
         let stop_error = runtime.stop().await.err();
         reclaim_initial_session_scan(state, initial_scan_task).await;
@@ -324,29 +368,16 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     }
     *state.runtime.lock().await = Some(Arc::new(runtime));
     let runtime_generation = state.runtime_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    super::sync_wechat_claw_service(state).await;
     if let Some(initial_scan_task) = initial_scan_task {
         start_waiting_webhook_watcher(state, initial_scan_task).await;
     }
-    if let Some(route_changed) = route_changed {
-        spawn_route_change_restart(Arc::clone(state), route_changed);
-    }
     let exit_state = Arc::clone(state);
-    tokio::spawn(async move {
-        if codex_exit.await.is_ok() {
-            while exit_state.restart_in_progress.load(Ordering::Acquire) {
-                let settled = exit_state.restart_settled.notified();
-                if !exit_state.restart_in_progress.load(Ordering::Acquire) {
-                    break;
-                }
-                // 兜底超时只是防丢通知，正常路径由 RestartInProgressGuard
-                // 的析构即时唤醒。
-                let _ = tokio::time::timeout(Duration::from_millis(250), settled).await;
-            }
-            if exit_state.runtime_generation.load(Ordering::Acquire) == runtime_generation {
-                exit_state.request_shutdown();
-            }
-        }
-    });
+    tokio::spawn(forward_codex_exit_to_codey_shutdown(
+        exit_state,
+        codex_exit,
+        runtime_generation,
+    ));
     Ok(json!({"status":"running"}))
 }
 
@@ -361,32 +392,66 @@ pub async fn launch_codey_runtime(state: &Arc<AppState>) -> Result<Value, String
     let result = launch_codey_inner(state).await;
     *state.startup_error.write().await = result.as_ref().err().cloned();
     if let Err(error) = &result {
-        let waiting_for_route_recovery = is_cc_switch_route_recovery_error(error);
         error_log::record_failure_with_metadata(
             "runtime_start_failed",
             "launch_codey_runtime",
             error.clone(),
             error_log::FailureMetadata {
                 stage: Some("startup.runtime".to_string()),
-                recoverable: Some(waiting_for_route_recovery),
+                recoverable: Some(false),
             },
-            json!({
-                "restart": false,
-                "waitingForRouteRecovery": waiting_for_route_recovery,
-            }),
+            runtime_start_failure_context(state, false, error).await,
         );
     }
     result
 }
 
-pub async fn schedule_restart_codey_runtime(state: &Arc<AppState>) -> Result<Value, String> {
-    schedule_restart_codey_runtime_with_trigger(state, RestartTrigger::Manual).await
+async fn runtime_start_failure_context(state: &Arc<AppState>, restart: bool, error: &str) -> Value {
+    let config = state.config.read().await;
+    let active_profile = config.active_profile();
+    let official_profile_count = config
+        .profiles
+        .iter()
+        .filter(|profile| profile.official_account)
+        .count();
+    let third_party_profile_count = config
+        .profiles
+        .iter()
+        .filter(|profile| !profile.official_account && !profile.is_unconfigured_default())
+        .count();
+    json!({
+        "restart": restart,
+        "errorClass": classify_runtime_start_error(error),
+        "codexHome": codex_home().to_string_lossy(),
+        "codeyConfigPath": state.store.path().to_string_lossy(),
+        "configuredCodexAppPath": config.codex_app_path.as_str(),
+        "activeProfileId": active_profile.as_ref().map(|profile| profile.id.clone()),
+        "activeProfileName": active_profile.as_ref().map(|profile| profile.name.clone()),
+        "activeProfileOfficial": active_profile.as_ref().map(|profile| profile.official_account),
+        "profileCount": config.profiles.len(),
+        "officialProfileCount": official_profile_count,
+        "thirdPartyProfileCount": third_party_profile_count,
+        "hasThirdPartyRoute": config.has_third_party_route(),
+        "routerRequiresOpenaiAuth": config.router_requires_openai_auth(),
+        "officialAccountAvailable": config.official_account_available_this_launch,
+        "officialAccountStatus": config.official_account_status_this_launch,
+        "credentialsIncluded": false,
+    })
 }
 
-async fn schedule_restart_codey_runtime_with_trigger(
-    state: &Arc<AppState>,
-    trigger: RestartTrigger,
-) -> Result<Value, String> {
+fn classify_runtime_start_error(error: &str) -> &'static str {
+    if error.contains("认证诊断：") || error.contains("没有可用的官方账号登录") {
+        "official_auth_unavailable"
+    } else if error.contains("Codex App") || error.contains("codex.exe") {
+        "codex_app_unavailable"
+    } else if error.contains("Provider") || error.contains("线路") {
+        "provider_route_invalid"
+    } else {
+        "runtime_start_failed"
+    }
+}
+
+pub async fn schedule_restart_codey_runtime(state: &Arc<AppState>) -> Result<Value, String> {
     let mut restart_task = state.restart_task.lock().await;
     ensure_runtime_can_start(state)?;
     if state.restart_in_progress.swap(true, Ordering::AcqRel) {
@@ -399,38 +464,14 @@ async fn schedule_restart_codey_runtime_with_trigger(
         let _restart_guard = RestartInProgressGuard {
             state: Arc::clone(&restart_state),
         };
-        run_scheduled_restart(restart_state, cancel_rx, trigger).await;
+        run_scheduled_restart(restart_state, cancel_rx).await;
     });
     *restart_task = Some(ScheduledRestart { cancel, task });
 
     Ok(json!({"status":"restarting"}))
 }
 
-async fn wait_for_cc_switch_route_recovery(
-    state: &AppState,
-    cancel: &mut oneshot::Receiver<()>,
-) -> bool {
-    let mut ready_streak = 0;
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(CC_SWITCH_ROUTE_RECOVERY_INTERVAL) => {}
-            _ = &mut *cancel => return false,
-        }
-        if state.is_shutting_down() {
-            return false;
-        }
-        let ready = cc_switch_route_ready_for_recovery().await;
-        if observe_route_recovery_readiness(&mut ready_streak, ready) {
-            return true;
-        }
-    }
-}
-
-async fn run_scheduled_restart(
-    restart_state: Arc<AppState>,
-    mut cancel: oneshot::Receiver<()>,
-    trigger: RestartTrigger,
-) {
+async fn run_scheduled_restart(restart_state: Arc<AppState>, mut cancel: oneshot::Receiver<()>) {
     tokio::select! {
         // The request originates inside the Codex renderer. Let the bridge
         // deliver its response before stopping the renderer that owns it.
@@ -441,6 +482,8 @@ async fn run_scheduled_restart(
         return;
     }
 
+    #[cfg(test)]
+    restart_state.restart_operation_pending.notify_one();
     let _operation = tokio::select! {
         operation = restart_state.runtime_operation.lock() => operation,
         _ = &mut cancel => return,
@@ -466,35 +509,27 @@ async fn run_scheduled_restart(
         return;
     }
 
-    loop {
-        let launch = launch_codey_inner_locked(&restart_state).await;
-        *restart_state.startup_error.write().await = launch.as_ref().err().cloned();
-        let Err(error) = launch else {
-            return;
-        };
-        error_log::record_failure(
-            "runtime_restart_failed",
-            "launch_runtime_after_restart",
-            error.clone(),
-            json!({
-                "routeChange": trigger == RestartTrigger::RouteChange,
-                "waitingForRouteRecovery": is_cc_switch_route_recovery_error(&error),
-            }),
-        );
-        eprintln!("Codey 自动重启 Codex 失败：{error}");
-        if !is_cc_switch_route_recovery_error(&error) {
-            restart_state.request_shutdown();
-            return;
-        }
-        eprintln!("CC Switch 路由尚未稳定；Codey 将保持运行并等待路由恢复");
-        if !wait_for_cc_switch_route_recovery(&restart_state, &mut cancel).await {
-            return;
-        }
-        eprintln!("CC Switch 路由已稳定，正在重新启动 Codex");
-    }
+    let launch = launch_codey_inner_locked(&restart_state).await;
+    *restart_state.startup_error.write().await = launch.as_ref().err().cloned();
+    let Err(error) = launch else {
+        return;
+    };
+    error_log::record_failure_with_metadata(
+        "runtime_restart_failed",
+        "launch_runtime_after_restart",
+        error.clone(),
+        error_log::FailureMetadata {
+            stage: Some("startup.runtime".to_string()),
+            recoverable: Some(false),
+        },
+        runtime_start_failure_context(&restart_state, true, &error).await,
+    );
+    eprintln!("Codey 自动重启 Codex 失败：{error}");
+    restart_state.request_shutdown();
 }
 
 async fn stop_codey_runtime_locked(state: &Arc<AppState>) -> Result<Value, String> {
+    super::stop_wechat_claw_service(state).await;
     stop_waiting_webhook_watcher(state).await;
     let runtime = state.runtime.lock().await.take();
     if let Some(runtime) = runtime {
@@ -503,7 +538,7 @@ async fn stop_codey_runtime_locked(state: &Arc<AppState>) -> Result<Value, Strin
             return Err(error.to_string());
         }
     } else {
-        restore_runtime_config(&codex_home())
+        restore_runtime_config(codex_home())
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -535,33 +570,129 @@ pub async fn begin_shutdown(state: &Arc<AppState>) {
 }
 
 #[cfg(test)]
-mod route_recovery_tests {
+mod tests {
+    use std::sync::{Arc, atomic::Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+
     use super::{
-        CC_SWITCH_ROUTE_RECOVERY_STABLE_READS, is_cc_switch_route_recovery_error,
-        observe_route_recovery_readiness,
+        classify_runtime_start_error, forward_codex_exit_to_codey_shutdown,
+        runtime_feature_status_value, runtime_start_failure_context,
     };
+    use crate::commands::{AppShutdownReason, AppState};
+    use crate::config::{CodeyConfig, ProviderProfile};
 
     #[test]
-    fn classifies_cc_switch_route_startup_errors_as_recoverable() {
-        assert!(is_cc_switch_route_recovery_error(
-            "检测到 CC Switch 已开启 Codex 路由，但当前 Live 配置未处于接管状态"
-        ));
-        assert!(is_cc_switch_route_recovery_error(
-            "解析 Codex Live 配置失败"
-        ));
-        assert!(!is_cc_switch_route_recovery_error(
-            "连接 Codex Renderer 失败"
-        ));
+    fn runtime_feature_status_has_a_stable_public_json_contract() {
+        assert_eq!(
+            runtime_feature_status_value(true, false, 2, true, false),
+            serde_json::json!({
+                "fastContextToolsActive": true,
+                "subagentOptimizationActive": false,
+                "notificationChannelsActive": true,
+                "activeNotificationChannelCount": 2,
+                "traceLogWriteProtectionActive": true,
+                "crashpadDiskProtectionActive": false,
+            })
+        );
+        assert_eq!(
+            runtime_feature_status_value(false, true, 0, false, true)["notificationChannelsActive"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_start_failure_context_is_complete_and_does_not_include_credentials() {
+        let state = Arc::new(AppState::default());
+        let mut relay = ProviderProfile::new("Relay");
+        relay.id = "relay".into();
+        relay.base_url = "https://relay.example/v1".into();
+        relay.api_key = "sk-private-runtime-key".into();
+        relay.normalize();
+        *state.config.write().await = CodeyConfig {
+            active_profile_id: relay.id.clone(),
+            profiles: vec![relay],
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        let context = runtime_start_failure_context(
+            &state,
+            true,
+            "当前 Codex 没有可用的官方账号登录。认证诊断：not logged in",
+        )
+        .await;
+        let serialized = serde_json::to_string(&context).unwrap();
+
+        assert_eq!(context["restart"], true);
+        assert_eq!(context["errorClass"], "official_auth_unavailable");
+        assert_eq!(context["activeProfileId"], "relay");
+        assert_eq!(context["thirdPartyProfileCount"], 1);
+        assert_eq!(context["credentialsIncluded"], false);
+        assert!(context["codexHome"].is_string());
+        assert!(context["codeyConfigPath"].is_string());
+        assert!(!serialized.contains("sk-private-runtime-key"));
+        assert!(!serialized.contains("relay.example"));
     }
 
     #[test]
-    fn route_recovery_requires_consecutive_ready_observations() {
-        let mut ready_streak = 0;
-        for _ in 1..CC_SWITCH_ROUTE_RECOVERY_STABLE_READS {
-            assert!(!observe_route_recovery_readiness(&mut ready_streak, true));
-        }
-        assert!(observe_route_recovery_readiness(&mut ready_streak, true));
-        assert!(!observe_route_recovery_readiness(&mut ready_streak, false));
-        assert_eq!(ready_streak, 0);
+    fn runtime_start_error_classification_is_stable() {
+        assert_eq!(
+            classify_runtime_start_error("没有可用的官方账号登录"),
+            "official_auth_unavailable"
+        );
+        assert_eq!(
+            classify_runtime_start_error("找不到 Codex App"),
+            "codex_app_unavailable"
+        );
+        assert_eq!(
+            classify_runtime_start_error("线路配置无效"),
+            "provider_route_invalid"
+        );
+        assert_eq!(classify_runtime_start_error("boom"), "runtime_start_failed");
+    }
+
+    #[tokio::test]
+    async fn current_codex_exit_requests_codey_shutdown() {
+        let state = Arc::new(AppState::default());
+        state.runtime_generation.store(7, Ordering::Release);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let watcher = tokio::spawn(forward_codex_exit_to_codey_shutdown(
+            Arc::clone(&state),
+            exit_rx,
+            7,
+        ));
+
+        exit_tx.send(()).expect("signal Codex exit");
+        let reason = tokio::time::timeout(Duration::from_secs(1), state.wait_for_shutdown())
+            .await
+            .expect("Codey shutdown was not requested after Codex exited");
+        watcher.await.expect("Codex exit forwarding task failed");
+
+        assert_eq!(reason, AppShutdownReason::CodexExited);
+        assert!(state.is_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn stale_codex_exit_does_not_shutdown_a_new_runtime_generation() {
+        let state = Arc::new(AppState::default());
+        state.runtime_generation.store(8, Ordering::Release);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let watcher = tokio::spawn(forward_codex_exit_to_codey_shutdown(
+            Arc::clone(&state),
+            exit_rx,
+            7,
+        ));
+
+        exit_tx.send(()).expect("signal stale Codex exit");
+        watcher.await.expect("Codex exit forwarding task failed");
+
+        assert!(!state.is_shutting_down());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), state.wait_for_shutdown())
+                .await
+                .is_err()
+        );
     }
 }

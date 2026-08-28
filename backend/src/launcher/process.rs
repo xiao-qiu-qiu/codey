@@ -143,7 +143,6 @@ pub(super) async fn spawn_codex(
     app_dir: &std::path::Path,
     debug_port: u16,
     disable_codex_pet: bool,
-    fast_codex_startup: bool,
     subagent_gate_active: bool,
     gpu_launch_mode: GpuLaunchMode,
     runtime_config_overrides: &[String],
@@ -151,17 +150,16 @@ pub(super) async fn spawn_codex(
     #[cfg(any(windows, target_os = "macos"))]
     let patch_options = crate::codex_startup_patch::PatchOptions {
         disable_pet: disable_codex_pet,
-        fast_codex_startup,
         subagent_gate_active,
     };
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (
         disable_codex_pet,
-        fast_codex_startup,
         subagent_gate_active,
         runtime_config_overrides,
     );
-    let runtime_arguments = codex_runtime_arguments(gpu_launch_mode, !cfg!(target_os = "macos"));
+    let runtime_arguments =
+        codex_runtime_arguments(gpu_launch_mode, !cfg!(target_os = "macos"), cfg!(windows));
 
     #[cfg(windows)]
     {
@@ -186,6 +184,7 @@ pub(super) async fn spawn_codex(
             inspector_port,
             patch_options,
             runtime_config_overrides,
+            !runtime_config_overrides.is_empty(),
         )
         .await
         {
@@ -205,7 +204,7 @@ pub(super) async fn spawn_codex(
                         "inspectorPort": inspector_port,
                         "processId": spawned.process_id,
                         "disablePet": patch_options.disable_pet,
-                        "fastCodexStartup": patch_options.fast_codex_startup,
+                        "runtimeConfigOverrideCount": runtime_config_overrides.len(),
                     }),
                 );
                 if let Err(cleanup_error) = stop_windows_spawned_codex(&mut spawned, app_dir).await
@@ -214,7 +213,12 @@ pub(super) async fn spawn_codex(
                         "Codex 启动补丁未能安装，且无法安全清理暂停的启动进程：{patch_error}；{cleanup_error:#}"
                     );
                 }
-                if !runtime_config_overrides.is_empty() || subagent_gate_active {
+                if !runtime_config_overrides.is_empty() {
+                    anyhow::bail!(
+                        "Codex 启动补丁未能确认 app-server 运行时覆盖；为避免丢失 Codey 运行时约束，已停止 Codex。当前 Codex 版本可能与 Codey 不兼容：{patch_error}"
+                    );
+                }
+                if subagent_gate_active {
                     anyhow::bail!(
                         "Codex 启动补丁未能安装；为避免丢失 Codey 运行时约束，已停止 Codex：{patch_error}"
                     );
@@ -223,7 +227,7 @@ pub(super) async fn spawn_codex(
                     Ok(mut fallback) => {
                         fallback.performance_status = "degraded".to_string();
                         fallback.performance_detail =
-                            "启动补丁未能安装，已自动以兼容模式启动；启动优化将在下次启动时重试"
+                            "启动补丁未能安装，已自动以兼容模式启动；本次会话的 Windows Git、WMI 与隐藏宠物窗口优化未生效，下次启动将重试"
                                 .to_string();
                         error_log::record_failure(
                             "patch_degraded",
@@ -273,6 +277,7 @@ pub(super) async fn spawn_codex(
             inspector_port,
             patch_options,
             runtime_config_overrides,
+            !runtime_config_overrides.is_empty(),
         )
         .await
         {
@@ -292,7 +297,6 @@ pub(super) async fn spawn_codex(
                         "processId": spawned.process_id,
                         "processGroupId": spawned.process_group_id,
                         "disablePet": patch_options.disable_pet,
-                        "fastCodexStartup": patch_options.fast_codex_startup,
                     }),
                 );
                 if let Err(stop_error) = stop_macos_codex(
@@ -398,8 +402,16 @@ pub(super) fn gpu_launch_arguments(
 pub(super) fn codex_runtime_arguments(
     gpu_launch_mode: GpuLaunchMode,
     gpu_arguments_enabled_for_platform: bool,
+    disable_background_ecoqos: bool,
 ) -> Vec<String> {
     let mut arguments = vec![DEFAULT_CHINESE_LOCALE_ARGUMENT.to_string()];
+    if disable_background_ecoqos {
+        // Chromium marks backgrounded renderer processes as EcoQoS on Windows
+        // 11. During Codex startup that can throttle the renderer which owns the
+        // app:// module patch and CDP bridge, so keep the controlled process tree
+        // on the normal scheduler policy.
+        arguments.push(DISABLE_BACKGROUND_ECOQOS_ARGUMENT.to_string());
+    }
     arguments.extend(gpu_launch_arguments(
         gpu_launch_mode,
         gpu_arguments_enabled_for_platform,

@@ -6,6 +6,13 @@ use crate::config::{
 };
 use crate::model_catalog;
 use crate::model_id;
+#[cfg(test)]
+use crate::subagent::rules::{RoleAccess, RolePolicy};
+
+#[cfg(test)]
+pub(crate) fn role_policy(role: &str) -> Option<RolePolicy> {
+    crate::subagent::rules::embedded().role_policy(role)
+}
 
 pub(crate) fn reconcile_for_current_provider(
     config: &mut CodeyConfig,
@@ -13,11 +20,19 @@ pub(crate) fn reconcile_for_current_provider(
     official_provider: bool,
 ) {
     prepare_subagent_roles(config);
+    let selected_models = if official_provider {
+        config.selected_models().to_vec()
+    } else {
+        config
+            .current_provider_id()
+            .map(|provider_id| config.enabled_route_models(provider_id))
+            .unwrap_or_default()
+    };
     let state = model_catalog::selection_state_with_manual_models(
         codex_home,
         official_provider,
         config.upstream_models_snapshot(),
-        config.selected_models(),
+        &selected_models,
         config.manual_third_party_models(),
         Some(&config.subagent_model),
     )
@@ -30,7 +45,13 @@ pub(crate) fn reconcile_with_model_state(
     state: Option<&model_catalog::ModelSelectionState>,
 ) {
     prepare_subagent_roles(config);
+    let route_aliases = config
+        .runtime_model_targets()
+        .into_iter()
+        .map(|target| target.alias)
+        .collect::<Vec<_>>();
     let Some(state) = state else {
+        canonicalize_route_aliases(&mut config.subagent_roles, &route_aliases);
         sync_legacy_default(config);
         return;
     };
@@ -42,20 +63,19 @@ pub(crate) fn reconcile_with_model_state(
     }
     for selection in config.subagent_roles.values_mut() {
         let requested = selection.model.trim();
-        let model = if config.subagent_optimization {
-            state
-                .available_subagent_model(requested)
-                .or_else(|| state.available_subagent_model(DEFAULT_SUBAGENT_MODEL))
-                .or_else(|| state.available_subagent_model(&state.default_model))
-                .or_else(|| state.first_available_subagent_model())
-        } else {
-            state
-                .available_model(requested)
-                .or_else(|| state.available_model(&state.default_model))
-                .or_else(|| state.available_model(DEFAULT_SUBAGENT_MODEL))
-                .or_else(|| state.first_available_model())
-        };
-        let Some(model) = model else {
+        if let Some(alias) = route_aliases
+            .iter()
+            .find(|alias| model_id::equal(alias, requested))
+        {
+            selection.model.clone_from(alias);
+            continue;
+        }
+        let Some(model) = state
+            .available_model(requested)
+            .or_else(|| state.available_model(&state.default_model))
+            .or_else(|| state.available_model(DEFAULT_SUBAGENT_MODEL))
+            .or_else(|| state.first_available_model())
+        else {
             continue;
         };
         let model = model.to_string();
@@ -64,6 +84,20 @@ pub(crate) fn reconcile_with_model_state(
         selection.model = model;
     }
     sync_legacy_default(config);
+}
+
+fn canonicalize_route_aliases(
+    roles: &mut std::collections::BTreeMap<String, SubagentRoleConfig>,
+    aliases: &[String],
+) {
+    for selection in roles.values_mut() {
+        if let Some(alias) = aliases
+            .iter()
+            .find(|alias| model_id::equal(alias, selection.model.trim()))
+        {
+            selection.model.clone_from(alias);
+        }
+    }
 }
 
 fn prepare_subagent_roles(config: &mut CodeyConfig) {
@@ -141,10 +175,35 @@ pub(crate) fn reasoning_effort_for_model(
         .third_party_models
         .iter()
         .any(|candidate| model_id::equal(candidate, model))
-        && model_catalog::THIRD_PARTY_REASONING_EFFORTS
-            .contains(&preferred_reasoning_effort.as_str())
     {
-        return preferred_reasoning_effort;
+        let metadata = state
+            .third_party_model_metadata
+            .iter()
+            .find(|candidate| model_id::equal(&candidate.slug, model));
+        let fallback_efforts = model_catalog::THIRD_PARTY_REASONING_EFFORTS.to_vec();
+        let supported_reasoning_efforts = metadata
+            .map(|metadata| {
+                metadata
+                    .supported_reasoning_efforts
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or(fallback_efforts);
+        if supported_reasoning_efforts
+            .iter()
+            .any(|effort| effort.eq_ignore_ascii_case(&preferred_reasoning_effort))
+        {
+            return preferred_reasoning_effort;
+        }
+        if supported_reasoning_efforts.contains(&DEFAULT_SUBAGENT_REASONING_EFFORT) {
+            return DEFAULT_SUBAGENT_REASONING_EFFORT.to_string();
+        }
+        if let Some(metadata) = metadata
+            && !metadata.default_reasoning_effort.trim().is_empty()
+        {
+            return metadata.default_reasoning_effort.clone();
+        }
     }
     DEFAULT_SUBAGENT_REASONING_EFFORT.to_string()
 }
@@ -153,6 +212,32 @@ pub(crate) fn reasoning_effort_for_model(
 mod tests {
     use super::*;
     use crate::config::ProviderProfile;
+
+    #[test]
+    fn role_policies_keep_access_and_visual_capabilities_explicit() {
+        assert_eq!(
+            role_policy(crate::config::SUBAGENT_ROLE_QUICK_SCAN),
+            Some(RolePolicy {
+                access: RoleAccess::ReadOnly,
+                visual: false,
+            })
+        );
+        assert_eq!(
+            role_policy(crate::config::SUBAGENT_ROLE_WORKER),
+            Some(RolePolicy {
+                access: RoleAccess::Write,
+                visual: false,
+            })
+        );
+        assert_eq!(
+            role_policy(crate::config::SUBAGENT_ROLE_VISUAL_WORKER),
+            Some(RolePolicy {
+                access: RoleAccess::Write,
+                visual: true,
+            })
+        );
+        assert_eq!(role_policy("unknown"), None);
+    }
 
     fn model_state() -> model_catalog::ModelSelectionState {
         model_catalog::ModelSelectionState {
@@ -176,7 +261,7 @@ mod tests {
     fn route_config(provider_id: &str) -> CodeyConfig {
         let mut profile = ProviderProfile::new("Route");
         profile.id = provider_id.to_string();
-        profile.cc_switch_read_only = false;
+        profile.official_account = false;
         CodeyConfig {
             active_profile_id: provider_id.to_string(),
             profiles: vec![profile],
@@ -206,9 +291,9 @@ mod tests {
             },
             Case {
                 upstream_models: &["gpt-5.6-sol"],
-                saved_effort: "xhigh",
+                saved_effort: "ultra",
                 expected_model: "gpt-5.6-sol",
-                expected_effort: "xhigh",
+                expected_effort: "ultra",
                 optimization_enabled: true,
             },
             Case {
@@ -221,7 +306,7 @@ mod tests {
             Case {
                 upstream_models: &["provider-custom-model"],
                 saved_effort: "high",
-                expected_model: "provider-old-model",
+                expected_model: "provider-custom-model",
                 expected_effort: "high",
                 optimization_enabled: false,
             },
@@ -232,6 +317,13 @@ mod tests {
             let mut config = route_config("route-b");
             config.subagent_reasoning_effort = case.saved_effort.into();
             config.upstream_models_by_provider.insert(
+                "route-b".into(),
+                case.upstream_models
+                    .iter()
+                    .map(|model| (*model).to_string())
+                    .collect(),
+            );
+            config.selected_models_by_provider.insert(
                 "route-b".into(),
                 case.upstream_models
                     .iter()
@@ -329,6 +421,72 @@ mod tests {
     }
 
     #[test]
+    fn route_qualified_model_is_preserved_outside_the_current_route_state() {
+        let mut provider_a = ProviderProfile::new("A");
+        provider_a.id = "route-a".into();
+        let mut provider_b = ProviderProfile::new("B");
+        provider_b.id = "route-b".into();
+        let mut config = CodeyConfig {
+            active_profile_id: provider_a.id.clone(),
+            profiles: vec![provider_a, provider_b],
+            selected_models_by_provider: std::collections::BTreeMap::from([
+                ("route-a".into(), vec![DEFAULT_SUBAGENT_MODEL.into()]),
+                ("route-b".into(), vec!["provider-special".into()]),
+            ]),
+            subagent_optimization: true,
+            subagent_model: "route-b/provider-special".into(),
+            subagent_reasoning_effort: "high".into(),
+            subagent_roles: uniform_subagent_roles("route-b/provider-special", "high"),
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        reconcile_with_model_state(&mut config, Some(&model_state()));
+
+        assert_eq!(config.subagent_model, "route-b/provider-special");
+        assert!(
+            config
+                .subagent_roles
+                .values()
+                .all(|selection| selection.model == "route-b/provider-special")
+        );
+    }
+
+    #[test]
+    fn incompatible_provider_fallback_remains_global_across_route_changes() {
+        let mut provider_a = ProviderProfile::new("A");
+        provider_a.id = "route-a".into();
+        let mut provider_b = ProviderProfile::new("B");
+        provider_b.id = "route-b".into();
+        let mut config = CodeyConfig {
+            active_profile_id: provider_a.id.clone(),
+            profiles: vec![provider_a, provider_b],
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-luna".into(),
+            subagent_reasoning_effort: "high".into(),
+            subagent_roles: uniform_subagent_roles("gpt-5.6-luna", "high"),
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        config.active_profile_id = "route-b".into();
+        let mut route_b_models = model_state();
+        route_b_models
+            .official_models
+            .retain(|model| model.slug == DEFAULT_SUBAGENT_MODEL);
+        route_b_models.default_model = DEFAULT_SUBAGENT_MODEL.into();
+        reconcile_with_model_state(&mut config, Some(&route_b_models));
+        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
+
+        config.active_profile_id = "route-a".into();
+        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(config.subagent_reasoning_effort, "high");
+
+        config.active_profile_id = "route-b".into();
+        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
+    }
+
+    #[test]
     fn unchanged_provider_only_reconciles_an_unavailable_model() {
         let available_home = tempfile::tempdir().unwrap();
         let mut available = route_config("route-a");
@@ -357,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_provider_reconciles_an_unsupported_reasoning_effort() {
+    fn api_route_models_use_route_reasoning_efforts_even_when_names_match_official_models() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
             home.path().join("models_cache.json"),
@@ -381,12 +539,15 @@ mod tests {
         config
             .upstream_models_by_provider
             .insert("route-a".into(), vec!["gpt-5.6-sol".into()]);
+        config
+            .selected_models_by_provider
+            .insert("route-a".into(), vec!["gpt-5.6-sol".into()]);
 
         reconcile_for_current_provider(&mut config, home.path(), false);
 
         assert!(config.subagent_optimization);
         assert_eq!(config.subagent_model, "gpt-5.6-sol");
-        assert_eq!(config.subagent_reasoning_effort, "medium");
+        assert_eq!(config.subagent_reasoning_effort, "low");
     }
 
     #[test]

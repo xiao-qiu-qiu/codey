@@ -2,17 +2,16 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use codey_runtime_core::{
-    protocol_proxy::{chat_completion_to_response_with_request, responses_to_chat_completions},
-    settings::RelayProtocol,
-};
 use reqwest::{
     Client, RequestBuilder,
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
 };
 use serde_json::{Value, json};
 
-use crate::config::PromptOptimizationConfig;
+use crate::config::{
+    PromptOptimizationConfig, UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+    UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS, UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+};
 use crate::model_list::{self, ModelEndpointError};
 
 /// Built-in optimizer instruction used when the user leaves the custom
@@ -74,8 +73,19 @@ pub struct ResolvedPromptOptimizationConfig {
     pub base_url: String,
     pub api_key: String,
     pub request_headers: BTreeMap<String, String>,
-    pub protocol: RelayProtocol,
+    /// Overrides the Responses API `store` field when the selected upstream
+    /// requires an explicit value. Manual and third-party routes leave this
+    /// unset so their existing payload contract is unchanged.
+    pub response_store: Option<bool>,
+    /// Overrides the Responses API `stream` field when the selected upstream
+    /// requires streaming. Manual and third-party routes keep the historical
+    /// non-streaming payload.
+    pub response_stream: Option<bool>,
+    /// Omits Responses API `max_output_tokens` for selected upstreams with a
+    /// narrower request schema. Manual and third-party routes keep sending it.
+    pub response_omit_max_output_tokens: bool,
     pub model: String,
+    pub upstream_protocol: String,
     pub instruction: String,
 }
 
@@ -85,10 +95,33 @@ impl ResolvedPromptOptimizationConfig {
             base_url: config.base_url.clone(),
             api_key: config.api_key.clone(),
             request_headers: BTreeMap::new(),
-            protocol: config.protocol,
+            response_store: None,
+            response_stream: None,
+            response_omit_max_output_tokens: false,
             model: config.model.clone(),
+            upstream_protocol: config.upstream_protocol.clone(),
             instruction: config.instruction.clone(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptimizationUpstreamProtocol {
+    OpenAiResponses,
+    OpenAiChatCompletions,
+    AnthropicMessages,
+}
+
+fn optimization_upstream_protocol(
+    config: &ResolvedPromptOptimizationConfig,
+) -> Result<OptimizationUpstreamProtocol, String> {
+    match config.upstream_protocol.trim() {
+        UPSTREAM_PROTOCOL_OPENAI_RESPONSES => Ok(OptimizationUpstreamProtocol::OpenAiResponses),
+        UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS => {
+            Ok(OptimizationUpstreamProtocol::OpenAiChatCompletions)
+        }
+        UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES => Ok(OptimizationUpstreamProtocol::AnthropicMessages),
+        _ => Err("提示词优化使用了不支持的上游协议".to_string()),
     }
 }
 
@@ -100,62 +133,68 @@ pub fn optimizer_http_client() -> Result<Client, String> {
     Client::builder()
         .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| format!("创建优化 HTTP 客户端失败：{error}"))
 }
 
-/// Builds the Chat Completions endpoint from the configured base URL. The
-/// user may fill in either the bare base (`https://api.example.com/v1`) or
-/// the complete endpoint (`https://api.example.com/v1/chat/completions`);
-/// both forms are accepted without double-appending the suffix.
-#[cfg(test)]
-pub fn chat_completions_endpoint(config: &PromptOptimizationConfig) -> Result<String, String> {
-    request_endpoint(&config.base_url, RelayProtocol::ChatCompletions)
-}
-
-fn request_endpoint(base_url: &str, protocol: RelayProtocol) -> Result<String, String> {
+fn request_endpoint(
+    base_url: &str,
+    protocol: OptimizationUpstreamProtocol,
+) -> Result<String, String> {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
-        return Err("请先配置 OpenAI 兼容 API 地址".to_string());
+        return Err("请先配置 API 地址".to_string());
     }
-    let url =
-        reqwest::Url::parse(base_url).map_err(|_| "API 地址不是有效的 HTTP(S) 地址".to_string())?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err("API 地址必须是有效的 HTTP(S) 地址".to_string());
+    crate::config::validate_outbound_api_url(base_url, "API 地址")?;
+    match protocol {
+        OptimizationUpstreamProtocol::OpenAiResponses => {
+            if base_url.ends_with("/responses") {
+                Ok(base_url.to_string())
+            } else {
+                Ok(format!("{base_url}/responses"))
+            }
+        }
+        OptimizationUpstreamProtocol::OpenAiChatCompletions => {
+            if base_url.ends_with("/chat/completions") {
+                Ok(base_url.to_string())
+            } else {
+                Ok(format!("{base_url}/chat/completions"))
+            }
+        }
+        OptimizationUpstreamProtocol::AnthropicMessages => {
+            if base_url.ends_with("/v1/messages") {
+                Ok(base_url.to_string())
+            } else if base_url.ends_with("/v1") {
+                Ok(format!("{base_url}/messages"))
+            } else {
+                Ok(format!("{base_url}/v1/messages"))
+            }
+        }
     }
-    let suffix = match protocol {
-        RelayProtocol::ChatCompletions => "/chat/completions",
-        RelayProtocol::Responses => "/responses",
-    };
-    if base_url.ends_with(suffix) {
-        return Ok(base_url.to_string());
-    }
-    let base_url = base_url
-        .strip_suffix("/chat/completions")
-        .or_else(|| base_url.strip_suffix("/responses"))
-        .unwrap_or(base_url);
-    Ok(format!("{base_url}{suffix}"))
 }
 
 /// Whether a 404 on the built endpoint should trigger the `/v1` retry. The
 /// retry only applies when the user supplied a bare base URL that does not
 /// already carry the `/v1` prefix or the complete endpoint.
-fn should_retry_with_v1(base_url: &str) -> bool {
-    !base_url.ends_with("/v1")
-        && !base_url.ends_with("/chat/completions")
-        && !base_url.ends_with("/responses")
+fn v1_retry_endpoint(base_url: &str, protocol: OptimizationUpstreamProtocol) -> Option<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    match protocol {
+        OptimizationUpstreamProtocol::OpenAiResponses
+            if !base_url.ends_with("/v1") && !base_url.ends_with("/responses") =>
+        {
+            Some(format!("{base_url}/v1/responses"))
+        }
+        OptimizationUpstreamProtocol::OpenAiChatCompletions
+            if !base_url.ends_with("/v1") && !base_url.ends_with("/chat/completions") =>
+        {
+            Some(format!("{base_url}/v1/chat/completions"))
+        }
+        _ => None,
+    }
 }
 
-fn v1_request_endpoint(base_url: &str, protocol: RelayProtocol) -> String {
-    let suffix = match protocol {
-        RelayProtocol::ChatCompletions => "chat/completions",
-        RelayProtocol::Responses => "responses",
-    };
-    format!("{}/v1/{suffix}", base_url.trim().trim_end_matches('/'))
-}
-
-/// Builds the first model-list endpoint from the same compatibility rules used
-/// by current-provider model synchronization.
+/// Builds the first model-list endpoint from the configured manual API base.
 #[cfg(test)]
 fn models_endpoint(config: &PromptOptimizationConfig) -> Result<String, String> {
     models_endpoints_from_base(&config.base_url).map(|endpoints| endpoints[0].clone())
@@ -166,6 +205,7 @@ fn models_endpoints_from_base(base_url: &str) -> Result<Vec<String>, String> {
     if base_url.is_empty() {
         return Err("请先配置 OpenAI 兼容 API 地址".to_string());
     }
+    crate::config::validate_outbound_api_url(base_url, "API 地址")?;
     model_list::model_endpoints(base_url, false, true).map_err(|error| match error {
         ModelEndpointError::InvalidUrl => "API 地址不是有效的 HTTP(S) 地址".to_string(),
         ModelEndpointError::UnsupportedSchemeOrHost => {
@@ -178,6 +218,7 @@ fn models_endpoints_from_base(base_url: &str) -> Result<Vec<String>, String> {
 /// service (`GET /models`), with the same `/v1` retry and error sanitization
 /// as the completion requests. The result keeps upstream order, is deduped
 /// and bounded so a misbehaving service cannot balloon the console.
+#[cfg(test)]
 pub async fn fetch_models(
     client: &Client,
     config: &PromptOptimizationConfig,
@@ -296,8 +337,16 @@ fn push_model_id(id: &str, seen: &mut std::collections::HashSet<String>, models:
 
 #[cfg(test)]
 pub fn optimizer_payload(config: &PromptOptimizationConfig, text: &str) -> Value {
-    let request = responses_payload(&config.model, &config.instruction, text);
-    upstream_request_payload(&request, config.protocol).expect("optimizer payload should convert")
+    optimization_payload(
+        &config.model,
+        &config.instruction,
+        text,
+        optimization_upstream_protocol(&ResolvedPromptOptimizationConfig::from_custom(config))
+            .expect("test config must use a supported protocol"),
+        None,
+        None,
+        false,
+    )
 }
 
 fn effective_instruction(instruction: &str) -> &str {
@@ -309,26 +358,131 @@ fn effective_instruction(instruction: &str) -> &str {
     }
 }
 
+fn responses_user_input(text: &str) -> Value {
+    json!([{
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": text,
+        }],
+    }])
+}
+
 fn responses_payload(model: &str, instruction: &str, text: &str) -> Value {
     json!({
         "model": model.trim(),
         "instructions": effective_instruction(instruction),
-        "input": text,
+        "input": responses_user_input(text),
         "max_output_tokens": MAX_TOKENS,
         "stream": false,
     })
 }
 
-fn upstream_request_payload(request: &Value, protocol: RelayProtocol) -> Result<Value, String> {
-    match protocol {
-        RelayProtocol::Responses => Ok(request.clone()),
-        RelayProtocol::ChatCompletions => responses_to_chat_completions(request.clone())
-            .map_err(|error| format!("转换 Responses 请求到 Chat Completions 失败：{error:#}")),
+fn openai_chat_messages(instruction: &str, text: &str) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let instruction = effective_instruction(instruction);
+    if !instruction.is_empty() {
+        messages.push(json!({ "role": "system", "content": instruction }));
     }
+    messages.push(json!({ "role": "user", "content": text }));
+    messages
 }
 
-/// Optimizes a user prompt through the resolved Chat Completions or Responses
-/// API and returns the rewritten prompt. All returned error messages are
+fn openai_chat_payload(model: &str, instruction: &str, text: &str, max_tokens: u32) -> Value {
+    json!({
+        "model": model.trim(),
+        "messages": openai_chat_messages(instruction, text),
+        "max_tokens": max_tokens,
+        "stream": false,
+    })
+}
+
+fn anthropic_payload(model: &str, instruction: &str, text: &str, max_tokens: u32) -> Value {
+    json!({
+        "model": model.trim(),
+        "system": effective_instruction(instruction),
+        "messages": [{ "role": "user", "content": text }],
+        "max_tokens": max_tokens,
+        "stream": false,
+    })
+}
+
+fn optimization_payload(
+    model: &str,
+    instruction: &str,
+    text: &str,
+    protocol: OptimizationUpstreamProtocol,
+    response_store: Option<bool>,
+    response_stream: Option<bool>,
+    response_omit_max_output_tokens: bool,
+) -> Value {
+    let mut payload = match protocol {
+        OptimizationUpstreamProtocol::OpenAiResponses => {
+            responses_payload(model, instruction, text)
+        }
+        OptimizationUpstreamProtocol::OpenAiChatCompletions => {
+            openai_chat_payload(model, instruction, text, MAX_TOKENS)
+        }
+        OptimizationUpstreamProtocol::AnthropicMessages => {
+            anthropic_payload(model, instruction, text, MAX_TOKENS)
+        }
+    };
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses && response_omit_max_output_tokens
+    {
+        payload.as_object_mut().unwrap().remove("max_output_tokens");
+    }
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && let Some(store) = response_store
+    {
+        payload["store"] = Value::Bool(store);
+    }
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && let Some(stream) = response_stream
+    {
+        payload["stream"] = Value::Bool(stream);
+    }
+    payload
+}
+
+fn configuration_test_payload(
+    model: &str,
+    protocol: OptimizationUpstreamProtocol,
+    response_store: Option<bool>,
+    response_stream: Option<bool>,
+    response_omit_max_output_tokens: bool,
+) -> Value {
+    let mut payload = match protocol {
+        OptimizationUpstreamProtocol::OpenAiResponses => json!({
+            "model": model,
+            "input": responses_user_input("hi"),
+            "max_output_tokens": 16,
+            "stream": false,
+        }),
+        OptimizationUpstreamProtocol::OpenAiChatCompletions => {
+            openai_chat_payload(model, "", "hi", 16)
+        }
+        OptimizationUpstreamProtocol::AnthropicMessages => anthropic_payload(model, "", "hi", 16),
+    };
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses && response_omit_max_output_tokens
+    {
+        payload.as_object_mut().unwrap().remove("max_output_tokens");
+    }
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && let Some(store) = response_store
+    {
+        payload["store"] = Value::Bool(store);
+    }
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && let Some(stream) = response_stream
+    {
+        payload["stream"] = Value::Bool(stream);
+    }
+    payload
+}
+
+/// Optimizes a user prompt through a Responses API and returns the rewritten
+/// prompt. All returned error messages are
 /// sanitized so provider credentials never reach the renderer or logs.
 #[cfg(test)]
 pub async fn optimize_prompt(
@@ -359,34 +513,43 @@ pub async fn optimize_prompt_resolved(
     if text.chars().count() > MAX_INPUT_CHARS {
         return Err(format!("提示词过长，最多支持 {MAX_INPUT_CHARS} 个字符"));
     }
-    let endpoint = request_endpoint(&config.base_url, config.protocol)?;
+    let protocol = optimization_upstream_protocol(config)?;
+    let endpoint = request_endpoint(&config.base_url, protocol)?;
     if config.model.trim().is_empty() {
         return Err("请先配置优化模型".to_string());
     }
 
-    let original_request = responses_payload(&config.model, &config.instruction, text);
-    let payload = upstream_request_payload(&original_request, config.protocol)?;
+    let payload = optimization_payload(
+        &config.model,
+        &config.instruction,
+        text,
+        protocol,
+        config.response_store,
+        config.response_stream,
+        config.response_omit_max_output_tokens,
+    );
     let response = post_optimization_request(client, &endpoint, config, &payload).await?;
     let status = response.status().as_u16();
 
-    // 404 且用户填的是缺少 /v1 前缀的纯 base 地址时自动补 /v1 重试，
-    // 与线路测试一致；已带 /v1 或已填完整端点时不再追加。
     let base_url = config.base_url.trim().trim_end_matches('/');
-    if status == 404 && should_retry_with_v1(base_url) {
-        let v1_endpoint = v1_request_endpoint(base_url, config.protocol);
+    if status == 404
+        && let Some(v1_endpoint) = v1_retry_endpoint(base_url, protocol)
+    {
         let v1_response = post_optimization_request(client, &v1_endpoint, config, &payload).await?;
-        return parse_optimized_response(v1_response, &v1_endpoint, config, &original_request)
+        return parse_optimized_response(v1_response, &v1_endpoint, config, protocol)
             .await
             .map_err(|error| error.message);
     }
 
-    match parse_optimized_response(response, &endpoint, config, &original_request).await {
+    match parse_optimized_response(response, &endpoint, config, protocol).await {
         Ok(optimized) => Ok(optimized),
-        Err(error) if error.retryable_with_v1 && should_retry_with_v1(base_url) => {
-            let v1_endpoint = v1_request_endpoint(base_url, config.protocol);
+        Err(error) if error.retryable_with_v1 => {
+            let Some(v1_endpoint) = v1_retry_endpoint(base_url, protocol) else {
+                return Err(error.message);
+            };
             let v1_response =
                 post_optimization_request(client, &v1_endpoint, config, &payload).await?;
-            parse_optimized_response(v1_response, &v1_endpoint, config, &original_request)
+            parse_optimized_response(v1_response, &v1_endpoint, config, protocol)
                 .await
                 .map_err(|error| error.message)
         }
@@ -394,7 +557,7 @@ pub async fn optimize_prompt_resolved(
     }
 }
 
-/// Sends a minimal request in the resolved protocol to verify connectivity and
+/// Sends a minimal Responses request to verify connectivity and
 /// credentials. Returns the HTTP status, endpoint and a sanitized response
 /// preview so the console can show the outcome without a full optimization.
 #[cfg(test)]
@@ -416,24 +579,26 @@ pub async fn test_configuration_resolved(
     client: &Client,
     config: &ResolvedPromptOptimizationConfig,
 ) -> Result<Value, String> {
-    let endpoint = request_endpoint(&config.base_url, config.protocol)?;
+    let protocol = optimization_upstream_protocol(config)?;
+    let endpoint = request_endpoint(&config.base_url, protocol)?;
     let model = config.model.trim();
     if model.is_empty() {
         return Err("请先配置优化模型".to_string());
     }
-    let request = json!({
-        "model": model,
-        "input": "hi",
-        "max_output_tokens": 16,
-        "stream": false,
-    });
-    let payload = upstream_request_payload(&request, config.protocol)?;
+    let payload = configuration_test_payload(
+        model,
+        protocol,
+        config.response_store,
+        config.response_stream,
+        config.response_omit_max_output_tokens,
+    );
     let response = post_optimization_request(client, &endpoint, config, &payload).await?;
     let status = response.status().as_u16();
 
     let base_url = config.base_url.trim().trim_end_matches('/');
-    if status == 404 && should_retry_with_v1(base_url) {
-        let v1_endpoint = v1_request_endpoint(base_url, config.protocol);
+    if status == 404
+        && let Some(v1_endpoint) = v1_retry_endpoint(base_url, protocol)
+    {
         let v1_response = post_optimization_request(client, &v1_endpoint, config, &payload).await?;
         return configuration_test_result(v1_response, &v1_endpoint, config).await;
     }
@@ -471,8 +636,15 @@ fn authenticated_request(
     let has_custom_authorization = config.request_headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case(AUTHORIZATION.as_str()) && !value.trim().is_empty()
     });
+    let protocol = optimization_upstream_protocol(config)
+        .unwrap_or(OptimizationUpstreamProtocol::OpenAiResponses);
     if !config.api_key.trim().is_empty() && !has_custom_authorization {
-        request = request.bearer_auth(config.api_key.trim());
+        request = match protocol {
+            OptimizationUpstreamProtocol::AnthropicMessages => request
+                .header("x-api-key", config.api_key.trim())
+                .header("anthropic-version", "2023-06-01"),
+            _ => request.bearer_auth(config.api_key.trim()),
+        };
     }
     for (name, value) in &config.request_headers {
         if name.eq_ignore_ascii_case(AUTHORIZATION.as_str()) && value.trim().is_empty() {
@@ -521,7 +693,7 @@ async fn parse_optimized_response(
     response: reqwest::Response,
     endpoint: &str,
     config: &ResolvedPromptOptimizationConfig,
-    original_request: &Value,
+    protocol: OptimizationUpstreamProtocol,
 ) -> Result<String, OptimizedResponseError> {
     let status = response.status().as_u16();
     if status >= 400 {
@@ -544,6 +716,24 @@ async fn parse_optimized_response(
     )
     .await
     .map_err(OptimizedResponseError::fatal)?;
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && config.response_stream == Some(true)
+    {
+        let optimized = extract_responses_stream_optimized_text(&body).map_err(|error| {
+            let preview = sanitize_resolved_error(&error, config);
+            OptimizedResponseError::retryable(format!(
+                "优化 API 流式响应无法解析（{endpoint}）：{preview}"
+            ))
+        })?;
+        let optimized = optimized.trim();
+        if optimized.is_empty() {
+            return Err(OptimizedResponseError::fatal(
+                "优化 API 返回了空的优化结果".to_string(),
+            ));
+        }
+        return Ok(optimized.chars().take(MAX_OUTPUT_CHARS).collect());
+    }
+
     let value: Value = serde_json::from_slice(&body).map_err(|_| {
         let preview = sanitize_resolved_error(String::from_utf8_lossy(&body).trim(), config);
         let preview: String = preview.chars().take(200).collect();
@@ -556,17 +746,7 @@ async fn parse_optimized_response(
             "优化 API 返回的不是有效 JSON（{endpoint}）。响应摘要：{preview}"
         ))
     })?;
-    let response = match config.protocol {
-        RelayProtocol::Responses => value,
-        RelayProtocol::ChatCompletions => {
-            chat_completion_to_response_with_request(value, original_request).map_err(|error| {
-                OptimizedResponseError::retryable(format!(
-                    "转换 Chat Completions 响应到 Responses 失败（{endpoint}）：{error:#}"
-                ))
-            })?
-        }
-    };
-    let optimized = extract_responses_optimized_text(&response).ok_or_else(|| {
+    let optimized = extract_optimized_text(&value, protocol).ok_or_else(|| {
         OptimizedResponseError::retryable("优化 API 响应中缺少优化结果".to_string())
     })?;
     let optimized = optimized.trim();
@@ -578,24 +758,118 @@ async fn parse_optimized_response(
     Ok(optimized.chars().take(MAX_OUTPUT_CHARS).collect())
 }
 
-/// Extracts `choices[0].message.content`, accepting both the plain string
-/// form and the newer part-array form (`{type:"text",text:...}`).
-#[cfg(test)]
-fn extract_optimized_text(response: &Value) -> Option<String> {
-    let content = response.pointer("/choices/0/message/content")?;
-    match content {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(parts) => {
-            let mut text = String::new();
-            for part in parts {
-                if let Some(segment) = part.get("text").and_then(Value::as_str) {
-                    text.push_str(segment);
+fn extract_responses_stream_optimized_text(body: &[u8]) -> Result<String, String> {
+    let mut cursor = 0;
+    let mut text = String::new();
+    let mut final_text = None;
+    while let Some(frame) = take_next_sse_frame(body, &mut cursor) {
+        let Some(data) = sse_frame_data(frame)? else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let event: Value = serde_json::from_str(data)
+            .map_err(|error| format!("Responses SSE data 不是有效 JSON：{error}"))?;
+        if let Some(message) = responses_stream_error_message(&event) {
+            return Err(message);
+        }
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    text.push_str(delta);
                 }
             }
-            Some(text)
+            Some("response.output_text.done") => {
+                if text.is_empty()
+                    && let Some(done_text) = event.get("text").and_then(Value::as_str)
+                {
+                    final_text = Some(done_text.to_string());
+                }
+            }
+            Some("response.completed") => {
+                if let Some(response) = event.get("response")
+                    && let Some(completed_text) = extract_responses_optimized_text(response)
+                {
+                    final_text = Some(completed_text);
+                }
+            }
+            _ => {}
         }
-        _ => None,
     }
+    if !body[cursor..].iter().all(u8::is_ascii_whitespace)
+        && let Some(data) = sse_frame_data(&body[cursor..])?
+    {
+        let data = data.trim();
+        if !data.is_empty() && data != "[DONE]" {
+            let event: Value = serde_json::from_str(data)
+                .map_err(|error| format!("Responses SSE 末尾 data 不是有效 JSON：{error}"))?;
+            if let Some(message) = responses_stream_error_message(&event) {
+                return Err(message);
+            }
+            if event.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
+                && let Some(delta) = event.get("delta").and_then(Value::as_str)
+            {
+                text.push_str(delta);
+            }
+        }
+    }
+    if text.is_empty() {
+        Ok(final_text.unwrap_or_default())
+    } else {
+        Ok(text)
+    }
+}
+
+fn responses_stream_error_message(event: &Value) -> Option<String> {
+    if !matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("error" | "response.failed" | "response.incomplete")
+    ) {
+        return None;
+    }
+    [
+        event.pointer("/error/message"),
+        event.pointer("/response/error/message"),
+        event.pointer("/response/incomplete_details/reason"),
+        event.get("message"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .map(str::to_string)
+    .or_else(|| Some(event.to_string()))
+}
+
+fn take_next_sse_frame<'a>(buffer: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let remaining = buffer.get(*cursor..)?;
+    let mut delimiter = None;
+    for index in 0..remaining.len() {
+        if remaining.get(index..index + 4) == Some(b"\r\n\r\n") {
+            delimiter = Some((index, 4));
+            break;
+        }
+        if remaining.get(index..index + 2) == Some(b"\n\n") {
+            delimiter = Some((index, 2));
+            break;
+        }
+    }
+    let (index, length) = delimiter?;
+    let frame_start = *cursor;
+    let frame_end = frame_start + index;
+    *cursor = frame_end + length;
+    Some(&buffer[frame_start..frame_end])
+}
+
+fn sse_frame_data(frame: &[u8]) -> Result<Option<String>, String> {
+    let frame = std::str::from_utf8(frame).map_err(|_| "Responses SSE 不是 UTF-8".to_string())?;
+    let data = frame
+        .lines()
+        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>();
+    Ok((!data.is_empty()).then(|| data.join("\n")))
 }
 
 fn extract_responses_optimized_text(response: &Value) -> Option<String> {
@@ -614,6 +888,56 @@ fn extract_responses_optimized_text(response: &Value) -> Option<String> {
         }
     }
     (!text.is_empty()).then_some(text)
+}
+
+fn extract_openai_chat_optimized_text(response: &Value) -> Option<String> {
+    let content = response
+        .get("choices")
+        .and_then(Value::as_array)?
+        .first()?
+        .get("message")?
+        .get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let mut text = String::new();
+    for item in content.as_array()? {
+        if let Some(segment) = item
+            .get("text")
+            .or_else(|| item.get("content"))
+            .and_then(Value::as_str)
+        {
+            text.push_str(segment);
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn extract_anthropic_optimized_text(response: &Value) -> Option<String> {
+    let mut text = String::new();
+    for item in response.get("content").and_then(Value::as_array)? {
+        if item.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(segment) = item.get("text").and_then(Value::as_str)
+        {
+            text.push_str(segment);
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn extract_optimized_text(
+    response: &Value,
+    protocol: OptimizationUpstreamProtocol,
+) -> Option<String> {
+    match protocol {
+        OptimizationUpstreamProtocol::OpenAiResponses => extract_responses_optimized_text(response),
+        OptimizationUpstreamProtocol::OpenAiChatCompletions => {
+            extract_openai_chat_optimized_text(response)
+        }
+        OptimizationUpstreamProtocol::AnthropicMessages => {
+            extract_anthropic_optimized_text(response)
+        }
+    }
 }
 
 async fn read_bounded_body(
@@ -705,73 +1029,125 @@ mod tests {
     fn endpoint_building_trims_and_validates() {
         let mut config = configured();
         assert_eq!(
-            chat_completions_endpoint(&config).unwrap(),
-            "https://api.example.com/v1/chat/completions"
-        );
-        config.base_url = "https://api.example.com/v1/".to_string();
-        assert_eq!(
-            chat_completions_endpoint(&config).unwrap(),
-            "https://api.example.com/v1/chat/completions"
-        );
-        config.base_url = "http://127.0.0.1:11434".to_string();
-        assert_eq!(
-            chat_completions_endpoint(&config).unwrap(),
-            "http://127.0.0.1:11434/chat/completions"
-        );
-        // 直接填写完整端点时不得重复拼接后缀。
-        config.base_url = "https://opencode.ai/zen/v1/chat/completions".to_string();
-        assert_eq!(
-            chat_completions_endpoint(&config).unwrap(),
-            "https://opencode.ai/zen/v1/chat/completions"
-        );
-        config.base_url = "https://opencode.ai/zen/v1/chat/completions/".to_string();
-        assert_eq!(
-            chat_completions_endpoint(&config).unwrap(),
-            "https://opencode.ai/zen/v1/chat/completions"
-        );
-        config.base_url = "  ".to_string();
-        assert!(
-            chat_completions_endpoint(&config)
-                .unwrap_err()
-                .contains("配置")
-        );
-        config.base_url = "ftp://api.example.com".to_string();
-        assert!(
-            chat_completions_endpoint(&config)
-                .unwrap_err()
-                .contains("HTTP")
-        );
-        config.base_url = "not a url".to_string();
-        assert!(
-            chat_completions_endpoint(&config)
-                .unwrap_err()
-                .contains("HTTP")
-        );
-        assert_eq!(
             request_endpoint(
-                "https://api.example.com/v1/chat/completions",
-                RelayProtocol::Responses
+                &config.base_url,
+                OptimizationUpstreamProtocol::OpenAiResponses,
             )
             .unwrap(),
             "https://api.example.com/v1/responses"
         );
+        config.base_url = "https://api.example.com/v1/".to_string();
+        assert_eq!(
+            request_endpoint(
+                &config.base_url,
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .unwrap(),
+            "https://api.example.com/v1/responses"
+        );
+        config.base_url = "http://127.0.0.1:11434".to_string();
+        assert_eq!(
+            request_endpoint(
+                &config.base_url,
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .unwrap(),
+            "http://127.0.0.1:11434/responses"
+        );
+        // 直接填写完整端点时不得重复拼接后缀。
+        config.base_url = "https://opencode.ai/zen/v1/responses".to_string();
+        assert_eq!(
+            request_endpoint(
+                &config.base_url,
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .unwrap(),
+            "https://opencode.ai/zen/v1/responses"
+        );
+        config.base_url = "https://opencode.ai/zen/v1/responses/".to_string();
+        assert_eq!(
+            request_endpoint(
+                &config.base_url,
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .unwrap(),
+            "https://opencode.ai/zen/v1/responses"
+        );
+        config.base_url = "  ".to_string();
+        assert!(
+            request_endpoint(
+                &config.base_url,
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .unwrap_err()
+            .contains("配置")
+        );
+        config.base_url = "ftp://api.example.com".to_string();
+        assert!(
+            request_endpoint(
+                &config.base_url,
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .unwrap_err()
+            .contains("HTTP")
+        );
+        config.base_url = "not a url".to_string();
+        assert!(
+            request_endpoint(
+                &config.base_url,
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .unwrap_err()
+            .contains("HTTP")
+        );
+        assert_eq!(
+            request_endpoint(
+                "https://api.example.com/v1",
+                OptimizationUpstreamProtocol::OpenAiChatCompletions,
+            )
+            .unwrap(),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            request_endpoint(
+                "https://api.anthropic.com",
+                OptimizationUpstreamProtocol::AnthropicMessages,
+            )
+            .unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     #[test]
-    fn v1_retry_applies_only_to_bare_base_urls() {
-        assert!(should_retry_with_v1("https://api.example.com/zen"));
-        assert!(should_retry_with_v1("https://api.example.com"));
-        assert!(!should_retry_with_v1("https://api.example.com/zen/v1"));
-        assert!(!should_retry_with_v1("https://api.example.com/v1"));
-        assert!(!should_retry_with_v1(
-            "https://opencode.ai/zen/v1/chat/completions"
-        ));
-        assert!(!should_retry_with_v1(
-            "https://api.example.com/chat/completions"
-        ));
-        assert!(!should_retry_with_v1(
-            "https://api.example.com/v1/responses"
-        ));
+    fn v1_retry_applies_only_to_openai_base_urls_without_v1() {
+        assert_eq!(
+            v1_retry_endpoint(
+                "https://api.example.com/zen",
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            ),
+            Some("https://api.example.com/zen/v1/responses".to_string())
+        );
+        assert_eq!(
+            v1_retry_endpoint(
+                "https://api.example.com",
+                OptimizationUpstreamProtocol::OpenAiChatCompletions,
+            ),
+            Some("https://api.example.com/v1/chat/completions".to_string())
+        );
+        assert!(
+            v1_retry_endpoint(
+                "https://api.example.com/v1",
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .is_none()
+        );
+        assert!(
+            v1_retry_endpoint(
+                "https://api.anthropic.com",
+                OptimizationUpstreamProtocol::AnthropicMessages,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -782,7 +1158,7 @@ mod tests {
             models_endpoint(&config).unwrap(),
             "https://opencode.ai/zen/v1/models"
         );
-        config.base_url = "https://opencode.ai/zen/v1/chat/completions".to_string();
+        config.base_url = "https://opencode.ai/zen/v1/responses".to_string();
         assert_eq!(
             models_endpoint(&config).unwrap(),
             "https://opencode.ai/zen/v1/models"
@@ -983,7 +1359,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("401"), "{error}");
-        assert!(error.contains("/v1/chat/completions"), "{error}");
+        assert!(error.contains("/v1/responses"), "{error}");
         assert!(error.contains("retry credentials rejected"), "{error}");
         assert!(!error.contains("missing route"), "{error}");
         server.await.unwrap();
@@ -1024,51 +1400,148 @@ mod tests {
     fn payload_uses_custom_instruction_or_the_default() {
         let mut config = configured();
         let payload = optimizer_payload(&config, " 你好 ");
-        assert_eq!(
-            payload["messages"][0]["content"],
-            DEFAULT_OPTIMIZER_INSTRUCTION
-        );
-        assert_eq!(payload["messages"][1]["content"], " 你好 ");
+        assert_eq!(payload["instructions"], DEFAULT_OPTIMIZER_INSTRUCTION);
+        assert_eq!(payload["input"][0]["content"][0]["text"], " 你好 ");
         assert_eq!(payload["model"], "gpt-test");
 
         config.instruction = " 简短回复 ".to_string();
         let payload = optimizer_payload(&config, "你好");
-        assert_eq!(payload["messages"][0]["content"], "简短回复");
-
-        config.protocol = RelayProtocol::Responses;
-        let payload = optimizer_payload(&config, "你好");
         assert_eq!(payload["instructions"], "简短回复");
-        assert_eq!(payload["input"], "你好");
+        assert_eq!(payload["input"][0]["type"], "message");
+        assert_eq!(payload["input"][0]["role"], "user");
+        assert_eq!(payload["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(payload["input"][0]["content"][0]["text"], "你好");
         assert_eq!(payload["max_output_tokens"], MAX_TOKENS);
         assert_eq!(payload["stream"], false);
         assert!(payload.get("messages").is_none());
     }
 
     #[test]
-    fn extracts_text_content_from_string_and_part_arrays() {
-        let string_response = json!({"choices": [{"message": {"content": "优化结果"}}]});
+    fn configuration_test_payload_uses_a_responses_input_list() {
+        let payload = configuration_test_payload(
+            "gpt-test",
+            OptimizationUpstreamProtocol::OpenAiResponses,
+            None,
+            None,
+            false,
+        );
+        assert!(payload["input"].is_array());
+        assert_eq!(payload["input"][0]["role"], "user");
+        assert_eq!(payload["input"][0]["content"][0]["text"], "hi");
+        assert!(payload.get("store").is_none());
+    }
+
+    #[test]
+    fn response_overrides_apply_only_to_responses_payloads() {
+        let test_payload = configuration_test_payload(
+            "gpt-test",
+            OptimizationUpstreamProtocol::OpenAiResponses,
+            Some(false),
+            Some(true),
+            true,
+        );
+        assert_eq!(test_payload["store"], false);
+        assert_eq!(test_payload["stream"], true);
+        assert!(test_payload.get("max_output_tokens").is_none());
+
+        let optimization_payload = optimization_payload(
+            "gpt-test",
+            "保持原意",
+            "写个博客",
+            OptimizationUpstreamProtocol::OpenAiResponses,
+            Some(false),
+            Some(true),
+            true,
+        );
+        assert_eq!(optimization_payload["store"], false);
+        assert_eq!(optimization_payload["stream"], true);
+        assert!(optimization_payload.get("max_output_tokens").is_none());
+
+        let chat_payload = configuration_test_payload(
+            "gpt-test",
+            OptimizationUpstreamProtocol::OpenAiChatCompletions,
+            Some(false),
+            Some(true),
+            true,
+        );
+        let anthropic_payload = configuration_test_payload(
+            "claude-test",
+            OptimizationUpstreamProtocol::AnthropicMessages,
+            Some(false),
+            Some(true),
+            true,
+        );
+        assert!(chat_payload.get("store").is_none());
+        assert!(anthropic_payload.get("store").is_none());
+        assert!(chat_payload.get("max_output_tokens").is_none());
+        assert!(anthropic_payload.get("max_output_tokens").is_none());
+        assert_eq!(chat_payload["stream"], false);
+        assert_eq!(anthropic_payload["stream"], false);
+    }
+
+    #[test]
+    fn third_party_responses_payloads_keep_max_output_tokens() {
+        let test_payload = configuration_test_payload(
+            "gpt-test",
+            OptimizationUpstreamProtocol::OpenAiResponses,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(test_payload["max_output_tokens"], 16);
+
+        let optimization_payload = optimization_payload(
+            "gpt-test",
+            "保持原意",
+            "写个博客",
+            OptimizationUpstreamProtocol::OpenAiResponses,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(optimization_payload["max_output_tokens"], MAX_TOKENS);
+    }
+
+    #[test]
+    fn chat_and_anthropic_payloads_and_responses_use_their_native_shapes() {
+        let chat = optimization_payload(
+            "gpt-test",
+            "保持原意",
+            "写个博客",
+            OptimizationUpstreamProtocol::OpenAiChatCompletions,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(chat["messages"][0]["role"], "system");
+        assert_eq!(chat["messages"][1]["content"], "写个博客");
         assert_eq!(
-            extract_optimized_text(&string_response).as_deref(),
-            Some("优化结果")
+            extract_optimized_text(
+                &json!({"choices":[{"message":{"content":"聊天结果"}}]}),
+                OptimizationUpstreamProtocol::OpenAiChatCompletions,
+            )
+            .as_deref(),
+            Some("聊天结果")
         );
 
-        let array_response = json!({"choices": [{"message": {"content": [
-            {"type": "text", "text": "优化"},
-            {"type": "text", "text": "结果"},
-        ]}}]});
-        assert_eq!(
-            extract_optimized_text(&array_response).as_deref(),
-            Some("优化结果")
+        let anthropic = optimization_payload(
+            "claude-test",
+            "保持原意",
+            "写个博客",
+            OptimizationUpstreamProtocol::AnthropicMessages,
+            None,
+            None,
+            false,
         );
-
-        assert_eq!(extract_optimized_text(&json!({"choices": []})), None);
+        assert_eq!(anthropic["system"], "保持原意");
+        assert_eq!(anthropic["messages"][0]["content"], "写个博客");
         assert_eq!(
-            extract_optimized_text(&json!({"error": {"message": "boom"}})),
-            None
-        );
-        assert_eq!(
-            extract_optimized_text(&json!({"choices": [{"message": {"content": 42}}]})),
-            None
+            extract_optimized_text(
+                &json!({"content":[{"type":"text","text":"Anthropic 结果"}]}),
+                OptimizationUpstreamProtocol::AnthropicMessages,
+            )
+            .as_deref(),
+            Some("Anthropic 结果")
         );
     }
 
@@ -1094,6 +1567,39 @@ mod tests {
     }
 
     #[test]
+    fn extracts_responses_stream_text_and_errors() {
+        let sse = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"优化\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"结果\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert_eq!(
+            extract_responses_stream_optimized_text(sse.as_bytes()).unwrap(),
+            "优化结果"
+        );
+
+        let completed = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"最终结果\"}}\n\n"
+        );
+        assert_eq!(
+            extract_responses_stream_optimized_text(completed.as_bytes()).unwrap(),
+            "最终结果"
+        );
+
+        let error = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"stream rejected\"}}}\n\n"
+        );
+        assert_eq!(
+            extract_responses_stream_optimized_text(error.as_bytes()).unwrap_err(),
+            "stream rejected"
+        );
+    }
+
+    #[test]
     fn sanitize_error_hides_the_api_key() {
         assert_eq!(
             sanitize_error("401 unauthorized for sk-test-key", "sk-test-key"),
@@ -1113,8 +1619,11 @@ mod tests {
             base_url: "https://provider.example/v1".to_string(),
             api_key: "provider-api-secret".to_string(),
             request_headers,
-            protocol: RelayProtocol::Responses,
+            response_store: None,
+            response_stream: None,
+            response_omit_max_output_tokens: false,
             model: "gpt-provider".to_string(),
+            upstream_protocol: UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
             instruction: String::new(),
         };
 
@@ -1207,10 +1716,10 @@ mod tests {
                 }
             }
             let request = String::from_utf8_lossy(&request);
-            assert!(request.starts_with("POST /chat/completions "), "{request}");
-            assert!(request.contains("\"messages\""), "{request}");
-            assert!(!request.contains("\"input\":"), "{request}");
-            let body = r#"{"choices":[{"message":{"content":"优化后的提示词"}}]}"#;
+            assert!(request.starts_with("POST /responses "), "{request}");
+            assert!(request.contains("\"input\":"), "{request}");
+            assert!(!request.contains("\"messages\""), "{request}");
+            let body = r#"{"output_text":"优化后的提示词"}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -1237,11 +1746,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             for (expected_path, body) in [
-                ("/chat/completions", "<html>missing API prefix</html>"),
-                (
-                    "/v1/chat/completions",
-                    r#"{"choices":[{"message":{"content":"回退后的优化结果"}}]}"#,
-                ),
+                ("/responses", "<html>missing API prefix</html>"),
+                ("/v1/responses", r#"{"output_text":"回退后的优化结果"}"#),
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -1297,7 +1803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_responses_request_uses_provider_headers_and_protocol() {
+    async fn resolved_responses_request_uses_provider_headers() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -1338,12 +1844,21 @@ mod tests {
                 request_lower.contains("authorization: custom provider token"),
                 "{request}"
             );
+            assert!(
+                request_lower
+                    .contains("x-codex-installation-id: 49a95816-9ead-4f14-b008-1d0cbaa3c328"),
+                "{request}"
+            );
             assert!(!request_lower.contains("bearer ignored-key"), "{request}");
             assert!(
                 request.contains(r#""instructions":"保持原意""#),
                 "{request}"
             );
-            assert!(request.contains(r#""input":"写个博客""#), "{request}");
+            let (_, body) = request.split_once("\r\n\r\n").unwrap();
+            let body: Value = serde_json::from_str(body).unwrap();
+            assert!(body["input"].is_array(), "{body}");
+            assert_eq!(body["input"][0]["content"][0]["text"], "写个博客");
+            assert!(body.get("store").is_none(), "{body}");
 
             let body = r#"{"output":[{"content":[{"type":"output_text","text":"优化后的响应"}]}]}"#;
             let response = format!(
@@ -1360,18 +1875,116 @@ mod tests {
             "Authorization".to_string(),
             "Custom Provider Token".to_string(),
         );
+        request_headers.insert(
+            "x-codex-installation-id".to_string(),
+            "49a95816-9ead-4f14-b008-1d0cbaa3c328".to_string(),
+        );
         let config = ResolvedPromptOptimizationConfig {
             base_url: format!("http://{address}/v1"),
             api_key: "ignored-key".to_string(),
             request_headers,
-            protocol: RelayProtocol::Responses,
+            response_store: None,
+            response_stream: None,
+            response_omit_max_output_tokens: false,
             model: "gpt-responses".to_string(),
+            upstream_protocol: UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
             instruction: "保持原意".to_string(),
         };
         let result = optimize_prompt_resolved(&local_client(), &config, "写个博客")
             .await
             .unwrap();
         assert_eq!(result, "优化后的响应");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolved_official_responses_request_uses_streaming_overrides() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let bytes_read = socket.read(&mut chunk).await.unwrap();
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..bytes_read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /v1/responses "), "{request}");
+            let request_lower = request.to_ascii_lowercase();
+            assert!(
+                request_lower.contains("authorization: bearer official-access-token"),
+                "{request}"
+            );
+            assert!(
+                request_lower.contains("chatgpt-account-id: account-123"),
+                "{request}"
+            );
+            let (_, body) = request.split_once("\r\n\r\n").unwrap();
+            let body: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(body["store"], false);
+            assert_eq!(body["stream"], true);
+            assert!(body.get("max_output_tokens").is_none(), "{body}");
+
+            let body = concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"官方\"}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"优化\"}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut request_headers = BTreeMap::new();
+        request_headers.insert(
+            "Authorization".to_string(),
+            "Bearer official-access-token".to_string(),
+        );
+        request_headers.insert("chatgpt-account-id".to_string(), "account-123".to_string());
+        let config = ResolvedPromptOptimizationConfig {
+            base_url: format!("http://{address}/v1"),
+            api_key: String::new(),
+            request_headers,
+            response_store: Some(false),
+            response_stream: Some(true),
+            response_omit_max_output_tokens: true,
+            model: "gpt-official".to_string(),
+            upstream_protocol: UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
+            instruction: "保持原意".to_string(),
+        };
+        let result = optimize_prompt_resolved(&Client::new(), &config, "写个博客")
+            .await
+            .unwrap();
+        assert_eq!(result, "官方优化");
         server.await.unwrap();
     }
 

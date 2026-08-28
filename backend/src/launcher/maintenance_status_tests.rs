@@ -25,12 +25,7 @@ fn maintenance_status_exposes_structured_session_metrics() {
     let subagent_cleanup = Ok(subagent_state_cleanup::SubagentStateCleanupReport::default());
     let session_delete_replay = Ok(session_delete_tombstone::ReplaySummary::default());
 
-    let summary = session_maintenance_summary(
-        &provider_sync,
-        &session_delete_replay,
-        &subagent_cleanup,
-        &cleanup,
-    );
+    let summary = session_maintenance_summary(Some(&provider_sync), &cleanup);
     let status = MaintenanceStatus {
         session_status: summary.status,
         session_files_fixed: summary.files_fixed,
@@ -44,4 +39,20 @@ fn maintenance_status_exposes_structured_session_metrics() {
     assert_eq!(value["sessionFilesFixed"], 3);
     assert_eq!(value["sqliteRowsUpdated"], 7);
     assert_eq!(value["ghostTasksPruned"], 2);
+}
+
+#[test]
+fn intentionally_skipped_provider_sync_is_still_ready() {
+    let cleanup = Ok(SessionIndexCleanupReport {
+        scanned_entries: 0,
+        live_threads: 0,
+        pruned_entries: 0,
+        backup_dir: None,
+    });
+
+    let summary = session_maintenance_summary(None, &cleanup);
+
+    assert_eq!(summary.status, "ready");
+    assert_eq!(summary.files_fixed, 0);
+    assert_eq!(summary.sqlite_rows_updated, 0);
 }

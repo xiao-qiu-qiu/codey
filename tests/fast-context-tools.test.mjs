@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
+
 const root = new URL("../", import.meta.url);
 
 test("user FastCtx blocks embedded tools across the backend and settings", async () => {
@@ -11,12 +13,16 @@ test("user FastCtx blocks embedded tools across the backend and settings", async
     sectionsSource,
     configSource,
     commandSource,
+    runtimeCommandSource,
+    runtimeStatusPresentation,
   ] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/App.types.ts", root), "utf8"),
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
     readFile(new URL("backend/src/config.rs", root), "utf8"),
     readFile(new URL("backend/src/commands.rs", root), "utf8"),
+    readFile(new URL("backend/src/commands/runtime.rs", root), "utf8"),
+    loadTypeScriptModule(new URL("src/runtimeStatusPresentation.ts", root)),
   ]);
   const uiSource = `${appSource}\n${sectionsSource}`;
 
@@ -27,6 +33,18 @@ test("user FastCtx blocks embedded tools across the backend and settings", async
   assert.match(commandSource, /embedded_fast_context_tools_enabled\([\s\S]*config_input\.fast_context_tools/);
   assert.doesNotMatch(commandSource, /current_fast_context_tools_status\(\)\?/);
   assert.match(appSource, /setFastContextToolsStatus\([\s\S]*result\.fastContextToolsStatus/);
+  assert.match(appSource, /fastContextToolsStatus=\{fastContextToolsStatus\}/);
+  assert.match(runtimeCommandSource, /"fastContextToolsActive": fast_context_tools_active/);
+  const [fastctxFeature] = runtimeStatusPresentation.buildEnabledOptimizationFeatures(
+    { running: true, fastContextToolsActive: true },
+    { userConfigured: false, detectionFailed: false },
+  );
+  assert.equal(fastctxFeature.id, "fastctx-context-tools");
+  assert.equal(fastctxFeature.name, "FastCtx 上下文加速");
+  assert.equal(
+    fastctxFeature.detail,
+    "Codey 内置 FastCtx 已随当前运行实例加载",
+  );
   assert.match(uiSource, /const fastContextToolsEnabled =\s*config\.fastContextTools && !fastctxStatusBlocksEmbedded/);
   assert.match(uiSource, /checked=\{fastContextToolsEnabled\}/);
   assert.match(uiSource, /disabled=\{isBusy \|\| fastctxStatusBlocksEmbedded\}/);
@@ -64,6 +82,6 @@ test("Codey keeps FastCtx in the dedicated sidecar", async () => {
   assert.match(configPatchSource, /CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx"/);
   assert.match(configPatchSource, /FASTCTX_TOKEN_BUDGET/);
   assert.match(configPatchSource, /configured_user_fastctx_server_id\(doc\)\.is_some\(\)[\s\S]*disable_fast_context_tools\(doc\);[\s\S]*return Ok\(None\)/);
-  assert.match(configPatchSource, /persist_previous_fastctx_guidance_migration/);
-  assert.match(configPatchSource, /remove_previous_codey_fastctx_guidance/);
+  assert.doesNotMatch(configPatchSource, /persist_previous_fastctx_guidance_migration/);
+  assert.doesNotMatch(configPatchSource, /remove_previous_codey_fastctx_guidance/);
 });

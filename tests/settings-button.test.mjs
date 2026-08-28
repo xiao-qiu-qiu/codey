@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const source = readFileSync(new URL("../public/renderer-inject.js", import.meta.url), "utf8");
 const bridgeSource = readFileSync(new URL("../public/codey-bridge.js", import.meta.url), "utf8");
 
@@ -12,60 +14,15 @@ const runRenderer = (sandbox) => {
   vm.runInContext(source, context);
 };
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(tagName = "div", { visible = true, right = 100, width = right, height = 46, top = 0 } = {}) {
-    this.tagName = tagName.toUpperCase();
-    this.children = [];
-    this.dataset = {};
-    this.id = "";
-    this.parentElement = null;
+    super(tagName);
     this.right = right;
     this.width = width;
     this.height = height;
     this.top = top;
-    this.style = {};
-    this.textContent = "";
-    this.attributes = new Map();
-    this.listeners = new Map();
     this.visible = visible;
-    this.isConnected = false;
     this.rectReads = 0;
-  }
-
-  addEventListener(type, handler) {
-    if (typeof handler !== "function") return;
-    const handlers = this.listeners.get(type) || [];
-    handlers.push(handler);
-    this.listeners.set(type, handlers);
-  }
-
-  removeEventListener(type, handler) {
-    const handlers = this.listeners.get(type) || [];
-    this.listeners.set(type, handlers.filter((candidate) => candidate !== handler));
-  }
-
-  dispatchEvent(event) {
-    if (!event?.type) return true;
-    if (!event.target) event.target = this;
-    event.currentTarget = this;
-    for (const handler of [...(this.listeners.get(event.type) || [])]) {
-      handler.call(this, event);
-    }
-    return true;
-  }
-
-  get nextElementSibling() {
-    if (!this.parentElement) return null;
-    const index = this.parentElement.children.indexOf(this);
-    return index >= 0 ? this.parentElement.children[index + 1] || null : null;
-  }
-
-  appendChild(child) {
-    child.remove();
-    child.parentElement = this;
-    child.isConnected = true;
-    this.children.push(child);
-    return child;
   }
 
   insertBefore(child, before) {
@@ -101,47 +58,21 @@ class FakeElement {
   }
 
   querySelector() {
-    return null;
+    return super.querySelector(...arguments);
   }
 
   querySelectorAll(selector) {
-    if (selector !== "button, [role=button], a[href]") return [];
-    const controls = [];
-    const visit = (element) => {
-      for (const child of element.children) {
-        if (child.tagName === "BUTTON") controls.push(child);
-        visit(child);
-      }
-    };
-    visit(this);
-    return controls;
+    return super.querySelectorAll(selector);
   }
 
   matches(selector) {
     return selector
       .split(",")
-      .some((part) => part.trim().toUpperCase() === this.tagName);
+      .some((part) => super.matches(part.trim()));
   }
 
-  remove() {
-    if (!this.parentElement) return;
-    const index = this.parentElement.children.indexOf(this);
-    if (index >= 0) this.parentElement.children.splice(index, 1);
-    this.parentElement = null;
-    this.isConnected = false;
-  }
-
-  getAttribute(name) {
-    return this.attributes.has(name) ? this.attributes.get(name) : null;
-  }
-
-  removeAttribute(name) {
-    this.attributes.delete(name);
-  }
-
-  setAttribute(name, value) {
-    this.attributes.set(name, String(value));
-    if (name === "id") this.id = String(value);
+  closest(selector) {
+    return super.closest(selector);
   }
 }
 
@@ -192,6 +123,7 @@ test("moves the Codey button beside the visible header's trailing action region"
     HTMLElement: FakeElement,
     location: { pathname: "/", search: "" },
     MutationObserver: class {
+      disconnect() {}
       observe() {}
     },
     URLSearchParams,
@@ -204,7 +136,7 @@ test("moves the Codey button beside the visible header's trailing action region"
   assert.deepEqual(visibleHeader.children, [codeyButton, rightRegion]);
 });
 
-test("renders official account usage as a draggable floating card", async () => {
+test("renders weekly and optional five-hour usage above the sidebar account", async () => {
   const visibleHeader = new FakeElement("header", { right: 1200 });
   const sessionTitle = new FakeElement("div", { right: 700, width: 240 });
   sessionTitle.textContent = "当前会话";
@@ -214,11 +146,51 @@ test("renders official account usage as a draggable floating card", async () => 
   visibleHeader.appendChild(sessionTitle);
   visibleHeader.appendChild(rightRegion);
 
+  const sidebarRoot = new FakeElement("div", {
+    right: 320,
+    width: 320,
+    height: 800,
+  });
+  const sidebarNavigation = new FakeElement("nav", {
+    right: 320,
+    width: 320,
+    height: 720,
+  });
+  const sidebarScroll = new FakeElement("div", {
+    right: 320,
+    width: 320,
+    height: 620,
+  });
+  sidebarScroll.setAttribute("data-app-action-sidebar-scroll", "");
+  sidebarNavigation.appendChild(sidebarScroll);
+  const sidebarFooterHost = new FakeElement("div", {
+    right: 320,
+    width: 320,
+    height: 64,
+    top: 736,
+  });
+  const nativeProfileFooter = new FakeElement("div", {
+    right: 320,
+    width: 320,
+    height: 64,
+    top: 736,
+  });
+  nativeProfileFooter.appendChild(new FakeElement("button", {
+    right: 220,
+    width: 200,
+    height: 40,
+    top: 748,
+  }));
+  sidebarFooterHost.appendChild(nativeProfileFooter);
+  sidebarRoot.appendChild(sidebarNavigation);
+  sidebarRoot.appendChild(sidebarFooterHost);
+
   const documentElement = new FakeElement("html", {
     right: 1200,
     width: 1200,
     height: 800,
   });
+  documentElement.appendChild(sidebarRoot);
   const findById = (id) => {
     let result = null;
     const visit = (element) => {
@@ -240,11 +212,13 @@ test("renders official account usage as a draggable floating card", async () => 
     visibilityState: "visible",
     createElement: (tagName) => new FakeElement(tagName),
     getElementById: findById,
-    querySelector: () => null,
-    querySelectorAll: (selector) =>
-      selector === "header" ? [visibleHeader] : [],
+    querySelector: (selector) => document.querySelectorAll(selector)[0] || null,
+    querySelectorAll: (selector) => {
+      if (selector === "header") return [visibleHeader];
+      if (selector === "nav") return [sidebarNavigation];
+      return documentElement.querySelectorAll(selector);
+    },
   };
-  const storedItems = new Map();
   const windowListeners = new Map();
   const addWindowListener = (type, handler) => {
     const handlers = windowListeners.get(type) || [];
@@ -267,6 +241,7 @@ test("renders official account usage as a draggable floating card", async () => 
   let accountUsageResult = {
     status: "ok",
     planType: "pro",
+    fetchedAt: Math.floor(Date.now() / 1000),
     primary: {
       usedPercent: 15,
       windowMinutes: 300,
@@ -277,14 +252,55 @@ test("renders official account usage as a draggable floating card", async () => 
       windowMinutes: 10080,
       resetsAt: Math.floor(tomorrowResetAt.getTime() / 1000),
     },
+    credits: {
+      hasCredits: true,
+      unlimited: false,
+      balance: "42",
+    },
   };
   let accountUsageCalls = 0;
+  let appServerUsageCalls = 0;
+  const appServerUsageResult = {
+    rateLimits: {
+      limitId: "codex",
+      primary: {
+        usedPercent: 20,
+        windowDurationMins: 10_080,
+        resetsAt: Math.floor(tomorrowResetAt.getTime() / 1000),
+      },
+      credits: {
+        hasCredits: true,
+        unlimited: false,
+        balance: "77",
+      },
+      planType: "plus",
+    },
+    rateLimitsByLimitId: {
+      codex_bengalfox: {
+        limitId: "codex_bengalfox",
+        primary: {
+          usedPercent: 35,
+          windowDurationMins: 300,
+          resetsAt: Math.floor(todayResetAt.getTime() / 1000),
+        },
+      },
+    },
+  };
   const scheduledDelays = [];
   const window = {
+    __codeyReadAccountRateLimits: async () => {
+      appServerUsageCalls += 1;
+      return appServerUsageResult;
+    },
+    __codeySessionToolsInjectLoaded: true,
     __codexSessionDeleteBridge: async (path) => {
-      assert.equal(path, "/account/usage");
-      accountUsageCalls += 1;
-      return accountUsageResult;
+      if (path === "/account/usage") {
+        accountUsageCalls += 1;
+        return accountUsageResult;
+      }
+      if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+      if (path === "/backend/health") return { status: "ok" };
+      throw new Error(`unexpected bridge path: ${path}`);
     },
     addEventListener: addWindowListener,
     alert() {},
@@ -293,12 +309,7 @@ test("renders official account usage as a draggable floating card", async () => 
     getComputedStyle: () => ({ display: "flex", visibility: "visible" }),
     innerHeight: 800,
     innerWidth: 1200,
-    localStorage: {
-      getItem: (key) => storedItems.get(key) || null,
-      key: () => null,
-      length: 0,
-      setItem: (key, value) => storedItems.set(key, String(value)),
-    },
+    localStorage: { getItem: () => null, key: () => null, length: 0, setItem() {} },
     removeEventListener: removeWindowListener,
     setTimeout: (_callback, delay) => {
       scheduledDelays.push(delay);
@@ -313,6 +324,7 @@ test("renders official account usage as a draggable floating card", async () => 
     HTMLElement: FakeElement,
     location: { pathname: "/", search: "" },
     MutationObserver: class {
+      disconnect() {}
       observe() {}
     },
     URLSearchParams,
@@ -323,89 +335,75 @@ test("renders official account usage as a draggable floating card", async () => 
 
   const usage = findById("codey-account-usage");
   const settingsButton = findById("codey-settings-button");
+  const injectedStyle = findById("codey-core-injected-style");
   assert.ok(usage);
   assert.ok(settingsButton);
-  assert.equal(usage.parentElement, document.body);
-  assert.notEqual(usage.nextElementSibling, settingsButton);
-  assert.equal(usage.style.right, "24px");
-  assert.equal(usage.style.bottom, "24px");
-  assert.equal(usage.style.left, "auto");
-  assert.equal(usage.style.top, "auto");
+  assert.ok(injectedStyle);
+  assert.match(injectedStyle.textContent, /#codey-account-usage \{[^}]*background: transparent;/);
+  assert.doesNotMatch(injectedStyle.textContent, /#codey-account-usage \{[^}]*background:[^;}]*Canvas/);
+  assert.match(injectedStyle.textContent, /\.codey-usage-meter \{ display: block;[^}]*height: 2px;[^}]*max-height: 2px;/);
+  assert.match(injectedStyle.textContent, /data-tone="healthy"[^}]*background: #34c759;/);
+  assert.match(injectedStyle.textContent, /data-tone="normal"[^}]*background: #0a84ff;/);
+  assert.match(injectedStyle.textContent, /data-tone="warning"[^}]*background: #ffcc00;/);
+  assert.match(injectedStyle.textContent, /data-tone="critical"[^}]*background: #ff453a;/);
+  assert.match(injectedStyle.textContent, /#codey-account-usage:hover \.codey-usage-details/);
+  assert.match(injectedStyle.textContent, /\.codey-usage-details \{[^}]*background: rgb\(34 34 34 \/ \.97\);/);
+  assert.match(injectedStyle.textContent, /\.codey-usage-plan-tag \{[^}]*border:[^}]*background: color-mix\(in srgb, #0a84ff 13%, transparent\);/);
+  assert.equal(usage.parentElement, sidebarFooterHost);
+  assert.equal(usage.nextElementSibling, nativeProfileFooter);
+  assert.deepEqual(sidebarFooterHost.children, [usage, nativeProfileFooter]);
+  assert.equal(sidebarFooterHost.getAttribute("data-codey-usage-host"), "true");
   assert.equal(sessionTitle.parentElement, visibleHeader);
   assert.equal(visibleHeader.children[0], sessionTitle);
   assert.equal(visibleHeader.getAttribute("data-codey-usage-host"), null);
-  assert.match(usage.innerHTML, /class="codey-usage-heading-title">官方额度/);
   assert.match(usage.innerHTML, /class="codey-usage-list"/);
-  assert.match(usage.innerHTML, /5 小时/);
-  assert.match(usage.innerHTML, /85%/);
-  assert.match(usage.innerHTML, /7 天/);
-  assert.match(usage.innerHTML, /60%/);
-  assert.equal(usage.dataset.plan, "pro-20x");
-  assert.match(usage.innerHTML, /class="codey-usage-plan" data-plan="pro-20x">Pro 20x/);
-  assert.match(usage.innerHTML, /data-tone="healthy"[\s\S]*?85%/);
-  assert.match(usage.innerHTML, /data-tone="normal"[\s\S]*?60%/);
-  assert.match(usage.innerHTML, /今天 \d{2}:\d{2} 刷新/);
-  assert.match(usage.innerHTML, /明天 \d{2}:\d{2} 刷新/);
-  assert.match(usage.getAttribute("aria-label"), /当前套餐 Pro 20x/);
+  assert.match(usage.innerHTML, /周额度[\s\S]*?60%[\s\S]*?5 小时[\s\S]*?85%/);
+  assert.match(usage.innerHTML, /data-window="weekly" data-tone="normal"/);
+  assert.match(usage.innerHTML, /data-window="five-hour" data-tone="healthy"/);
+  assert.match(usage.innerHTML, /今天 \d{2}:\d{2} 重置/);
+  assert.match(usage.innerHTML, /明天 \d{2}:\d{2} 重置/);
+  const summaryHtml = usage.innerHTML.split('class="codey-usage-details"')[0];
+  assert.match(summaryHtml, /class="codey-usage-plan-tag">Pro 20x<\/span>[\s\S]*?周额度[\s\S]*?60%/);
+  assert.doesNotMatch(summaryHtml, /余额|42/);
+  assert.match(usage.innerHTML, /class="codey-usage-details" role="tooltip"/);
+  assert.doesNotMatch(usage.innerHTML, /codey-usage-details-plan/);
+  assert.match(usage.innerHTML, /5 小时额度[\s\S]*?剩余 85%[\s\S]*?已用 15%/);
+  assert.match(usage.innerHTML, /周额度[\s\S]*?剩余 60%[\s\S]*?已用 40%/);
+  assert.match(usage.innerHTML, /Credits 余额[\s\S]*?42/);
+  assert.match(usage.innerHTML, /更新于 \d{2}:\d{2}/);
+  assert.equal(usage.dataset.windowCount, "2");
+  assert.equal(usage.dataset.plan, undefined);
+  assert.equal(usage.getAttribute("tabindex"), "0");
+  assert.equal(usage.getAttribute("aria-describedby"), "codey-account-usage-details");
+  assert.match(usage.getAttribute("aria-label"), /周额度剩余 60%/);
   assert.match(usage.getAttribute("aria-label"), /5 小时额度剩余 85%/);
-
-  usage.right = 1140;
-  usage.width = 176;
-  usage.height = 128;
-  usage.top = 600;
-  let pointerDownPrevented = false;
-  usage.dispatchEvent({
-    type: "pointerdown",
-    button: 0,
-    pointerId: 7,
-    clientX: 1030,
-    clientY: 620,
-    preventDefault: () => {
-      pointerDownPrevented = true;
-    },
-    stopPropagation() {},
-  });
-  assert.equal(pointerDownPrevented, true);
-  assert.equal(usage.getAttribute("data-dragging"), "true");
-  dispatchWindowEvent({
-    type: "pointermove",
-    pointerId: 7,
-    clientX: 860,
-    clientY: 450,
-    preventDefault() {},
-  });
-  dispatchWindowEvent({ type: "pointerup", pointerId: 7 });
-  assert.equal(usage.getAttribute("data-dragging"), null);
-  assert.equal(usage.style.left, "794px");
-  assert.equal(usage.style.top, "430px");
-  assert.equal(usage.style.right, "auto");
-  assert.equal(usage.style.bottom, "auto");
-  assert.deepEqual(
-    JSON.parse(storedItems.get("codey.accountUsage.position.v1")),
-    { left: 794, top: 430 },
-  );
 
   accountUsageResult = {
     ...accountUsageResult,
-    planType: "pro_5x",
     primary: { ...accountUsageResult.primary, usedPercent: 65 },
     secondary: { ...accountUsageResult.secondary, usedPercent: 85 },
   };
   await window.__codeyRefreshAccountUsage();
-  assert.equal(usage.dataset.plan, "pro-5x");
-  assert.match(usage.innerHTML, /class="codey-usage-plan" data-plan="pro-5x">Pro 5x/);
-  assert.match(usage.innerHTML, /data-tone="warning"[\s\S]*?35%/);
-  assert.match(usage.innerHTML, /data-tone="critical"[\s\S]*?15%/);
+  assert.match(usage.innerHTML, /data-window="weekly" data-tone="critical"[\s\S]*?15%/);
+  assert.match(usage.innerHTML, /data-window="five-hour" data-tone="warning"[\s\S]*?35%/);
 
-  accountUsageResult = { ...accountUsageResult, planType: "plus" };
+  accountUsageResult = {
+    ...accountUsageResult,
+    primary: accountUsageResult.secondary,
+    secondary: null,
+  };
   await window.__codeyRefreshAccountUsage();
-  assert.equal(usage.dataset.plan, "plus");
-  assert.match(usage.innerHTML, /class="codey-usage-plan" data-plan="plus">Plus/);
+  assert.equal(usage.dataset.windowCount, "1");
+  assert.match(usage.innerHTML, /周额度/);
+  assert.doesNotMatch(usage.innerHTML, /5 小时/);
 
-  accountUsageResult = { ...accountUsageResult, planType: "free" };
+  accountUsageResult = { status: "error", message: "官方额度接口返回 401" };
   await window.__codeyRefreshAccountUsage();
-  assert.equal(usage.dataset.plan, "free");
-  assert.match(usage.innerHTML, /class="codey-usage-plan" data-plan="free">Free/);
+  assert.equal(appServerUsageCalls, 1);
+  assert.equal(usage.dataset.windowCount, "2");
+  assert.match(usage.innerHTML, /周额度[\s\S]*?80%[\s\S]*?5 小时[\s\S]*?65%/);
+  assert.match(usage.innerHTML, /Credits 余额[\s\S]*?77/);
+  assert.match(usage.innerHTML, /class="codey-usage-plan-tag">Plus<\/span>/);
 
   accountUsageResult = { status: "unavailable", reason: "third_party" };
   const refreshSchedulesBeforeUnavailable = scheduledDelays.filter(
@@ -413,6 +411,7 @@ test("renders official account usage as a draggable floating card", async () => 
   ).length;
   await window.__codeyRefreshAccountUsage();
   assert.equal(findById("codey-account-usage"), null);
+  assert.equal(sidebarFooterHost.getAttribute("data-codey-usage-host"), null);
   assert.equal(visibleHeader.getAttribute("data-codey-usage-host"), null);
   assert.equal(
     scheduledDelays.filter((delay) => delay === 60_000).length,
@@ -424,17 +423,21 @@ test("renders official account usage as a draggable floating card", async () => 
     planType: "plus",
     primary: {
       usedPercent: 20,
-      windowMinutes: 300,
-      resetsAt: Math.floor(todayResetAt.getTime() / 1000),
+      windowMinutes: 10080,
+      resetsAt: Math.floor(tomorrowResetAt.getTime() / 1000),
     },
   };
   await window.__codeyRefreshAccountUsage();
   const remountedUsage = findById("codey-account-usage");
   assert.ok(remountedUsage);
   assert.equal(accountUsageCalls, 6);
-  assert.equal(remountedUsage.parentElement, document.body);
-  assert.equal(remountedUsage.style.left, "794px");
-  assert.equal(remountedUsage.style.top, "430px");
+  assert.equal(appServerUsageCalls, 1);
+  assert.equal(remountedUsage.parentElement, sidebarFooterHost);
+  assert.equal(remountedUsage.nextElementSibling, nativeProfileFooter);
+  assert.match(remountedUsage.innerHTML, /周额度/);
+  const remountedSummaryHtml = remountedUsage.innerHTML.split('class="codey-usage-details"')[0];
+  assert.doesNotMatch(remountedSummaryHtml, /5 小时/);
+  assert.match(remountedSummaryHtml, /class="codey-usage-plan-tag">Plus<\/span>/);
 });
 
 const createStartupUpdateFixture = (bridge) => {
@@ -444,12 +447,20 @@ const createStartupUpdateFixture = (bridge) => {
   let nextTimerId = 1;
   const timers = [];
   const events = [];
+  const alerts = [];
+  const documentListeners = new Map();
   const activeTimers = () => timers.filter((timer) => !timer.cleared);
   const visibleButton = () =>
     elementsById.get("codey-settings-button") || null;
   const document = {
     body: new FakeElement("body"),
     documentElement,
+    visibilityState: "visible",
+    addEventListener(type, handler) {
+      const handlers = documentListeners.get(type) || [];
+      handlers.push(handler);
+      documentListeners.set(type, handlers);
+    },
     createElement: (tagName) => {
       const element = new FakeElement(tagName);
       let id = element.id;
@@ -481,8 +492,8 @@ const createStartupUpdateFixture = (bridge) => {
   const window = {
     __codexSessionDeleteBridge: bridge,
     addEventListener() {},
-    alert() {
-      throw new Error("startup update check must use page UI, not alert");
+    alert(message) {
+      alerts.push(String(message));
     },
     clearTimeout(id) {
       const timer = timers.find((entry) => entry.id === id);
@@ -524,7 +535,13 @@ const createStartupUpdateFixture = (bridge) => {
 
   return {
     activeTimers,
+    alerts,
     document,
+    dispatchDocumentEvent(type) {
+      for (const handler of documentListeners.get(type) || []) {
+        handler({ type });
+      }
+    },
     elementsById,
     events,
     timers,
@@ -547,6 +564,7 @@ test("hydrates the passive update badge from startup backend state", async () =>
         },
       };
     }
+    if (path === "/backend/health") return { status: "ok" };
     throw new Error(`unexpected bridge path: ${path}`);
   });
 
@@ -557,8 +575,10 @@ test("hydrates the passive update badge from startup backend state", async () =>
   assert.equal(button.getAttribute("data-codey-update-available"), "true");
   assert.equal(button.getAttribute("aria-label"), "打开 Codey 配置，有可用更新");
   assert.equal(fixture.window.__codeyUpdateAvailability.latestVersion, "0.4.0");
-  assert.equal(fixture.events.length, 1);
-  assert.equal(fixture.events[0].type, "codey-update-availability-changed");
+  const updateEvents = fixture.events.filter(
+    (event) => event.type === "codey-update-availability-changed",
+  );
+  assert.equal(updateEvents.length, 1);
   assert.equal(fixture.document.getElementById("codey-update-check-status"), null);
   assert.equal(fixture.document.getElementById("codey-update-dialog"), null);
   assert.equal(
@@ -567,8 +587,21 @@ test("hydrates the passive update badge from startup backend state", async () =>
   );
   assert.deepEqual(
     bridgeCalls.map(({ path }) => path),
-    ["/backend/status"],
+    ["/backend/status", "/backend/health"],
   );
+  assert.equal(
+    fixture.activeTimers().some((timer) => timer.delay === 30_000),
+    true,
+  );
+
+  let unchangedAttributeWrites = 0;
+  const originalSetAttribute = button.setAttribute.bind(button);
+  button.setAttribute = (...args) => {
+    unchangedAttributeWrites += 1;
+    originalSetAttribute(...args);
+  };
+  await fixture.window.__codeyRefreshRuntimeHealth();
+  assert.equal(unchangedAttributeWrites, 0);
 });
 
 test("falls back to a passive periodic check when backend update state hangs", async () => {
@@ -589,6 +622,103 @@ test("falls back to a passive periodic check when backend update state hangs", a
   assert.equal(fixture.window.__codeyUpdateAvailability, null);
   assert.equal(
     fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
+    true,
+  );
+});
+
+test("marks the Codey icon unavailable after consecutive hung health checks and recovers", async () => {
+  let healthMode = "hang";
+  const fixture = createStartupUpdateFixture(async (path) => {
+    if (path === "/backend/status") {
+      return { status: "ok", availableUpdate: null };
+    }
+    if (path === "/backend/health") {
+      return healthMode === "healthy"
+        ? { status: "ok" }
+        : new Promise(() => {});
+    }
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+
+  const fireLatestHealthTimeout = () => {
+    const timer = fixture.activeTimers()
+      .filter((candidate) => candidate.delay === 3_250)
+      .at(-1);
+    assert.ok(timer, "health timeout should be armed");
+    timer.cleared = true;
+    timer.callback();
+  };
+
+  fireLatestHealthTimeout();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const button = fixture.document.getElementById("codey-settings-button");
+  assert.ok(button);
+  assert.equal(button.getAttribute("data-codey-runtime-state"), "checking");
+
+  const retryTimer = fixture.activeTimers().find(
+    (candidate) => candidate.delay === 1_000,
+  );
+  assert.ok(retryTimer, "first health failure should retry after one second");
+  retryTimer.cleared = true;
+  retryTimer.callback();
+  fireLatestHealthTimeout();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(button.getAttribute("data-codey-runtime-state"), "unavailable");
+  assert.match(button.getAttribute("aria-label"), /Codey 进程异常或连接中断/);
+  assert.match(button.title, /Codey 后端未响应/);
+  button.dispatchEvent({
+    type: "click",
+    preventDefault() {},
+    stopPropagation() {},
+  });
+  assert.deepEqual(fixture.alerts, [
+    "Codey 进程异常或已退出，当前配置面板无法连接。请退出 Codex 后重新启动 Codey。",
+  ]);
+
+  healthMode = "healthy";
+  await fixture.window.__codeyRefreshRuntimeHealth();
+
+  assert.equal(button.getAttribute("data-codey-runtime-state"), "healthy");
+  assert.equal(button.getAttribute("aria-label"), "打开 Codey 配置");
+  assert.equal(button.title, "打开 Codey 配置");
+  assert.equal(fixture.window.__codeyRuntimeHealth.consecutiveFailures, 0);
+});
+
+test("pauses Codey health checks while the page is hidden and resumes immediately", async () => {
+  let healthCalls = 0;
+  const fixture = createStartupUpdateFixture(async (path) => {
+    if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+    if (path === "/backend/health") {
+      healthCalls += 1;
+      return { status: "ok" };
+    }
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(healthCalls, 1);
+
+  fixture.document.visibilityState = "hidden";
+  fixture.dispatchDocumentEvent("visibilitychange");
+  assert.equal(
+    fixture.activeTimers().some((timer) => timer.delay === 30_000),
+    false,
+  );
+  await fixture.window.__codeyRefreshRuntimeHealth();
+  assert.equal(healthCalls, 1);
+
+  fixture.document.visibilityState = "visible";
+  fixture.dispatchDocumentEvent("visibilitychange");
+  const immediateTimer = fixture.activeTimers().find((timer) => timer.delay === 0);
+  assert.ok(immediateTimer);
+  immediateTimer.cleared = true;
+  immediateTimer.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(healthCalls, 2);
+  assert.equal(
+    fixture.activeTimers().some((timer) => timer.delay === 30_000),
     true,
   );
 });

@@ -1,16 +1,19 @@
 mod account_usage;
-mod cc_switch;
 mod cdp;
 mod codex_config;
 mod codex_config_guidance;
+mod codex_provider;
 mod codex_startup_patch;
 mod commands;
 mod config;
 mod crashpad_pending_guard;
 mod error_log;
+pub mod fastctx;
 mod fastctx_route_gate;
 mod fs_util;
+mod http_response;
 mod launcher;
+mod local_router;
 mod maintenance_lock;
 mod message_delete;
 mod model_catalog;
@@ -24,7 +27,6 @@ mod plugin_marketplace;
 mod process_cleanup;
 mod process_tree;
 mod prompt_optimization;
-mod provider_lease;
 mod provider_models;
 mod session_delete;
 mod session_delete_tombstone;
@@ -34,7 +36,10 @@ mod session_transfer;
 mod sqlite_util;
 mod startup_maintenance;
 mod startup_update;
+mod subagent;
+mod subagent_control_mcp;
 mod subagent_gate;
+mod subagent_orchestrator;
 mod subagent_policy;
 mod subagent_state_cleanup;
 mod trace_log_guard;
@@ -99,6 +104,10 @@ pub fn run_subagent_gate_hook_if_requested() -> Result<bool> {
     subagent_gate::run_hook_if_requested()
 }
 
+pub fn run_subagent_control_mcp_if_requested() -> Result<bool> {
+    subagent_control_mcp::run_if_requested()
+}
+
 pub fn run_fastctx_route_hook_if_requested() -> Result<bool> {
     fastctx_route_gate::run_hook_if_requested()
 }
@@ -131,7 +140,7 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
     error_log::initialize();
     let state = Arc::new(AppState::default());
     let codex_home = codex_config::codex_home();
-    if let Err(error) = launcher::restore_previous_runtime_state(&codex_home).await {
+    if let Err(error) = launcher::restore_previous_runtime_state(codex_home).await {
         error_log::record_failure_with_metadata(
             "restore_failed",
             "restore_previous_runtime_state_at_startup",
@@ -144,7 +153,20 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
         );
         eprintln!("Codey 启动前恢复上次临时配置失败：{error:#}");
     }
-    match repair_legacy_model_catalog(&codex_home).await {
+    if let Err(error) = launcher::prepare_persistent_router_resume_shim(codex_home).await {
+        error_log::record_failure_with_metadata(
+            "patch_failed",
+            "prepare_persistent_router_resume_shim_at_startup",
+            format!("{error:#}"),
+            error_log::FailureMetadata {
+                stage: Some("startup.prepare_router_resume_shim".to_string()),
+                recoverable: Some(true),
+            },
+            serde_json::json!({}),
+        );
+        eprintln!("Codey 启动前写入 codey_router 恢复兼容桩失败：{error:#}");
+    }
+    match repair_legacy_model_catalog(codex_home).await {
         Ok(true) => eprintln!("已修复旧版 Codey 模型目录缺失的 description 字段"),
         Ok(false) => {}
         Err(error) => {
@@ -169,58 +191,30 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
     if startup_update_outcome == startup_update::StartupUpdateOutcome::InstallScheduled {
         return Ok(());
     }
-    let shutdown_reason = 'runtime: loop {
-        match commands::launch_codey_runtime(&state).await {
-            Ok(_) => {
-                break tokio::select! {
-                    reason = state.wait_for_shutdown() => match reason {
-                        AppShutdownReason::CodexExited => ShutdownReason::CodexExited,
-                        AppShutdownReason::InstallUpdate => ShutdownReason::InstallUpdate,
-                    },
-                    _ = &mut shutdown => ShutdownReason::Signal,
-                };
-            }
-            Err(error) if commands::is_cc_switch_route_recovery_error(&error) => {
-                eprintln!(
-                    "Codey 自动启动 Codex 时检测到 CC Switch 路由尚未稳定；Codey 将保持运行并等待路由恢复：{error}"
+    let shutdown_reason = match commands::launch_codey_runtime(&state).await {
+        Ok(_) => tokio::select! {
+            reason = state.wait_for_shutdown() => match reason {
+                AppShutdownReason::CodexExited => ShutdownReason::CodexExited,
+                AppShutdownReason::InstallUpdate => ShutdownReason::InstallUpdate,
+            },
+            _ = &mut shutdown => ShutdownReason::Signal,
+        },
+        Err(error) => {
+            eprintln!("Codey 自动启动 Codex 失败：{error:#}");
+            let cleanup = stop_runtime_with_retry(&state).await;
+            if let Err(cleanup_error) = &cleanup {
+                error_log::record_failure(
+                    "restore_failed",
+                    "restore_runtime_after_startup_failure",
+                    cleanup_error.clone(),
+                    serde_json::json!({}),
                 );
-                let mut ready_streak = 0_u8;
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(
-                            commands::CC_SWITCH_ROUTE_RECOVERY_INTERVAL
-                        ) => {}
-                        _ = &mut shutdown => break 'runtime ShutdownReason::Signal,
-                    }
-                    if commands::cc_switch_route_ready_for_recovery().await {
-                        ready_streak = ready_streak.saturating_add(1);
-                    } else {
-                        ready_streak = 0;
-                    }
-                    if ready_streak >= commands::CC_SWITCH_ROUTE_RECOVERY_STABLE_READS {
-                        eprintln!("CC Switch 路由已稳定，正在启动 Codex");
-                        break;
-                    }
-                }
             }
-            Err(error) => {
-                eprintln!("Codey 自动启动 Codex 失败：{error:#}");
-                let cleanup = stop_runtime_with_retry(&state).await;
-                if let Err(cleanup_error) = &cleanup {
-                    error_log::record_failure(
-                        "restore_failed",
-                        "restore_runtime_after_startup_failure",
-                        cleanup_error.clone(),
-                        serde_json::json!({}),
-                    );
-                }
-                let error = initial_startup_failure_error(
-                    &error,
-                    cleanup.as_ref().err().map(String::as_str),
-                );
-                show_initial_startup_failure(&error).await;
-                return Err(anyhow::Error::msg(error));
-            }
+            let error =
+                initial_startup_failure_error(&error, cleanup.as_ref().err().map(String::as_str));
+            #[cfg(windows)]
+            show_initial_startup_failure(&error).await;
+            return Err(anyhow::Error::msg(error));
         }
     };
 
@@ -308,9 +302,6 @@ async fn show_initial_startup_failure(error: &str) {
         eprintln!("Codey 启动失败提示框显示异常：{dialog_error}");
     }
 }
-
-#[cfg(not(windows))]
-async fn show_initial_startup_failure(_error: &str) {}
 
 async fn shutdown_signal() {
     #[cfg(unix)]
