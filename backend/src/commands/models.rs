@@ -2225,6 +2225,7 @@ mod tests {
                 slug: "gpt-5.6-sol".into(),
                 display_name: "GPT-5.6 Sol".into(),
                 supported: true,
+                supports_subagent: true,
                 supported_reasoning_efforts: vec!["medium".into()],
                 default_reasoning_effort: "medium".into(),
             }],

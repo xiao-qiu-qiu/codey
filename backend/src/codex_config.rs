@@ -608,13 +608,14 @@ fn apply_isolated_test_runtime_config(
     use_official_catalog: bool,
     fastctx_command: Option<&Path>,
     subagent_optimization: bool,
+    subagent_guidance: &str,
     subagent_model: &str,
     subagent_reasoning_effort: &str,
     subagent_roles: Option<&BTreeMap<String, SubagentRoleConfig>>,
     marker: &Path,
     backup_root: &Path,
 ) -> Result<AppliedRuntimeRouterConfig> {
-    apply_isolated_runtime_router_config(
+    apply_isolated_runtime_router_config_with_guidance(
         home,
         RouterApplyOptions {
             local_router: test_runtime_router_endpoint(),
@@ -628,6 +629,7 @@ fn apply_isolated_test_runtime_config(
             marker,
             backup_root,
         },
+        subagent_guidance,
     )
 }
 

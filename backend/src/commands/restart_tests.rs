@@ -295,7 +295,7 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
         catalog["model_metadata"][0],
         json!({
             "model": "source-provider/gpt-5.6-sol",
-            "display_name": "[默认] gpt-5.6-sol",
+            "display_name": "默认配置 / gpt-5.6-sol",
             "route_name": "默认配置",
             "route_prefix": "默认",
             "provider_id": "codey_router",
@@ -312,7 +312,7 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
         catalog["model_metadata"][5],
         json!({
             "model": "source-provider/provider-fast-coder",
-            "display_name": "[默认] provider-fast-coder",
+            "display_name": "默认配置 / provider-fast-coder",
             "route_name": "默认配置",
             "route_prefix": "默认",
             "provider_id": "codey_router",
@@ -396,6 +396,7 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
             slug: "gpt-5.6-sol".into(),
             display_name: "GPT-5.6-Sol".into(),
             supported: true,
+            supports_subagent: true,
             supported_reasoning_efforts: vec!["low".into(), "medium".into()],
             default_reasoning_effort: "low".into(),
         }],
@@ -415,7 +416,7 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
         catalog["model_metadata"][0],
         json!({
             "model": "openai/gpt-5.6-sol",
-            "display_name": "[官] gpt-5.6-sol",
+            "display_name": "gpt-5.6-sol",
             "route_name": "默认配置",
             "route_prefix": "官",
             "provider_id": crate::local_router::ROUTER_PROVIDER_ID,

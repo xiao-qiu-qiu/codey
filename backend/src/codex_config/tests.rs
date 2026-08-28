@@ -151,6 +151,7 @@ fn failed_initial_lease_never_publishes_runtime_policy() {
         false,
         None,
         true,
+        SUBAGENT_GUIDANCE,
         DEFAULT_SUBAGENT_MODEL,
         DEFAULT_SUBAGENT_REASONING_EFFORT,
         None,
@@ -1873,7 +1874,7 @@ command = "echo preserve-user-hook"
     let pre_tool_use = document["hooks"]["PreToolUse"]
         .as_array_of_tables()
         .unwrap();
-    assert_eq!(pre_tool_use.len(), 1);
+    assert_eq!(pre_tool_use.len(), 2);
     let preserved_handler = pre_tool_use.get(0).unwrap()["hooks"]
         .as_array_of_tables()
         .unwrap()
@@ -1931,20 +1932,17 @@ command = "echo preserve-user-hook"
             .as_str()
             .is_some_and(|hash| hash.starts_with("sha256:"))
     );
-    let result = patch_config_with_fastctx_mode_and_proxy(
+    let result = patch_config_with_fastctx_mode(
         &existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
             fastctx_command: None,
-            subagent_optimization: true,
+            subagent_optimization: false,
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-            preserve_provider_route: false,
-            protocol_proxy_base_url: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
     .unwrap();
@@ -2822,6 +2820,7 @@ wire_api = "responses"
         PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
     )
     .unwrap();
+    let custom_guidance = "## 自定义子代理策略\n\n只派发边界清晰的任务。";
     let applied = apply_isolated_test_runtime_config(
         &home,
         true,
@@ -2878,7 +2877,7 @@ wire_api = "responses"
             .iter()
             .any(|entry| entry.starts_with("agents.default.config_file="))
     );
-    for role in SUBAGENT_RUNTIME_ROLE_IDS {
+    for role in SUBAGENT_ROLE_IDS {
         for field in ["config_file", "description"] {
             let key = format!("agents.{role}.{field}");
             assert!(
@@ -3063,7 +3062,7 @@ wire_api = "responses"
             .join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)
             .exists()
     );
-    for role in SUBAGENT_RUNTIME_ROLE_IDS {
+    for role in SUBAGENT_ROLE_IDS {
         let runtime_path = if role == SUBAGENT_ROLE_DEFAULT {
             constraints_dir.join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)
         } else {
@@ -3128,6 +3127,7 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
     )
     .unwrap();
 
+    let reapplied_guidance = "## 更新后的 GUI 子代理策略\n\n优先并行处理独立任务。";
     let reapplied = apply_isolated_test_runtime_config(
         &home,
         true,
