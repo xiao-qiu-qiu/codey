@@ -13,6 +13,9 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
+    for variable in ["CODEY_ENABLE_SELF_UPDATE", "CODEY_UPDATE_BASE_URL"] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
 
     let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
     let status = Command::new(npm)
