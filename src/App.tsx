@@ -260,6 +260,9 @@ export function App({
         defaultSubagentGuidance?: string;
       }>("load_codey_config");
       setPersistedConfig(result.config);
+      setDefaultSubagentGuidance(
+        result.defaultSubagentGuidance ?? result.config.subagentGuidance,
+      );
       setProviderStatus(result.providerStatus ?? null);
       if (typeof result.officialAccountAvailable === "boolean") {
         setStatus((current) => ({
@@ -1219,6 +1222,7 @@ export function App({
                 tooltipContainer={portalContainer}
                 isBusy={isBusy}
                 subagentModelOptions={subagentModelOptions}
+                defaultSubagentGuidance={defaultSubagentGuidance}
                 onConfigChange={handleConfigChange}
                 onSubagentOptimizationChange={handleSubagentOptimizationChange}
               />

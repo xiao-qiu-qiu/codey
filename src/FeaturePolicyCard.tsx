@@ -1,5 +1,10 @@
 import { memo, type CSSProperties } from "react";
-import { IconAdjustmentsHorizontal, IconInfoCircle, IconUsersGroup } from "@tabler/icons-react";
+import {
+  IconAdjustmentsHorizontal,
+  IconInfoCircle,
+  IconRestore,
+  IconUsersGroup,
+} from "@tabler/icons-react";
 
 import type {
   Config,
@@ -9,6 +14,7 @@ import type {
 import {
   ActionIcon,
   Badge,
+  Button,
   Card,
   Select,
   Switch,
@@ -148,6 +154,9 @@ export function SubagentPolicyCardComponent({
     enabledReadOnlyRoleNames.length > 0
       ? `可写子代理已全部关闭；${enabledReadOnlyRoleNames.join("、")}仍可使用。`
       : "可写子代理已全部关闭；请先启用至少一个只读角色。";
+  const subagentGuidanceBytes = new TextEncoder().encode(
+    config.subagentGuidance,
+  ).byteLength;
 
   return (
     <section className="secondary-section subagent-section" aria-labelledby="subagent-title">
@@ -334,8 +343,89 @@ export function SubagentPolicyCardComponent({
                         </Table.Tr>
                       );
                     })}
+                    {SUBAGENT_FIXED_ROLE_TYPES.map((task) => (
+                      <Table.Tr key={task.id} className="subagent-fixed-role-row">
+                        <Table.Td />
+                        <Table.Td>
+                          <div className="subagent-role-name">
+                            <span>{task.name}</span>
+                            <Badge variant="secondary" size="xs">固定</Badge>
+                            <Tooltip
+                              content={task.description}
+                              getPopupContainer={() =>
+                                popupContainer ?? tooltipContainer ?? document.body
+                              }
+                              position="top"
+                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                            >
+                              <ActionIcon
+                                variant="subtle"
+                                color="gray"
+                                size="xs"
+                                radius="sm"
+                                className="subagent-role-info-btn"
+                                aria-label={`${task.name}：${task.description}`}
+                              >
+                                <IconInfoCircle size={13} aria-hidden="true" />
+                              </ActionIcon>
+                            </Tooltip>
+                          </div>
+                        </Table.Td>
+                        <Table.Td>
+                          <span className="subagent-fixed-value">{task.model}</span>
+                        </Table.Td>
+                        <Table.Td>
+                          <span className="subagent-fixed-value">
+                            {REASONING_EFFORT_LABELS[task.reasoningEffort]}
+                          </span>
+                        </Table.Td>
+                      </Table.Tr>
+                    ))}
                   </Table.Tbody>
                 </Table>
+              </div>
+              <div className="subagent-guidance-editor">
+                <div className="subagent-guidance-toolbar">
+                  <label htmlFor="subagent-guidance">主代理委派策略</label>
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    disabled={
+                      isBusy ||
+                      !defaultSubagentGuidance ||
+                      config.subagentGuidance === defaultSubagentGuidance
+                    }
+                    onClick={() =>
+                      onConfigChange({
+                        ...config,
+                        subagentGuidance: defaultSubagentGuidance,
+                      })
+                    }
+                  >
+                    <IconRestore size={14} aria-hidden="true" />
+                    恢复默认
+                  </Button>
+                </div>
+                <textarea
+                  id="subagent-guidance"
+                  className="subagent-guidance-textarea"
+                  value={config.subagentGuidance}
+                  disabled={isBusy}
+                  maxLength={32768}
+                  spellCheck={false}
+                  onChange={(event) =>
+                    onConfigChange({
+                      ...config,
+                      subagentGuidance: event.currentTarget.value,
+                    })
+                  }
+                />
+                <div className="subagent-guidance-meta">
+                  <small>保存后需重启 Codex 生效</small>
+                  <small>
+                    {subagentGuidanceBytes.toLocaleString()} / 32,768 字节
+                  </small>
+                </div>
               </div>
               <div className="subagent-policy-callout">
                 <IconInfoCircle size={14} className="subagent-callout-icon" aria-hidden="true" />

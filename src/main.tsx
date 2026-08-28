@@ -40,6 +40,8 @@ if (import.meta.env.DEV) {
       feishu: "https://webhook.example.invalid/feishu/preview-only",
       wecom: "https://webhook.example.invalid/wecom/preview-only?key=preview",
     } as const;
+    const previewSubagentGuidance =
+      "## 子代理使用\n\n根据任务范围主动选择并派发合适的 Codey 子代理角色。";
     let previewConfig: Config = {
       settingsRevision: 0,
       activeProfileId: "primary",
