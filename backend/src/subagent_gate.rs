@@ -10,9 +10,6 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const HOOK_ARGUMENT: &str = "--codey-subagent-gate-hook";
 pub(crate) const RUNTIME_ACTIVE_ENV: &str = "CODEY_SUBAGENT_GATE_ACTIVE";
-pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
-pub(crate) const SESSION_END_HOOK_TIMEOUT_SECONDS: u64 = 3;
-pub(crate) const WAIT_AGENT_HOOK_MATCHER: &str = ".*wait_agent$|^functions(__|[./:_])wait$";
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 const STATE_DIRECTORY: &str = "codey-subagent-gate-v2";
 
@@ -74,10 +71,6 @@ fn write_hook_output(output: &Value) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn hook_commands() -> Result<HookCommands> {
-    hook_commands_for(HOOK_ARGUMENT)
-}
-
 pub(crate) fn hook_commands_for(argument: &str) -> Result<HookCommands> {
     let executable = std::env::current_exe().context("定位 Codey 子代理门禁程序失败")?;
     Ok(HookCommands {
@@ -87,6 +80,28 @@ pub(crate) fn hook_commands_for(argument: &str) -> Result<HookCommands> {
             powershell_executable_invocation(&executable)
         ),
     })
+}
+
+/// Remove marker state left behind by a previous Codey/Codex process.
+///
+/// Marker files only describe the lifetime of the process that created them;
+/// keeping them after a restart makes a fresh root session look blocked even
+/// though those child processes no longer exist.
+pub(crate) fn cleanup_stale_state() -> Result<()> {
+    cleanup_state_root(&std::env::temp_dir().join(STATE_DIRECTORY))
+}
+
+fn cleanup_state_root(state_root: &Path) -> Result<()> {
+    match fs::remove_dir_all(state_root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "清理上一代 Codex 子代理门禁状态失败：{}",
+                state_root.display()
+            )
+        }),
+    }
 }
 
 pub(crate) fn hook_trust_hash(
@@ -167,7 +182,7 @@ fn pre_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
 
 fn post_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
     if nonempty(input.agent_id.as_deref()).is_some()
-        || !input.tool_name.as_deref().is_some_and(is_wait_agent_tool)
+        || !input.tool_name.as_deref().is_some_and(is_agent_status_tool)
     {
         return Ok(json!({}));
     }
@@ -175,7 +190,17 @@ fn post_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
         remove_session_state(state_root, &input.session_id)?;
         return Ok(json!({}));
     }
-    remove_completed_agents_from_wait_response(
+    if input.tool_name.as_deref().is_some_and(is_list_agents_tool)
+        && input
+            .tool_response
+            .as_ref()
+            .map(parse_json_string)
+            .is_some_and(|response| list_agents_snapshot_is_terminal(&response))
+    {
+        remove_session_state(state_root, &input.session_id)?;
+        return Ok(json!({}));
+    }
+    remove_completed_agents_from_status_response(
         state_root,
         &input.session_id,
         input.tool_response.as_ref(),
@@ -212,7 +237,7 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
         }),
         "PostToolUse"
             if nonempty(input.agent_id.as_deref()).is_none()
-                && input.tool_name.as_deref().is_some_and(is_wait_agent_tool) =>
+                && input.tool_name.as_deref().is_some_and(is_agent_status_tool) =>
         {
             json!({
                 "decision": "block",
@@ -281,7 +306,7 @@ fn wait_was_interrupted_by_user(tool_response: Option<&Value>) -> bool {
     tool_response.is_some_and(value_reports_user_interrupt)
 }
 
-fn remove_completed_agents_from_wait_response(
+fn remove_completed_agents_from_status_response(
     state_root: &Path,
     session_id: &str,
     tool_response: Option<&Value>,
@@ -290,13 +315,42 @@ fn remove_completed_agents_from_wait_response(
         return Ok(());
     };
     let mut completed_agent_ids = Vec::new();
-    collect_completed_agent_ids(tool_response, &mut completed_agent_ids);
+    let parsed_response = parse_json_string(tool_response);
+    collect_completed_agent_ids(&parsed_response, &mut completed_agent_ids);
     completed_agent_ids.sort();
     completed_agent_ids.dedup();
     for agent_id in completed_agent_ids {
         remove_active_marker(state_root, session_id, &agent_id)?;
     }
     Ok(())
+}
+
+fn list_agents_snapshot_is_terminal(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => {
+            !values.is_empty()
+                && values.iter().all(|value| {
+                    value
+                        .as_object()
+                        .is_some_and(object_reports_agent_completion)
+                })
+        }
+        Value::Object(values) => {
+            values.iter().any(|(key, value)| {
+                let normalized_key = normalized_ascii_identifier(key);
+                if normalized_key == "agents" || normalized_key == "agentsstates" {
+                    return list_agents_snapshot_is_terminal(value);
+                }
+                false
+            }) || (!values.is_empty()
+                && values.values().all(|value| {
+                    value
+                        .as_object()
+                        .is_some_and(object_reports_agent_completion)
+                }))
+        }
+        _ => false,
+    }
 }
 
 fn collect_completed_agent_ids(value: &Value, completed_agent_ids: &mut Vec<String>) {
@@ -312,6 +366,20 @@ fn collect_completed_agent_ids(value: &Value, completed_agent_ids: &mut Vec<Stri
             {
                 completed_agent_ids.push(agent_id.to_string());
             }
+            if let Some(states) = values.iter().find_map(|(key, value)| {
+                (normalized_ascii_identifier(key) == "agentsstates")
+                    .then_some(value.as_object())
+                    .flatten()
+            }) {
+                for (agent_id, state) in states {
+                    if state
+                        .as_object()
+                        .is_some_and(object_reports_agent_completion)
+                    {
+                        completed_agent_ids.push(agent_id.to_string());
+                    }
+                }
+            }
             for value in values.values() {
                 collect_completed_agent_ids(value, completed_agent_ids);
             }
@@ -322,9 +390,12 @@ fn collect_completed_agent_ids(value: &Value, completed_agent_ids: &mut Vec<Stri
 
 fn object_agent_id(values: &Map<String, Value>) -> Option<&str> {
     values.iter().find_map(|(key, value)| {
-        (normalized_ascii_identifier(key) == "agentid")
-            .then(|| nonempty(value.as_str()))
-            .flatten()
+        matches!(
+            normalized_ascii_identifier(key).as_str(),
+            "agentid" | "agentname" | "taskid" | "taskname" | "threadid"
+        )
+        .then(|| nonempty(value.as_str()))
+        .flatten()
     })
 }
 
@@ -337,15 +408,43 @@ fn object_reports_agent_completion(values: &Map<String, Value>) -> bool {
 fn is_agent_completion_field(key: &str) -> bool {
     matches!(
         normalized_ascii_identifier(key).as_str(),
-        "status" | "type" | "kind" | "event" | "messagetype" | "messagekind" | "eventname"
+        "status"
+            | "agentstatus"
+            | "type"
+            | "kind"
+            | "event"
+            | "messagetype"
+            | "messagekind"
+            | "eventname"
     )
 }
 
 fn is_agent_completion_value(value: &str) -> bool {
     matches!(
         normalized_ascii_identifier(value).as_str(),
-        "finalanswer" | "taskcomplete"
+        "finalanswer"
+            | "taskcomplete"
+            | "completed"
+            | "complete"
+            | "errored"
+            | "error"
+            | "failed"
+            | "interrupted"
+            | "shutdown"
+            | "notfound"
+            | "cancelled"
+            | "canceled"
     )
+}
+
+fn parse_json_string(value: &Value) -> Value {
+    // Tool wrappers occasionally serialize the response one extra time. Keep
+    // the original value for rendering, but inspect the embedded JSON when it
+    // is an object or array so terminal agent states still reconcile.
+    match value {
+        Value::String(text) => serde_json::from_str(text).unwrap_or_else(|_| value.clone()),
+        _ => value.clone(),
+    }
 }
 
 fn value_reports_user_interrupt(value: &Value) -> bool {
@@ -429,6 +528,14 @@ fn is_collaboration_tool(tool_name: &str) -> bool {
 
 fn is_wait_agent_tool(tool_name: &str) -> bool {
     normalized_collaboration_tool(tool_name) == "wait_agent"
+}
+
+fn is_agent_status_tool(tool_name: &str) -> bool {
+    is_wait_agent_tool(tool_name) || normalized_collaboration_tool(tool_name) == "list_agents"
+}
+
+fn is_list_agents_tool(tool_name: &str) -> bool {
+    normalized_collaboration_tool(tool_name) == "list_agents"
 }
 
 fn is_spawn_agent_tool(tool_name: &str) -> bool {
@@ -823,6 +930,110 @@ mod tests {
     }
 
     #[test]
+    fn failed_and_errored_agent_states_release_markers_from_wait_and_list_agents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for agent_id in ["agent-failed", "agent-errored"] {
+            let mut start = input("SubagentStart", "session-a");
+            start.agent_id = Some(agent_id.to_string());
+            handle_hook(&start, root).unwrap();
+        }
+
+        let mut failed_wait = input("PostToolUse", "session-a");
+        failed_wait.tool_name = Some("agents.wait_agent".to_string());
+        failed_wait.tool_response = Some(json!({
+            "agent_id": "agent-failed",
+            "status": "failed",
+            "error": "429 Too Many Requests"
+        }));
+        assert_eq!(
+            handle_hook(&failed_wait, root).unwrap()["decision"].as_str(),
+            Some("block")
+        );
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 1);
+
+        let mut list = input("PostToolUse", "session-a");
+        list.tool_name = Some("agents.list_agents".to_string());
+        list.tool_response = Some(json!({
+            "agentsStates": {
+                "agent-errored": { "status": "errored", "message": "429 Too Many Requests" }
+            }
+        }));
+        assert_eq!(handle_hook(&list, root).unwrap(), json!({}));
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 0);
+    }
+
+    #[test]
+    fn list_agents_keeps_gate_for_running_agents_and_handles_agent_name_statuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for agent_id in ["agent-completed", "agent-running"] {
+            let mut start = input("SubagentStart", "session-a");
+            start.agent_id = Some(agent_id.to_string());
+            handle_hook(&start, root).unwrap();
+        }
+
+        let mut list = input("PostToolUse", "session-a");
+        list.tool_name = Some("agents.list_agents".to_string());
+        list.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "agent-completed", "agent_status": "completed" },
+                { "agent_name": "agent-running", "agent_status": "running" }
+            ]
+        }));
+        let blocked = handle_hook(&list, root).unwrap();
+        assert_eq!(blocked["decision"].as_str(), Some("block"));
+        assert!(
+            blocked["reason"]
+                .as_str()
+                .unwrap()
+                .contains("仍有 1 个子代理")
+        );
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 1);
+    }
+
+    #[test]
+    fn terminal_list_agents_snapshot_clears_markers_even_when_ids_are_renamed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut start = input("SubagentStart", "session-a");
+        start.agent_id = Some("internal-marker-id".to_string());
+        handle_hook(&start, root).unwrap();
+
+        let mut list = input("PostToolUse", "session-a");
+        list.tool_name = Some("agents.list_agents".to_string());
+        list.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root/renamed-agent", "agent_status": "errored" }
+            ]
+        }));
+        assert_eq!(handle_hook(&list, root).unwrap(), json!({}));
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 0);
+    }
+
+    #[test]
+    fn terminal_nested_agent_states_clear_markers_even_when_ids_are_renamed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut start = input("SubagentStart", "session-a");
+        start.agent_id = Some("internal-marker-id".to_string());
+        handle_hook(&start, root).unwrap();
+
+        let mut list = input("PostToolUse", "session-a");
+        list.tool_name = Some("agents.list_agents".to_string());
+        list.tool_response = Some(json!({
+            "agentsStates": {
+                "/root/renamed-agent": {
+                    "status": "errored",
+                    "message": "429 Too Many Requests"
+                }
+            }
+        }));
+        assert_eq!(handle_hook(&list, root).unwrap(), json!({}));
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 0);
+    }
+
+    #[test]
     fn non_terminal_or_unattributed_wait_updates_do_not_release_markers() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -942,6 +1153,21 @@ mod tests {
     }
 
     #[test]
+    fn stale_state_cleanup_removes_markers_from_previous_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join(STATE_DIRECTORY);
+        let mut start = input("SubagentStart", "old-session");
+        start.agent_id = Some("old-agent".to_string());
+        handle_hook(&start, &state_root).unwrap();
+        assert_eq!(active_agent_count(&state_root, "old-session").unwrap(), 1);
+
+        cleanup_state_root(&state_root).unwrap();
+
+        assert_eq!(active_agent_count(&state_root, "old-session").unwrap(), 0);
+        cleanup_state_root(&state_root).unwrap();
+    }
+
+    #[test]
     fn collaboration_tool_aliases_are_allowed() {
         for tool in [
             "Agent",
@@ -965,6 +1191,9 @@ mod tests {
         assert!(is_wait_agent_tool("functions.wait"));
         assert!(is_wait_agent_tool("functions__wait"));
         assert!(!is_wait_agent_tool("functions.exec"));
+        assert!(is_agent_status_tool("agents.wait_agent"));
+        assert!(is_agent_status_tool("agents.list_agents"));
+        assert!(!is_agent_status_tool("agents.send_message"));
         assert!(is_spawn_agent_tool("Agent"));
         assert!(is_spawn_agent_tool("agents.spawn_agent"));
         assert!(is_spawn_agent_tool("agents__spawn_agent"));

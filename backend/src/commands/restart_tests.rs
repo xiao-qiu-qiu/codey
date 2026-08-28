@@ -8,6 +8,7 @@ fn every_available_route_model_can_be_selected_for_subagents() {
             slug: "gpt-5.6-luna".into(),
             display_name: "GPT-5.6-Luna".into(),
             supported: true,
+            supports_subagent: true,
             supported_reasoning_efforts: vec!["low".into(), "high".into()],
             default_reasoning_effort: "low".into(),
         }],
@@ -41,6 +42,7 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
             slug: slug.into(),
             display_name: display_name.into(),
             supported: !matches!(slug, "gpt-5.6-terra" | "gpt-5.4-mini"),
+            supports_subagent: matches!(slug, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"),
             supported_reasoning_efforts: vec![
                 "low".into(),
                 "medium".into(),
@@ -208,6 +210,15 @@ fn restart_sensitive_config_changes_are_detected() {
         &disabled_subagent_change
     ));
 
+    let mut disabled_guidance_change = applied.clone();
+    disabled_guidance_change.subagent_guidance = "Custom policy.".into();
+    assert!(!config_requires_restart(
+        &applied,
+        &applied_models,
+        &applied_subagent,
+        &disabled_guidance_change
+    ));
+
     let mut enabled_subagents = applied.clone();
     enabled_subagents.subagent_optimization = true;
     let enabled_models = RuntimeModelConfig::from_config(&enabled_subagents);
@@ -238,6 +249,15 @@ fn restart_sensitive_config_changes_are_detected() {
         &enabled_models,
         &enabled_subagent,
         &changed_task_role
+    ));
+
+    let mut changed_guidance = enabled_subagents.clone();
+    changed_guidance.subagent_guidance = "Custom policy.".into();
+    assert!(config_requires_restart(
+        &enabled_subagents,
+        &enabled_models,
+        &enabled_subagent,
+        &changed_guidance
     ));
 }
 
@@ -319,6 +339,7 @@ async fn runtime_status_exposes_cached_available_update() {
         latest_version: "2.0.0".to_string(),
         update_available: true,
         selected_asset: None,
+        self_update_enabled: true,
     });
 
     let status = runtime_status(&state).await.unwrap();

@@ -22,8 +22,15 @@ fn maintenance_status_exposes_structured_session_metrics() {
         pruned_entries: 2,
         backup_dir: None,
     });
+    let subagent_cleanup = Ok(subagent_state_cleanup::SubagentStateCleanupReport::default());
+    let session_delete_replay = Ok(session_delete_tombstone::ReplaySummary::default());
 
-    let summary = session_maintenance_summary(&provider_sync, &cleanup);
+    let summary = session_maintenance_summary(
+        &provider_sync,
+        &session_delete_replay,
+        &subagent_cleanup,
+        &cleanup,
+    );
     let status = MaintenanceStatus {
         session_status: summary.status,
         session_files_fixed: summary.files_fixed,

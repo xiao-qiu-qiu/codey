@@ -35,9 +35,11 @@ use crate::message_delete;
 use crate::model_catalog;
 use crate::pet_slim_patch;
 use crate::provider_lease;
+use crate::session_delete_tombstone::{self, ReplaySummary as SessionDeleteReplaySummary};
 use crate::session_index_cleanup::{self, SessionIndexCleanupReport};
 use crate::startup_maintenance::{self, ProviderSyncPlan};
 use crate::subagent_policy;
+use crate::subagent_state_cleanup;
 use crate::trace_log_guard;
 
 mod platform;
@@ -232,6 +234,9 @@ async fn run_startup_session_maintenance(
     let maintenance_provider = provider.to_string();
     let maintenance_result = tokio::task::spawn_blocking(move || {
         let stale_lock_recovery = maintenance_lock::recover_stale_locks(&maintenance_home);
+        // Remove externally recreated sessions before provider synchronization
+        // can copy their stale metadata into another Codex database.
+        let session_delete_replay = session_delete_tombstone::replay(&maintenance_home);
         let provider_sync =
             match startup_maintenance::provider_sync_plan(&maintenance_home, &maintenance_provider)
             {
@@ -267,33 +272,45 @@ async fn run_startup_session_maintenance(
         // request completed. Reapply durable tombstones after the old process
         // is stopped and before the new process can hydrate that stale data.
         let message_delete_replay = message_delete::reapply_persisted_deletions(&maintenance_home);
+        // Child processes cannot survive a full desktop restart. Close stale
+        // spawn edges before the new renderer hydrates its subagent activity.
+        let subagent_state_cleanup =
+            subagent_state_cleanup::close_stale_spawn_edges(&maintenance_home);
         // `session_index.jsonl` is also cleaned before spawn, while its
         // source snapshot is stable. The original file is backed up.
         let index_cleanup = session_index_cleanup::cleanup(&maintenance_home);
         (
             stale_lock_recovery,
+            session_delete_replay,
             provider_sync,
             message_delete_replay,
+            subagent_state_cleanup,
             index_cleanup,
         )
     })
     .await;
-    let (stale_lock_recovery, provider_sync, message_delete_replay, index_cleanup) =
-        match maintenance_result {
-            Ok(result) => result,
-            Err(error) => {
-                let error = anyhow::Error::new(error).context("启动前会话修复任务异常退出");
-                error_log::record_failure(
-                    "patch_failed",
-                    "run_startup_session_repairs",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "codexHome": home,
-                    }),
-                );
-                return Err(error);
-            }
-        };
+    let (
+        stale_lock_recovery,
+        session_delete_replay,
+        provider_sync,
+        message_delete_replay,
+        subagent_state_cleanup,
+        index_cleanup,
+    ) = match maintenance_result {
+        Ok(result) => result,
+        Err(error) => {
+            let error = anyhow::Error::new(error).context("启动前会话修复任务异常退出");
+            error_log::record_failure(
+                "patch_failed",
+                "run_startup_session_repairs",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "codexHome": home,
+                }),
+            );
+            return Err(error);
+        }
+    };
     match stale_lock_recovery {
         Ok(recovered) => {
             for path in recovered {
@@ -337,6 +354,36 @@ async fn run_startup_session_maintenance(
             }),
         );
     }
+    match &session_delete_replay {
+        Ok(summary) => {
+            if summary.database_rows > 0 || summary.rollout_files > 0 || summary.index_entries > 0 {
+                eprintln!(
+                    "启动前重放会话删除墓碑：{} 个会话、数据库 {} 行、rollout {} 个、索引 {} 条",
+                    summary.sessions,
+                    summary.database_rows,
+                    summary.rollout_files,
+                    summary.index_entries,
+                );
+            }
+            for (session_id, message) in &summary.failures {
+                error_log::record_failure(
+                    "patch_failed",
+                    "replay_session_deletion",
+                    message.clone(),
+                    serde_json::json!({"sessionId": session_id}),
+                );
+            }
+        }
+        Err(error) => {
+            error_log::record_failure(
+                "patch_failed",
+                "replay_session_deletions",
+                format!("{error:#}"),
+                serde_json::json!({"codexHome": home}),
+            );
+            eprintln!("启动前重放会话删除墓碑失败：{error:#}");
+        }
+    }
     match message_delete_replay {
         Ok(summary) => {
             if summary.deleted > 0 {
@@ -368,6 +415,34 @@ async fn run_startup_session_maintenance(
             eprintln!("启动前重施消息删除失败：{error:#}");
         }
     }
+    match &subagent_state_cleanup {
+        Ok(report) => {
+            if report.edges_closed > 0
+                || report.jobs_interrupted > 0
+                || report.items_interrupted > 0
+            {
+                eprintln!(
+                    "启动前收敛了陈旧子代理状态：边 {} 条、任务 {} 个、任务项 {} 个、解除绑定 {} 条（检查 {} 个数据库）",
+                    report.edges_closed,
+                    report.jobs_interrupted,
+                    report.items_interrupted,
+                    report.assignments_released,
+                    report.databases_checked,
+                );
+            }
+        }
+        Err(error) => {
+            error_log::record_failure(
+                "patch_failed",
+                "close_stale_subagent_spawn_edges",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "codexHome": home,
+                }),
+            );
+            eprintln!("启动前清理陈旧子代理状态失败：{error:#}");
+        }
+    }
     if let Err(error) = &index_cleanup {
         error_log::record_failure(
             "patch_failed",
@@ -378,7 +453,12 @@ async fn run_startup_session_maintenance(
             }),
         );
     }
-    Ok(session_maintenance_summary(&provider_sync, &index_cleanup))
+    Ok(session_maintenance_summary(
+        &provider_sync,
+        &session_delete_replay,
+        &subagent_state_cleanup,
+        &index_cleanup,
+    ))
 }
 
 async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBuf> {
@@ -555,6 +635,7 @@ async fn prepare_codex_startup_state(
     let mut runtime_subagent_config = config.clone();
     subagent_policy::reconcile_with_model_state(&mut runtime_subagent_config, Some(&model_state));
     let subagent_optimization = runtime_subagent_config.subagent_optimization;
+    let subagent_guidance = runtime_subagent_config.subagent_guidance.clone();
     let subagent_model = runtime_subagent_config.subagent_model.clone();
     let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort.clone();
     let subagent_roles = runtime_subagent_config.subagent_roles.clone();
@@ -571,6 +652,7 @@ async fn prepare_codex_startup_state(
                 default_model: runtime_default_model.as_deref(),
                 fast_context_tools,
                 subagent_optimization,
+                subagent_guidance: &subagent_guidance,
                 subagent_model: &subagent_model,
                 subagent_reasoning_effort: &subagent_reasoning_effort,
                 subagent_roles: Some(&subagent_roles),
@@ -1752,6 +1834,8 @@ fn watchdog_should_reinject(consecutive_failures: &mut u8, healthy: bool) -> boo
 
 fn session_maintenance_summary(
     provider_sync: &ProviderSyncResult,
+    session_delete_replay: &Result<SessionDeleteReplaySummary>,
+    subagent_state_cleanup: &Result<subagent_state_cleanup::SubagentStateCleanupReport>,
     index_cleanup: &Result<SessionIndexCleanupReport>,
 ) -> SessionMaintenanceSummary {
     let pruned_entries = match index_cleanup {
@@ -1760,6 +1844,11 @@ fn session_maintenance_summary(
     };
     let has_errors = provider_sync.status != ProviderSyncStatus::Synced
         || !provider_sync.skipped_locked_rollout_files.is_empty()
+        || match session_delete_replay {
+            Ok(summary) => !summary.failures.is_empty(),
+            Err(_) => true,
+        }
+        || subagent_state_cleanup.is_err()
         || index_cleanup.is_err();
     let status = if has_errors { "error" } else { "ready" };
     SessionMaintenanceSummary {

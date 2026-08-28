@@ -33,6 +33,7 @@ function AppUpdateCardComponent({
   onInstallUpdate,
 }: AppUpdateCardProps) {
   const hasUpdate = updateCheck?.updateAvailable === true;
+  const updatesLocked = updateCheck?.selfUpdateEnabled === false;
   return (
     <section className="secondary-section" aria-labelledby="update-title">
       <div className="section-title compact">
@@ -66,7 +67,7 @@ function AppUpdateCardComponent({
             </div>
           </div>
           <Badge variant={hasUpdate ? "warning" : "secondary"}>
-            {hasUpdate ? "发现新版本" : "已是最新"}
+            {updatesLocked ? "本地锁定" : hasUpdate ? "发现新版本" : "已是最新"}
           </Badge>
         </div>
 
@@ -76,7 +77,10 @@ function AppUpdateCardComponent({
               className={`inline-result ${updateResult.tone}`}
               aria-live="polite"
             >
-              {updateResult.text || "从公开更新源检查最新稳定版本。"}
+              {updateResult.text ||
+                (updatesLocked
+                  ? "当前本地定制构建不接受在线安装包。"
+                  : "从公开更新源检查最新稳定版本。")}
             </span>
           </div>
           <div className="update-actions-row">
@@ -109,19 +113,21 @@ function AppUpdateCardComponent({
                 下载更新
               </Button>
             ) : null}
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={isBusy}
-              onClick={onCheckUpdates}
-            >
-              {busy === "check-update" ? (
-                <LoaderCircle className="spinner" aria-hidden="true" />
-              ) : (
-                <RefreshCw aria-hidden="true" />
-              )}
-              检查更新
-            </Button>
+            {!updatesLocked && (
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={isBusy}
+                onClick={onCheckUpdates}
+              >
+                {busy === "check-update" ? (
+                  <LoaderCircle className="spinner" aria-hidden="true" />
+                ) : (
+                  <RefreshCw aria-hidden="true" />
+                )}
+                检查更新
+              </Button>
+            )}
           </div>
         </div>
       </Card>

@@ -11,20 +11,22 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
 
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, PREVIOUS_SUBAGENT_GUIDANCE, PREVIOUS_SUBAGENT_GUIDANCE_V2,
+    CODEY_FASTCTX_GUIDANCE, PREVIOUS_SUBAGENT_GUIDANCE_VERSIONS,
     ROOT_AGENT_COLLABORATION_USAGE_HINT, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
-    SUBAGENT_GUIDANCE, append_root_agent_collaboration_usage_hint, append_subagent_guidance,
-    codey_fastctx_guidance_blocks, default_agent_config_with_fastctx_guidance,
-    previous_default_agent_config_without_sandbox, remove_codey_fastctx_guidance,
-    remove_previous_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
+    SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_BLOCK_START, append_root_agent_collaboration_usage_hint,
+    append_subagent_guidance, codey_fastctx_guidance_blocks,
+    default_agent_config_with_fastctx_guidance, previous_default_agent_config_without_sandbox,
+    remove_codey_fastctx_guidance, remove_previous_codey_fastctx_guidance,
+    remove_subagent_guidance, subagent_source_config,
 };
 #[cfg(test)]
 use crate::codex_config_guidance::{
     CODEY_FASTCTX_GUIDANCE_VERSIONS, PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
 };
 use crate::config::{
-    CodeyConfig, ProviderProfile, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT,
-    SUBAGENT_ROLE_IDS, SubagentRoleConfig, default_config_path,
+    CodeyConfig, ProviderProfile, SUBAGENT_FIXED_ROLE_IDS, SUBAGENT_REASONING_EFFORTS,
+    SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SUBAGENT_RUNTIME_ROLE_IDS, SubagentRoleConfig,
+    default_config_path, fixed_subagent_role_config,
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
@@ -169,6 +171,7 @@ pub(crate) struct RuntimeProviderConfigOptions<'a> {
     pub default_model: Option<&'a str>,
     pub fast_context_tools: bool,
     pub subagent_optimization: bool,
+    pub subagent_guidance: &'a str,
     pub subagent_model: &'a str,
     pub subagent_reasoning_effort: &'a str,
     pub subagent_roles: Option<&'a BTreeMap<String, SubagentRoleConfig>>,
@@ -196,6 +199,7 @@ struct ProviderApplyOptions<'a> {
     default_model: Option<&'a str>,
     fastctx_command: Option<&'a Path>,
     subagent_optimization: bool,
+    subagent_guidance: &'a str,
     subagent_model: &'a str,
     subagent_reasoning_effort: &'a str,
     subagent_roles: Option<&'a BTreeMap<String, SubagentRoleConfig>>,
@@ -214,6 +218,7 @@ impl<'a> ProviderApplyOptions<'a> {
             default_model: None,
             fastctx_command: None,
             subagent_optimization: false,
+            subagent_guidance: SUBAGENT_GUIDANCE,
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
@@ -263,6 +268,7 @@ pub(crate) fn apply_runtime_provider_config(
             provider_id,
             fastctx_command.as_deref(),
             options.subagent_optimization,
+            options.subagent_guidance,
             options.subagent_model,
             options.subagent_reasoning_effort,
             options.subagent_roles,
@@ -281,6 +287,7 @@ pub(crate) fn apply_runtime_provider_config(
             default_model,
             fastctx_command: fastctx_command.as_deref(),
             subagent_optimization: options.subagent_optimization,
+            subagent_guidance: options.subagent_guidance,
             subagent_model: options.subagent_model,
             subagent_reasoning_effort: options.subagent_reasoning_effort,
             subagent_roles: options.subagent_roles,
@@ -402,6 +409,7 @@ fn apply_isolated_cc_switch_runtime_config(
     provider_id: &str,
     fastctx_command: Option<&Path>,
     subagent_optimization: bool,
+    subagent_guidance: &str,
     subagent_model: &str,
     subagent_reasoning_effort: &str,
     subagent_roles: Option<&BTreeMap<String, SubagentRoleConfig>>,
@@ -463,11 +471,7 @@ fn apply_isolated_cc_switch_runtime_config(
     };
     let (root_instructions, collaboration_hint, runtime_agents) = if subagent_optimization {
         let root_path = constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE);
-        let root_instructions = read_or_create_constraint_file_with_exact_migration(
-            &root_path,
-            SUBAGENT_GUIDANCE,
-            &[PREVIOUS_SUBAGENT_GUIDANCE_V2, PREVIOUS_SUBAGENT_GUIDANCE],
-        )?;
+        let root_instructions = write_managed_constraint_file(&root_path, subagent_guidance)?;
         let collaboration_hint = read_or_create_constraint_file(
             &constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),
             ROOT_AGENT_COLLABORATION_USAGE_HINT,
@@ -494,15 +498,19 @@ fn apply_isolated_cc_switch_runtime_config(
         collaboration_hint.as_deref(),
     )?;
 
-    let runtime_hooks_enabled = subagent_optimization || fastctx_namespace.is_some();
+    let raw_original_hooks = read_optional(&hooks_path)?;
+    let stale_subagent_hooks = raw_original_hooks
+        .as_deref()
+        .is_some_and(json_contains_subagent_gate_hooks);
+    let runtime_hooks_enabled = fastctx_namespace.is_some() || stale_subagent_hooks;
     let original_hooks = if runtime_hooks_enabled {
-        read_optional(&hooks_path)?
+        raw_original_hooks
+            .as_deref()
+            .map(strip_subagent_gate_hooks_json)
+            .transpose()?
     } else {
         None
     };
-    let subagent_hook_commands = subagent_optimization
-        .then(crate::subagent_gate::hook_commands)
-        .transpose()?;
     let fastctx_hook_commands = fastctx_namespace
         .is_some()
         .then(|| crate::subagent_gate::hook_commands_for(crate::fastctx_route_gate::HOOK_ARGUMENT))
@@ -512,9 +520,8 @@ fn apply_isolated_cc_switch_runtime_config(
             contents,
             trust_entries,
         } = build_runtime_hooks_file(
-            original_hooks.as_deref(),
+            raw_original_hooks.as_deref(),
             &hooks_path,
-            subagent_hook_commands.as_ref(),
             fastctx_hook_commands.as_ref(),
         )?;
         (Some(contents), trust_entries)
@@ -621,6 +628,14 @@ fn read_or_create_constraint_file(path: &Path, default_contents: &str) -> Result
     Ok(default_contents.to_string())
 }
 
+fn write_managed_constraint_file(path: &Path, contents: &str) -> Result<String> {
+    let contents = contents.trim();
+    if read_optional(path)?.as_deref() != Some(contents.as_bytes()) {
+        atomic_write(path, contents.as_bytes())?;
+    }
+    Ok(contents.to_string())
+}
+
 fn read_or_create_constraint_file_with_exact_migration(
     path: &Path,
     default_contents: &str,
@@ -643,7 +658,7 @@ fn runtime_subagent_roles(
         .and_then(|roles| roles.get(SUBAGENT_ROLE_DEFAULT))
         .cloned()
         .unwrap_or_else(|| SubagentRoleConfig::new(legacy_model, legacy_reasoning_effort));
-    SUBAGENT_ROLE_IDS
+    let mut roles = SUBAGENT_ROLE_IDS
         .into_iter()
         .map(|role| {
             let selection = configured
@@ -652,7 +667,13 @@ fn runtime_subagent_roles(
                 .unwrap_or_else(|| fallback.clone());
             (role.to_string(), selection)
         })
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    for role in SUBAGENT_FIXED_ROLE_IDS {
+        if let Some(selection) = fixed_subagent_role_config(role) {
+            roles.insert(role.to_string(), selection);
+        }
+    }
+    roles
 }
 
 fn prepare_runtime_agent_files(
@@ -660,8 +681,8 @@ fn prepare_runtime_agent_files(
     roles: &BTreeMap<String, SubagentRoleConfig>,
     fastctx_instructions: Option<&str>,
 ) -> Result<Vec<RuntimeAgentRegistration>> {
-    let mut registrations = Vec::with_capacity(SUBAGENT_ROLE_IDS.len());
-    for role in SUBAGENT_ROLE_IDS {
+    let mut registrations = Vec::with_capacity(SUBAGENT_RUNTIME_ROLE_IDS.len());
+    for role in SUBAGENT_RUNTIME_ROLE_IDS {
         let selection = roles
             .get(role)
             .with_context(|| format!("缺少 Codey 子代理任务类型配置：{role}"))?;
@@ -902,6 +923,7 @@ fn apply_runtime_provider_config_at_mode(
         default_model,
         fastctx_command,
         subagent_optimization,
+        subagent_guidance,
         subagent_model,
         subagent_reasoning_effort,
         subagent_roles,
@@ -959,7 +981,10 @@ fn apply_runtime_provider_config_at_mode(
     let updated_agents_md = if subagent_optimization {
         let existing_agents_md = str::from_utf8(original_agents_md.as_deref().unwrap_or_default())
             .context("Codex AGENTS.md 不是 UTF-8")?;
-        Some(append_subagent_guidance(existing_agents_md))
+        Some(append_subagent_guidance(
+            existing_agents_md,
+            subagent_guidance,
+        ))
     } else {
         None
     };
@@ -1248,7 +1273,7 @@ fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &Path) -> Res
 }
 
 fn snapshot_runtime_agent_files(constraints_dir: &Path) -> Result<Vec<RuntimeAgentFileSnapshot>> {
-    SUBAGENT_ROLE_IDS
+    SUBAGENT_RUNTIME_ROLE_IDS
         .into_iter()
         .map(|role| {
             let path = runtime_agent_path(constraints_dir, role);
@@ -1263,7 +1288,7 @@ fn verify_runtime_agent_files(
     roles: &BTreeMap<String, SubagentRoleConfig>,
 ) -> Result<()> {
     anyhow::ensure!(
-        registrations.len() == SUBAGENT_ROLE_IDS.len(),
+        registrations.len() == SUBAGENT_RUNTIME_ROLE_IDS.len(),
         "Codey 子代理运行时文件数量不完整"
     );
     for registration in registrations {
@@ -1557,7 +1582,13 @@ fn restore_agents_md(path: &Path, original: Option<&[u8]>, applied: &[u8]) -> Re
     }
     let original_contains_guidance = original
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .is_some_and(|contents| contents.contains(SUBAGENT_GUIDANCE));
+        .is_some_and(|contents| {
+            contents.contains(SUBAGENT_GUIDANCE_BLOCK_START)
+                || contents.contains(SUBAGENT_GUIDANCE)
+                || PREVIOUS_SUBAGENT_GUIDANCE_VERSIONS
+                    .iter()
+                    .any(|guidance| contents.contains(guidance))
+        });
     if original_contains_guidance {
         return Ok(());
     }
@@ -1773,6 +1804,9 @@ fn patch_config_with_fastctx_mode_and_proxy(
         enable_hooks_feature(&mut doc)?;
         enable_fastctx_route_hook(&mut doc, config_path)?;
     }
+    if !subagent_optimization {
+        remove_subagent_gate_hooks(&mut doc, config_path);
+    }
     document_string(&doc)
 }
 
@@ -1862,8 +1896,7 @@ fn enable_subagent_optimization(
             "features.multi_agent_v2.subagent_developer_instructions",
         )?;
     }
-    features["hooks"] = value(true);
-    enable_subagent_gate_hooks(doc, config_path)?;
+    remove_subagent_gate_hooks(doc, config_path);
     Ok(())
 }
 
@@ -1886,45 +1919,6 @@ struct RuntimeHooksFile {
     trust_entries: Vec<RuntimeHookTrustEntry>,
 }
 
-const SUBAGENT_GATE_HOOKS: [CodeyHookSpec; 6] = [
-    CodeyHookSpec {
-        toml_event: "PreToolUse",
-        event_key: "pre_tool_use",
-        matcher: Some("*"),
-        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
-    },
-    CodeyHookSpec {
-        toml_event: "PostToolUse",
-        event_key: "post_tool_use",
-        matcher: Some(crate::subagent_gate::WAIT_AGENT_HOOK_MATCHER),
-        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
-    },
-    CodeyHookSpec {
-        toml_event: "SubagentStart",
-        event_key: "subagent_start",
-        matcher: None,
-        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
-    },
-    CodeyHookSpec {
-        toml_event: "SubagentStop",
-        event_key: "subagent_stop",
-        matcher: None,
-        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
-    },
-    CodeyHookSpec {
-        toml_event: "Stop",
-        event_key: "stop",
-        matcher: None,
-        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
-    },
-    CodeyHookSpec {
-        toml_event: "SessionEnd",
-        event_key: "session_end",
-        matcher: None,
-        timeout_seconds: crate::subagent_gate::SESSION_END_HOOK_TIMEOUT_SECONDS,
-    },
-];
-
 const FASTCTX_ROUTE_HOOKS: [CodeyHookSpec; 1] = [CodeyHookSpec {
     toml_event: "PreToolUse",
     event_key: "pre_tool_use",
@@ -1941,10 +1935,18 @@ const CODEY_HOOK_EVENTS: [&str; 6] = [
     "SessionEnd",
 ];
 
+const SUBAGENT_GATE_HOOK_EVENTS: [(&str, &str); 6] = [
+    ("PreToolUse", "pre_tool_use"),
+    ("PostToolUse", "post_tool_use"),
+    ("SubagentStart", "subagent_start"),
+    ("SubagentStop", "subagent_stop"),
+    ("Stop", "stop"),
+    ("SessionEnd", "session_end"),
+];
+
 fn build_runtime_hooks_file(
     existing: Option<&[u8]>,
     hooks_path: &Path,
-    subagent_commands: Option<&crate::subagent_gate::HookCommands>,
     fastctx_commands: Option<&crate::subagent_gate::HookCommands>,
 ) -> Result<RuntimeHooksFile> {
     let mut root = match existing {
@@ -1971,17 +1973,10 @@ fn build_runtime_hooks_file(
         }
     }
 
-    let mut trust_entries = Vec::with_capacity(
-        subagent_commands.map_or(0, |_| SUBAGENT_GATE_HOOKS.len())
-            + fastctx_commands.map_or(0, |_| FASTCTX_ROUTE_HOOKS.len()),
-    );
-    for (specs, commands) in [
-        (&SUBAGENT_GATE_HOOKS[..], subagent_commands),
-        (&FASTCTX_ROUTE_HOOKS[..], fastctx_commands),
-    ] {
-        let Some(commands) = commands else {
-            continue;
-        };
+    let mut trust_entries =
+        Vec::with_capacity(fastctx_commands.map_or(0, |_| FASTCTX_ROUTE_HOOKS.len()));
+    if let Some(commands) = fastctx_commands {
+        let specs = &FASTCTX_ROUTE_HOOKS[..];
         let selected_command = if cfg!(windows) {
             commands.command_windows.as_str()
         } else {
@@ -2045,6 +2040,66 @@ fn build_runtime_hooks_file(
         contents: rendered,
         trust_entries,
     })
+}
+
+fn json_contains_subagent_gate_hooks(bytes: &[u8]) -> bool {
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|hooks| {
+            hooks.values().any(|groups| {
+                groups
+                    .as_array()
+                    .is_some_and(|groups| groups.iter().any(json_hook_group_is_subagent_gate_owned))
+            })
+        })
+}
+
+fn strip_subagent_gate_hooks_json(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut root =
+        serde_json::from_slice::<serde_json::Value>(bytes).context("解析 Codex hooks.json 失败")?;
+    let changed = remove_subagent_gate_hooks_from_json(&mut root);
+    if !changed {
+        return Ok(bytes.to_vec());
+    }
+    let mut rendered = serde_json::to_vec_pretty(&root)?;
+    rendered.push(b'\n');
+    Ok(rendered)
+}
+
+fn remove_subagent_gate_hooks_from_json(root: &mut serde_json::Value) -> bool {
+    let Some(hooks) = root
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for groups in hooks.values_mut() {
+        if let Some(groups) = groups.as_array_mut() {
+            let before = groups.len();
+            groups.retain(|group| !json_hook_group_is_subagent_gate_owned(group));
+            changed |= groups.len() != before;
+        }
+    }
+    hooks.retain(|_, groups| !groups.as_array().is_some_and(Vec::is_empty));
+    changed
+}
+
+fn json_hook_group_is_subagent_gate_owned(group: &serde_json::Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|handlers| {
+            handlers.iter().any(|handler| {
+                ["command", "commandWindows", "command_windows"]
+                    .into_iter()
+                    .filter_map(|key| handler.get(key).and_then(serde_json::Value::as_str))
+                    .any(|command| command.contains(crate::subagent_gate::HOOK_ARGUMENT))
+            })
+        })
 }
 
 fn json_hook_group_is_codey_owned(group: &serde_json::Value) -> bool {
@@ -2249,11 +2304,7 @@ fn build_isolated_runtime_overrides(
             &["features", "hooks"],
             "features.hooks",
         )?;
-        let expected_hook_count = if runtime_agents.is_empty() {
-            0
-        } else {
-            SUBAGENT_GATE_HOOKS.len()
-        } + usize::from(fastctx_namespace.is_some());
+        let expected_hook_count = usize::from(fastctx_namespace.is_some());
         anyhow::ensure!(
             hook_trust_entries.len() == expected_hook_count,
             "Codey Hook 信任项不完整"
@@ -2346,9 +2397,118 @@ fn append_constraint_text(existing: &str, addition: &str) -> String {
     }
 }
 
-fn enable_subagent_gate_hooks(doc: &mut DocumentMut, config_path: &Path) -> Result<()> {
-    let commands = crate::subagent_gate::hook_commands()?;
-    enable_codey_hooks(doc, config_path, &SUBAGENT_GATE_HOOKS, &commands)
+fn remove_subagent_gate_hooks(doc: &mut DocumentMut, config_path: &Path) {
+    let Some(hooks) = doc.get_mut("hooks").and_then(Item::as_table_mut) else {
+        return;
+    };
+    let config_path_prefix = format!("{}:", config_path.display());
+
+    let mut removed_state_suffixes = Vec::new();
+    let mut removed_events = Vec::new();
+    for (event, event_key) in SUBAGENT_GATE_HOOK_EVENTS {
+        let Some(item) = hooks.get_mut(event) else {
+            continue;
+        };
+        let mut removed_indices = Vec::new();
+        match item {
+            Item::ArrayOfTables(groups) => {
+                for index in (0..groups.len()).rev() {
+                    if groups
+                        .get(index)
+                        .is_some_and(table_is_subagent_gate_hook_group)
+                    {
+                        groups.remove(index);
+                        removed_indices.push(index);
+                    }
+                }
+                if groups.is_empty() {
+                    hooks.remove(event);
+                    removed_events.push(event_key);
+                }
+            }
+            Item::Value(Value::Array(groups)) => {
+                for index in (0..groups.len()).rev() {
+                    if groups
+                        .get(index)
+                        .is_some_and(value_is_subagent_gate_hook_group)
+                    {
+                        groups.remove(index);
+                        removed_indices.push(index);
+                    }
+                }
+                if groups.is_empty() {
+                    hooks.remove(event);
+                    removed_events.push(event_key);
+                }
+            }
+            _ => {}
+        }
+        removed_state_suffixes.extend(removed_indices.into_iter().map(|index| (event_key, index)));
+    }
+
+    if let Some(state) = hooks.get_mut("state").and_then(Item::as_table_mut) {
+        state.retain(|key, entry| {
+            let remove_for_removed_group =
+                removed_state_suffixes.iter().any(|(event_key, index)| {
+                    key.starts_with(&config_path_prefix)
+                        && key.ends_with(&format!(":{event_key}:{index}:0"))
+                        || key.ends_with(&format!(":{event_key}:{index}:0"))
+                });
+            let remove_for_removed_event = removed_events
+                .iter()
+                .any(|event_key| key.contains(&format!(":{event_key}:")));
+            let remove_stale_disabled_entry = entry.as_table().is_some_and(|entry| {
+                entry.get("enabled").and_then(Item::as_bool) == Some(false)
+                    && entry.get("trusted_hash").is_none()
+            });
+            !(remove_for_removed_group || remove_for_removed_event || remove_stale_disabled_entry)
+        });
+        if state.is_empty() {
+            hooks.remove("state");
+        }
+    }
+    if hooks.is_empty() {
+        doc.as_table_mut().remove("hooks");
+    }
+}
+
+fn table_is_subagent_gate_hook_group(group: &Table) -> bool {
+    group
+        .get("hooks")
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|handlers| {
+            handlers.iter().any(|handler| {
+                ["command", "commandWindows"].iter().any(|field| {
+                    handler
+                        .get(field)
+                        .and_then(Item::as_str)
+                        .is_some_and(|command| {
+                            command.contains(crate::subagent_gate::HOOK_ARGUMENT)
+                        })
+                })
+            })
+        })
+}
+
+fn value_is_subagent_gate_hook_group(group: &Value) -> bool {
+    group
+        .as_inline_table()
+        .and_then(|group| group.get("hooks"))
+        .and_then(Value::as_array)
+        .is_some_and(|handlers| {
+            handlers.iter().any(|handler| {
+                handler.as_inline_table().is_some_and(|handler| {
+                    ["command", "commandWindows"].iter().any(|field| {
+                        handler
+                            .get(field)
+                            .and_then(Value::as_str)
+                            .is_some_and(|command| {
+                                command.contains(crate::subagent_gate::HOOK_ARGUMENT)
+                            })
+                    })
+                })
+            })
+        })
 }
 
 fn enable_hooks_feature(doc: &mut DocumentMut) -> Result<()> {

@@ -9,6 +9,10 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::codex_config_guidance::{
+    PREVIOUS_SUBAGENT_GUIDANCE_VERSIONS, SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_BLOCK_END,
+    SUBAGENT_GUIDANCE_BLOCK_START,
+};
 use crate::model_id;
 pub use crate::notifications::WebhookConfig;
 
@@ -229,6 +233,10 @@ pub struct CodeyConfig {
     /// the next runtime. Disabled by default and restored on shutdown.
     #[serde(default)]
     pub subagent_optimization: bool,
+    /// Root-agent dispatch policy injected while Codey's multi-agent
+    /// optimization is enabled.
+    #[serde(default = "default_subagent_guidance")]
+    pub subagent_guidance: String,
     /// Default model used by newly spawned subagents while Codey's
     /// multi-agent optimization is enabled.
     #[serde(default = "default_subagent_model")]
@@ -281,6 +289,7 @@ impl Default for CodeyConfig {
             fast_context_tools: false,
             fast_codex_startup: true,
             subagent_optimization: false,
+            subagent_guidance: default_subagent_guidance(),
             subagent_model: default_subagent_model(),
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
             subagent_roles: default_subagent_roles(),
@@ -322,6 +331,14 @@ impl CodeyConfig {
             &mut self.subagent_model,
             &mut self.subagent_reasoning_effort,
         );
+        self.subagent_guidance = self.subagent_guidance.trim().to_string();
+        if self.subagent_guidance.is_empty()
+            || PREVIOUS_SUBAGENT_GUIDANCE_VERSIONS
+                .iter()
+                .any(|guidance| guidance.trim() == self.subagent_guidance)
+        {
+            self.subagent_guidance = default_subagent_guidance();
+        }
         self.subagent_roles
             .retain(|role, _| SUBAGENT_ROLE_IDS.contains(&role.as_str()));
         if self.subagent_roles.is_empty() {
@@ -446,6 +463,7 @@ fn default_true() -> bool {
 
 pub const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5.6-terra";
 pub const DEFAULT_SUBAGENT_REASONING_EFFORT: &str = "low";
+pub const MAX_SUBAGENT_GUIDANCE_BYTES: usize = 32 * 1024;
 pub const SUBAGENT_REASONING_EFFORTS: [&str; 6] =
     ["low", "medium", "high", "xhigh", "max", "ultra"];
 pub const SUBAGENT_ROLE_QUICK_SCAN: &str = "codey_quick_scan";
@@ -454,6 +472,9 @@ pub const SUBAGENT_ROLE_VISUAL_ANALYSIS: &str = "codey_visual_analysis";
 pub const SUBAGENT_ROLE_WORKER: &str = "codey_worker";
 pub const SUBAGENT_ROLE_VISUAL_WORKER: &str = "codey_visual_worker";
 pub const SUBAGENT_ROLE_DEFAULT: &str = "default";
+pub const SUBAGENT_ROLE_LUNA: &str = "codey_luna";
+pub const SUBAGENT_ROLE_TERRA: &str = "codey_terra";
+pub const SUBAGENT_ROLE_SOL: &str = "codey_sol";
 pub const SUBAGENT_ROLE_IDS: [&str; 6] = [
     SUBAGENT_ROLE_QUICK_SCAN,
     SUBAGENT_ROLE_DEEP_RESEARCH,
@@ -462,6 +483,47 @@ pub const SUBAGENT_ROLE_IDS: [&str; 6] = [
     SUBAGENT_ROLE_VISUAL_WORKER,
     SUBAGENT_ROLE_DEFAULT,
 ];
+pub const SUBAGENT_FIXED_ROLE_IDS: [&str; 3] =
+    [SUBAGENT_ROLE_LUNA, SUBAGENT_ROLE_TERRA, SUBAGENT_ROLE_SOL];
+pub const SUBAGENT_RUNTIME_ROLE_IDS: [&str; 9] = [
+    SUBAGENT_ROLE_QUICK_SCAN,
+    SUBAGENT_ROLE_DEEP_RESEARCH,
+    SUBAGENT_ROLE_VISUAL_ANALYSIS,
+    SUBAGENT_ROLE_WORKER,
+    SUBAGENT_ROLE_VISUAL_WORKER,
+    SUBAGENT_ROLE_DEFAULT,
+    SUBAGENT_ROLE_LUNA,
+    SUBAGENT_ROLE_TERRA,
+    SUBAGENT_ROLE_SOL,
+];
+
+pub fn fixed_subagent_role_config(role: &str) -> Option<SubagentRoleConfig> {
+    match role {
+        SUBAGENT_ROLE_LUNA => Some(SubagentRoleConfig::new("gpt-5.6-luna", "max")),
+        SUBAGENT_ROLE_TERRA => Some(SubagentRoleConfig::new("gpt-5.6-terra", "max")),
+        SUBAGENT_ROLE_SOL => Some(SubagentRoleConfig::new("gpt-5.6-sol", "xhigh")),
+        _ => None,
+    }
+}
+
+pub fn default_subagent_guidance() -> String {
+    SUBAGENT_GUIDANCE.trim().to_string()
+}
+
+pub fn validate_subagent_guidance(guidance: &str) -> Result<(), String> {
+    if guidance.len() > MAX_SUBAGENT_GUIDANCE_BYTES {
+        return Err(format!(
+            "子代理策略不能超过 {} KiB",
+            MAX_SUBAGENT_GUIDANCE_BYTES / 1024
+        ));
+    }
+    if guidance.contains(SUBAGENT_GUIDANCE_BLOCK_START)
+        || guidance.contains(SUBAGENT_GUIDANCE_BLOCK_END)
+    {
+        return Err("子代理策略包含 Codey 保留的边界标记".to_string());
+    }
+    Ok(())
+}
 
 pub fn default_subagent_roles() -> BTreeMap<String, SubagentRoleConfig> {
     [
@@ -517,6 +579,22 @@ fn default_subagent_reasoning_effort() -> String {
 }
 
 const DEFAULT_UPDATE_BASE_URL: &str = "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev";
+
+/// Local builds do not accept executable replacements unless the release
+/// environment explicitly opts in. This keeps a customized installation from
+/// being replaced by an upstream package with the same application identity.
+pub fn self_update_enabled() -> bool {
+    self_update_enabled_from_value(option_env!("CODEY_ENABLE_SELF_UPDATE"))
+}
+
+fn self_update_enabled_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        )
+    })
+}
 
 fn update_manifest_url_from_base(configured_base_url: Option<&str>) -> String {
     let base_url = configured_base_url
@@ -813,6 +891,16 @@ mod tests {
     }
 
     #[test]
+    fn self_update_is_an_explicit_build_time_opt_in() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(!self_update_enabled_from_value(value), "{value:?}");
+        }
+        for value in [Some("1"), Some("true"), Some("yes"), Some("on")] {
+            assert!(self_update_enabled_from_value(value), "{value:?}");
+        }
+    }
+
+    #[test]
     fn pet_slim_mode_defaults_to_enabled_for_existing_configs() {
         let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
             .unwrap()
@@ -894,6 +982,7 @@ mod tests {
             .normalize();
 
         assert!(!config.subagent_optimization);
+        assert_eq!(config.subagent_guidance, SUBAGENT_GUIDANCE.trim());
         assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
         assert_eq!(
             config.subagent_reasoning_effort,
@@ -906,6 +995,41 @@ mod tests {
                 .values()
                 .all(|selection| selection.model == DEFAULT_SUBAGENT_MODEL)
         );
+    }
+
+    #[test]
+    fn subagent_guidance_normalizes_and_round_trips() {
+        let blank = serde_json::from_str::<CodeyConfig>(
+            r#"{"activeProfileId":"","profiles":[],"subagentGuidance":"  \n  "}"#,
+        )
+        .unwrap()
+        .normalize();
+        assert_eq!(blank.subagent_guidance, SUBAGENT_GUIDANCE.trim());
+
+        let custom = serde_json::from_str::<CodeyConfig>(
+            r#"{"activeProfileId":"","profiles":[],"subagentGuidance":"  Line one.\n\nLine two.  "}"#,
+        )
+        .unwrap()
+        .normalize();
+        assert_eq!(custom.subagent_guidance, "Line one.\n\nLine two.");
+        let encoded = serde_json::to_value(&custom).unwrap();
+        assert_eq!(encoded["subagentGuidance"], "Line one.\n\nLine two.");
+
+        let migrated = serde_json::from_str::<CodeyConfig>(&format!(
+            r#"{{"activeProfileId":"","profiles":[],"subagentGuidance":{}}}"#,
+            serde_json::to_string(PREVIOUS_SUBAGENT_GUIDANCE_VERSIONS[0]).unwrap()
+        ))
+        .unwrap()
+        .normalize();
+        assert_eq!(migrated.subagent_guidance, SUBAGENT_GUIDANCE.trim());
+    }
+
+    #[test]
+    fn subagent_guidance_rejects_reserved_markers_and_oversized_values() {
+        assert!(validate_subagent_guidance("Custom policy.").is_ok());
+        assert!(validate_subagent_guidance(SUBAGENT_GUIDANCE_BLOCK_START).is_err());
+        assert!(validate_subagent_guidance(SUBAGENT_GUIDANCE_BLOCK_END).is_err());
+        assert!(validate_subagent_guidance(&"x".repeat(MAX_SUBAGENT_GUIDANCE_BYTES + 1)).is_err());
     }
 
     #[test]
@@ -955,6 +1079,11 @@ mod tests {
         .normalize();
 
         assert_eq!(config.subagent_roles.len(), SUBAGENT_ROLE_IDS.len());
+        assert!(
+            SUBAGENT_FIXED_ROLE_IDS
+                .into_iter()
+                .all(|role| !config.subagent_roles.contains_key(role))
+        );
         assert!(!config.subagent_roles.contains_key("unknown"));
         assert_eq!(
             config.subagent_roles[SUBAGENT_ROLE_QUICK_SCAN],

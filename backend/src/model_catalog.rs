@@ -60,6 +60,7 @@ pub struct OfficialModelAvailability {
     pub slug: String,
     pub display_name: String,
     pub supported: bool,
+    pub supports_subagent: bool,
     pub supported_reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: String,
 }
@@ -99,6 +100,28 @@ impl ModelSelectionState {
             .find(|model| model.supported)
             .map(|model| model.slug.as_str())
             .or_else(|| self.third_party_models.first().map(String::as_str))
+    }
+
+    pub fn available_subagent_model(&self, requested: &str) -> Option<&str> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return None;
+        }
+        self.official_models
+            .iter()
+            .find(|model| {
+                model.supported
+                    && model.supports_subagent
+                    && model.slug.eq_ignore_ascii_case(requested)
+            })
+            .map(|model| model.slug.as_str())
+    }
+
+    pub fn first_available_subagent_model(&self) -> Option<&str> {
+        self.official_models
+            .iter()
+            .find(|model| model.supported && model.supports_subagent)
+            .map(|model| model.slug.as_str())
     }
 }
 
@@ -275,6 +298,12 @@ pub fn selection_state_with_manual_models(
             let supported_reasoning_efforts = reasoning_efforts_from_value(model);
             let default_reasoning_effort =
                 default_reasoning_effort_from_value(model, &supported_reasoning_efforts);
+            let supports_subagent = model
+                .get("multi_agent_version")
+                .and_then(Value::as_str)
+                .is_some_and(|version| {
+                    matches!(version.trim().to_ascii_lowercase().as_str(), "v1" | "v2")
+                });
             let model = official_model_from_value(model)?;
             let supported = official_provider
                 || !provider_models_synced
@@ -283,6 +312,7 @@ pub fn selection_state_with_manual_models(
                 slug: model.slug,
                 display_name: model.display_name,
                 supported,
+                supports_subagent,
                 supported_reasoning_efforts,
                 default_reasoning_effort,
             })

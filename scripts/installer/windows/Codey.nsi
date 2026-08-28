@@ -33,6 +33,12 @@ Icon "${PROJECT_ROOT}\backend\icons\Codey.ico"
 Section "Codey" SEC_CODEY
   SectionIn RO
   SetOutPath "$INSTDIR"
+  ; Codex owns the FastCtx MCP children, so they can outlive Codey.exe and
+  ; hold the sidecar open across an otherwise successful application update.
+  ; The sidecar has no user state and is recreated by the next Codey launch.
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM codey-fastctx.exe'
+  Pop $0
+  Sleep 250
   File "/oname=Codey.exe" "${PROJECT_ROOT}\target\release\codey.exe"
   File "${PROJECT_ROOT}\target\release\codey-fastctx.exe"
   File "${PROJECT_ROOT}\README.md"

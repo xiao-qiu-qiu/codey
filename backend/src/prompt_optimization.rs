@@ -694,6 +694,13 @@ mod tests {
         }
     }
 
+    fn local_client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local test client should build")
+    }
+
     #[test]
     fn endpoint_building_trims_and_validates() {
         let mut config = configured();
@@ -863,11 +870,12 @@ mod tests {
                 body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
         });
 
         let mut config = configured();
         config.base_url = format!("http://{address}");
-        let client = Client::new();
+        let client = local_client();
         let models = fetch_models(&client, &config).await.unwrap();
         assert_eq!(models, ["model-a", "model-b"]);
         server.await.unwrap();
@@ -899,12 +907,13 @@ mod tests {
                     body
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
             }
         });
 
         let mut config = configured();
         config.base_url = format!("http://{address}");
-        let models = fetch_models(&Client::new(), &config).await.unwrap();
+        let models = fetch_models(&local_client(), &config).await.unwrap();
         assert_eq!(models, ["fallback-model"]);
         server.await.unwrap();
     }
@@ -927,11 +936,12 @@ mod tests {
                 body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
         });
 
         let mut config = configured();
         config.base_url = format!("http://{address}/v1");
-        let error = test_configuration(&Client::new(), &config)
+        let error = test_configuration(&local_client(), &config)
             .await
             .unwrap_err();
         assert!(error.contains("401"), "{error}");
@@ -963,12 +973,13 @@ mod tests {
                     body.len()
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
             }
         });
 
         let mut config = configured();
         config.base_url = format!("http://{address}");
-        let error = test_configuration(&Client::new(), &config)
+        let error = test_configuration(&local_client(), &config)
             .await
             .unwrap_err();
         assert!(error.contains("401"), "{error}");
@@ -989,18 +1000,20 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 8192];
             let _ = socket.read(&mut request).await.unwrap();
-            let body = "x".repeat(MAX_ERROR_RESPONSE_BYTES + 1);
+            let chunk = "x".repeat(MAX_ERROR_RESPONSE_BYTES / 8);
+            let chunks = (0..8)
+                .map(|_| format!("{:X}\r\n{chunk}\r\n", chunk.len()))
+                .collect::<String>();
             let response = format!(
-                "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
-                body.len(),
-                body
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{chunks}1\r\nx\r\n0\r\n\r\n",
             );
             socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
         });
 
         let mut config = configured();
         config.base_url = format!("http://{address}/v1");
-        let error = test_configuration(&Client::new(), &config)
+        let error = test_configuration(&local_client(), &config)
             .await
             .unwrap_err();
         assert!(error.contains("过大"), "{error}");
@@ -1114,7 +1127,7 @@ mod tests {
 
     #[tokio::test]
     async fn optimize_prompt_validates_before_any_request() {
-        let client = Client::new();
+        let client = local_client();
         let config = configured();
 
         assert!(
@@ -1204,11 +1217,12 @@ mod tests {
                 body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
         });
 
         let mut config = configured();
         config.base_url = format!("http://{address}");
-        let client = Client::new();
+        let client = local_client();
         let result = optimize_prompt(&client, &config, "写个博客").await.unwrap();
         assert_eq!(result, "优化后的提示词");
         server.await.unwrap();
@@ -1269,12 +1283,13 @@ mod tests {
                     body
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
             }
         });
 
         let mut config = configured();
         config.base_url = format!("http://{address}");
-        let result = optimize_prompt(&Client::new(), &config, "写个博客")
+        let result = optimize_prompt(&local_client(), &config, "写个博客")
             .await
             .unwrap();
         assert_eq!(result, "回退后的优化结果");
@@ -1337,6 +1352,7 @@ mod tests {
                 body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
         });
 
         let mut request_headers = BTreeMap::new();
@@ -1352,7 +1368,7 @@ mod tests {
             model: "gpt-responses".to_string(),
             instruction: "保持原意".to_string(),
         };
-        let result = optimize_prompt_resolved(&Client::new(), &config, "写个博客")
+        let result = optimize_prompt_resolved(&local_client(), &config, "写个博客")
             .await
             .unwrap();
         assert_eq!(result, "优化后的响应");
@@ -1377,11 +1393,12 @@ mod tests {
                 body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
         });
 
         let mut config = configured();
         config.base_url = format!("http://{address}");
-        let client = Client::new();
+        let client = local_client();
         let error = optimize_prompt(&client, &config, "你好").await.unwrap_err();
         assert!(error.contains("401"), "{error}");
         assert!(!error.contains("sk-test-key"), "{error}");

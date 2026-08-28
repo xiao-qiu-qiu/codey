@@ -109,7 +109,7 @@ pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V3: &str = r#"## 子代理使用
 - 派发后立即等待全部子代理完成，再继续分析、命令或修改。子代理累计运行 10 分钟仍未完成时，检查状态并终止异常任务，必要时拆成更小任务重新派发。
 "#;
 
-pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V4: &str = r#"## 子代理使用
 
 本 AGENTS.md 明确要求主代理在适用任务中主动使用子代理；无需等待用户逐次点名。子代理用于把宽而重的检索、独立核验或边界清晰的实现从主线程中拆出，减少上下文污染、提高并行度并提供独立证据。
 
@@ -148,12 +148,149 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 本轮计划的子代理全部派发后，在继续非协作分析、命令或修改前进入等待。等待返回 `MESSAGE` 或其他局部更新时，只可使用 `agents.*` 协作工具做必要的查看、转向或停止，然后继续等待；所有已派发子代理完成前不得恢复本地工作或结束任务。子代理累计运行 10 分钟仍未完成时，检查状态并终止异常任务，必要时拆成更小任务重新派发。
 "#;
 
-pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
-    SUBAGENT_GUIDANCE,
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V5: &str = r#"## 子代理使用
+
+本 AGENTS.md 明确要求主代理在适用任务中主动使用子代理；无需等待用户逐次点名。子代理用于把宽而重的检索、独立核验或边界清晰的实现从主线程中拆出，减少上下文污染、提高并行度并提供独立证据。
+
+### 主动派发要求
+
+除下述“直接处理”例外外，只要符合任一条件，必须派发至少一个合适的子代理：
+
+- 需要先定位未知实现位置，或需要跨多个文件、目录、日志或文档检索；
+- 可以拆成两个或更多相互独立的探索、核验或实现分支；
+- 预计会产生大量搜索结果、日志、页面或其他外围材料，需要压缩后再判断；
+- 存在边界清晰、可回滚且可测试的独立实现，可交给写入型角色处理。
+
+不要因为用户没有明确要求子代理、主代理自己也能完成、任务已不在开头，或派发会增加一次工具调用而跳过。若多个条件同时成立，应优先拆成多个互不重叠的任务并在同一轮并发派发。
+
+以下内容由主代理直接处理，不派子代理：已知位置的小文件或少量代码、即将修改的确切代码、奠基性文档，以及派发与复核成本明确不低于直接处理的单一事实。若任务只命中这些例外，不要为了满足数量而形式化派发。
+
+### 任务类型路由
+
+派生时必须按任务性质显式选择下列 `agent_type`，不要用模型名代替任务类型：
+
+- `codey_quick_scan`：只读的快速定位、精确事实查找、重复性检查和低风险小范围检索。
+- `codey_deep_research`：只读的跨文件、日志、代码或文档宽范围检索、归纳和架构探索。
+- `codey_visual_analysis`：只读的截图、页面、GUI、PDF 等视觉证据分析，以及复杂探索或独立核验。
+- `codey_worker`：可写的低到中等复杂度、边界清晰、可回滚且可测试的非视觉实现。
+- `codey_visual_worker`：可写的页面、GUI、PDF 或其他依赖视觉证据与渲染验证的实现。
+- `default`：只读兜底；任务不符合以上专用类型时使用，不承担代码实施。
+
+除 `codey_worker` 和 `codey_visual_worker` 外，子代理默认只做探索、检索和核验，不改动文件。可写角色也只处理被明确授权且边界清晰的实现；方案取舍、关键代码复核和最终验证由主代理负责。角色文件中的沙箱是默认值，实际权限仍受父任务当前权限模式约束。
+
+### 委派与验证
+
+- 任务必须自包含，写清检索范围、具体问题、允许的改动范围和期望输出；精度重要时要求返回 `file:line`、符号名及必要关键原文。派生时必须把这份完整任务写入当前工具 schema 要求的初始任务字段（通常是 `message` 或 `task`）；`task_name`、角色名、模型名和 `fork_turns` 都只是元数据，不能代替任务正文。角色参数只有在当前工具 schema 明确声明时才传入。
+- 多个相互独立的任务应先完成同一批次的全部派发，再进入等待。派生时显式使用 `fork_turns = "none"`，不给子代理复制主线程历史。
+- 子代理结果只是压缩后的线索。主代理沿其出处抽查关键部分，不要把已外包的材料完整重读一遍；但即将修改的确切代码和奠基性文档必须由主代理亲自完整读取。
+- 每个子代理只用一轮，不复用、不追派；子代理不得继续派生其他子代理。
+- 本轮计划的子代理全部派发后，在继续非协作分析、命令或修改前进入等待。等待返回 `MESSAGE` 或其他局部更新时，只可使用 `agents.*` 协作工具做必要的查看、转向或停止，然后继续等待；若子代理报告未收到目标、任务为空或无法判断范围，立即用 `agents.followup_task` 补发同一份完整、自包含的任务正文。所有已派发子代理完成前不得恢复本地工作或结束任务。子代理累计运行 10 分钟仍未完成时，检查状态并终止异常任务，必要时拆成更小任务重新派发。
+"#;
+
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V6: &str = r#"## 子代理使用
+
+本 AGENTS.md 明确要求主代理在适用任务中主动使用子代理；无需等待用户逐次点名。子代理用于把宽而重的检索、独立核验或边界清晰的实现从主线程中拆出，减少上下文污染、提高并行度并提供独立证据。
+
+### 主动派发要求
+
+除下述“直接处理”例外外，只要符合任一条件，必须派发至少一个合适的子代理：
+
+- 需要先定位未知实现位置，或需要跨多个文件、目录、日志或文档检索；
+- 可以拆成两个或更多相互独立的探索、核验或实现分支；
+- 预计会产生大量搜索结果、日志、页面或其他外围材料，需要压缩后再判断；
+- 存在边界清晰、可回滚且可测试的独立实现，可交给写入型角色处理。
+
+不要因为用户没有明确要求子代理、主代理自己也能完成、任务已不在开头，或派发会增加一次工具调用而跳过。若多个条件同时成立，应优先拆成多个互不重叠的任务并在同一轮并发派发。
+
+以下内容由主代理直接处理，不派子代理：已知位置的小文件或少量代码、即将修改的确切代码、奠基性文档，以及派发与复核成本明确不低于直接处理的单一事实。若任务只命中这些例外，不要为了满足数量而形式化派发。
+
+### 任务类型路由
+
+派生时必须按任务性质显式选择下列 `agent_type`，不要用模型名代替任务类型：
+
+- `codey_quick_scan`：只读的快速定位、精确事实查找、重复性检查和低风险小范围检索。
+- `codey_deep_research`：只读的跨文件、日志、代码或文档宽范围检索、归纳和架构探索。
+- `codey_visual_analysis`：只读的截图、页面、GUI、PDF 等视觉证据分析，以及复杂探索或独立核验。
+- `codey_worker`：可写的低到中等复杂度、边界清晰、可回滚且可测试的非视觉实现。
+- `codey_visual_worker`：可写的页面、GUI、PDF 或其他依赖视觉证据与渲染验证的实现。
+- `default`：只读兜底；任务不符合以上专用类型时使用，不承担代码实施。
+
+除 `codey_worker` 和 `codey_visual_worker` 外，子代理默认只做探索、检索和核验，不改动文件。可写角色也只处理被明确授权且边界清晰的实现；方案取舍、关键代码复核和最终验证仍由主代理负责。角色文件中的沙箱是默认值，实际权限仍受父任务当前权限模式约束。
+
+### 委派与验证
+
+- 任务必须自包含，写清检索范围、具体问题、允许的改动范围和期望输出；精度重要时要求返回 `file:line`、符号名及必要关键原文。派生时必须把这份完整任务写入当前工具 schema 要求的初始任务字段（通常是 `message` 或 `task`）；`task_name`、角色名、模型名和 `fork_turns` 都只是元数据，不能代替任务正文。角色参数只有在当前工具 schema 明确声明时才传入。
+- 多个相互独立的任务应先完成同一批次的全部派发，再进入等待。派生时显式使用 `fork_turns = "none"`，不给子代理复制主线程历史。
+- 子代理结果只是压缩后的线索。主代理沿其出处抽查关键部分，不要把已外包的材料完整重读一遍；但即将修改的确切代码和奠基性文档必须由主代理亲自完整读取。
+- 每个子代理只用一轮，不复用、不追派；子代理不得继续派生其他子代理。
+- 本轮计划的子代理全部派发后，在继续非协作分析、命令或修改前进入等待。等待返回 `MESSAGE` 或其他局部更新时，只可使用 `agents.*` 协作工具做必要的查看、转向或停止，然后继续等待；若子代理报告未收到目标、任务为空或无法判断范围，立即用 `agents.followup_task` 补发同一份完整、自包含的任务正文。所有已派发子代理完成前不得恢复本地工作或结束任务。
+"#;
+
+pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+
+本 AGENTS.md 明确要求主代理在适用任务中主动使用子代理；无需等待用户逐次点名。子代理用于把宽而重的检索、独立核验或边界清晰的实现从主线程中拆出，减少上下文污染、提高并行度并提供独立证据。
+
+### 主动派发要求
+
+除下述“直接处理”例外外，只要符合任一条件，必须派发至少一个合适的子代理：
+
+- 需要先定位未知实现位置，或需要跨多个文件、目录、日志或文档检索；
+- 可以拆成两个或更多相互独立的探索、核验或实现分支；
+- 预计会产生大量搜索结果、日志、页面或其他外围材料，需要压缩后再判断；
+- 存在边界清晰、可回滚且可测试的独立实现，可交给写入型角色处理。
+
+不要因为用户没有明确要求子代理、主代理自己也能完成、任务已不在开头，或派发会增加一次工具调用而跳过。若多个条件同时成立，应优先拆成多个互不重叠的任务并在同一轮并发派发。
+
+以下内容由主代理直接处理，不派子代理：已知位置的小文件或少量代码、即将修改的确切代码、奠基性文档，以及派发与复核成本明确不低于直接处理的单一事实。若任务只命中这些例外，不要为了满足数量而形式化派发。
+
+### 任务类型路由
+
+派生时必须按任务性质显式选择下列 `agent_type`，不要用模型名代替任务类型：
+
+- `codey_quick_scan`：只读的快速定位、精确事实查找、重复性检查和低风险小范围检索。
+- `codey_deep_research`：只读的跨文件、日志、代码或文档宽范围检索、归纳和架构探索。
+- `codey_visual_analysis`：只读的截图、页面、GUI、PDF 等视觉证据分析，以及复杂探索或独立核验。
+- `codey_worker`：可写的低到中等复杂度、边界清晰、可回滚且可测试的非视觉实现。
+- `codey_visual_worker`：可写的页面、GUI、PDF 或其他依赖视觉证据与渲染验证的实现。
+- `default`：只读兜底；任务不符合以上专用类型时使用，不承担代码实施。
+- `codey_luna`：固定使用 `gpt-5.6-luna` 与 `max` 思考强度，适合需要最深推理的任务。
+- `codey_terra`：固定使用 `gpt-5.6-terra` 与 `max` 思考强度，适合需要最深推理的任务。
+- `codey_sol`：固定使用 `gpt-5.6-sol` 与 `xhigh` 思考强度，适合高质量、较快的任务处理。
+
+除 `codey_worker` 和 `codey_visual_worker` 外，子代理默认只做探索、检索和核验，不改动文件。可写角色也只处理被明确授权且边界清晰的实现；方案取舍、关键代码复核和最终验证仍由主代理负责。角色文件中的沙箱是默认值，实际权限仍受父任务当前权限模式约束。
+
+需要选择模型挡位时，优先根据任务复杂度在 `codey_luna`、`codey_terra` 和 `codey_sol` 中选择；这三个角色的模型与思考强度由 Codey 固定，不受用户可编辑任务角色配置影响。
+
+### 委派与验证
+
+- 任务必须自包含，写清检索范围、具体问题、允许的改动范围和期望输出；精度重要时要求返回 `file:line`、符号名及必要关键原文。派生时必须把这份完整任务写入当前工具 schema 要求的初始任务字段（通常是 `message` 或 `task`）；`task_name`、角色名、模型名和 `fork_turns` 都只是元数据，不能代替任务正文。角色参数只有在当前工具 schema 明确声明时才传入。
+- 多个相互独立的任务应先完成同一批次的全部派发，再进入等待。派生时显式使用 `fork_turns = "none"`，不给子代理复制主线程历史。
+- 子代理结果只是压缩后的线索。主代理沿其出处抽查关键部分，不要把已外包的材料完整重读一遍；但即将修改的确切代码和奠基性文档必须由主代理亲自完整读取。
+- 每个子代理只用一轮，不复用、不追派；子代理不得继续派生其他子代理。
+- 本轮计划的子代理全部派发后，在继续非协作分析、命令或修改前进入等待。等待返回 `MESSAGE` 或其他局部更新时，只可使用 `agents.*` 协作工具做必要的查看、转向或停止，然后继续等待；若子代理报告未收到目标、任务为空或无法判断范围，立即用 `agents.followup_task` 补发同一份完整、自包含的任务正文。所有已派发子代理完成前不得恢复本地工作或结束任务。
+"#;
+
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
+    PREVIOUS_SUBAGENT_GUIDANCE_V6,
+    PREVIOUS_SUBAGENT_GUIDANCE_V5,
+    PREVIOUS_SUBAGENT_GUIDANCE_V4,
     PREVIOUS_SUBAGENT_GUIDANCE_V3,
     PREVIOUS_SUBAGENT_GUIDANCE_V2,
     PREVIOUS_SUBAGENT_GUIDANCE,
 ];
+
+pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
+    SUBAGENT_GUIDANCE,
+    PREVIOUS_SUBAGENT_GUIDANCE_V6,
+    PREVIOUS_SUBAGENT_GUIDANCE_V5,
+    PREVIOUS_SUBAGENT_GUIDANCE_V4,
+    PREVIOUS_SUBAGENT_GUIDANCE_V3,
+    PREVIOUS_SUBAGENT_GUIDANCE_V2,
+    PREVIOUS_SUBAGENT_GUIDANCE,
+];
+
+pub(crate) const SUBAGENT_GUIDANCE_BLOCK_START: &str = "<!-- CODEY:SUBAGENT_GUIDANCE:BEGIN -->";
+pub(crate) const SUBAGENT_GUIDANCE_BLOCK_END: &str = "<!-- CODEY:SUBAGENT_GUIDANCE:END -->";
 
 pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V4: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
@@ -178,7 +315,13 @@ or another partial update needs action, use only the relevant `agents.send_messa
 `agents.wait_agent`. Treat an agent as done only after its `FINAL_ANSWER` or `task_complete` notification, \
 and continue until every spawned agent is done. While spawned subagents are active, Codey's runtime gate \
 denies non-collaboration local tools and prevents the root turn from finishing. The `functions.exec` tool \
-world is a separate route and does not contain collaboration tools.";
+world is a separate route and does not contain collaboration tools. These agent tools are not in the \
+`functions` namespace and must never be wrapped in `functions.exec`: do not call \
+`functions.spawn_agent`, `functions.wait_agent`, or `functions.followup_task`. The canonical dispatch \
+shape is `agents.spawn_agent({task_name, agent_type, fork_turns: \"none\", message})`, with the complete \
+assignment in `message`; the canonical wait shape is `agents.wait_agent({timeout_ms})`. If the UI shows \
+`Correcting agent tool usage`, treat it as a call-routing or schema error, not agent output, and retry \
+once with the canonical direct schema.";
 
 pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V3: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
@@ -318,6 +461,45 @@ developer_instructions = """
 image_generation = false
 "#####;
 
+pub(crate) const LUNA_AGENT_CONFIG: &str = r#####"name = "codey_luna"
+
+description = "Fixed GPT-5.6-Luna subagent role with Max reasoning effort."
+sandbox_mode = "read-only"
+
+developer_instructions = """
+你是 Luna 固定档位子代理，使用最深的推理强度处理主代理交给你的自包含任务。遵守主代理给出的任务边界，不派生其他子代理；除非任务明确要求，否则只读并返回带出处的高置信度结果。
+"""
+
+[features]
+image_generation = false
+"#####;
+
+pub(crate) const TERRA_AGENT_CONFIG: &str = r#####"name = "codey_terra"
+
+description = "Fixed GPT-5.6-Terra subagent role with Max reasoning effort."
+sandbox_mode = "read-only"
+
+developer_instructions = """
+你是 Terra 固定档位子代理，使用最深的推理强度处理主代理交给你的自包含任务。遵守主代理给出的任务边界，不派生其他子代理；除非任务明确要求，否则只读并返回带出处的高置信度结果。
+"""
+
+[features]
+image_generation = false
+"#####;
+
+pub(crate) const SOL_AGENT_CONFIG: &str = r#####"name = "codey_sol"
+
+description = "Fixed GPT-5.6-Sol subagent role with XHigh reasoning effort."
+sandbox_mode = "read-only"
+
+developer_instructions = """
+你是 Sol 固定档位子代理，使用高强度推理快速完成主代理交给你的自包含任务。遵守主代理给出的任务边界，不派生其他子代理；除非任务明确要求，否则只读并返回带出处的高置信度结果。
+"""
+
+[features]
+image_generation = false
+"#####;
+
 pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
     match role {
         "codey_quick_scan" => Some(QUICK_SCAN_AGENT_CONFIG),
@@ -326,6 +508,9 @@ pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
         "codey_worker" => Some(WORKER_AGENT_CONFIG),
         "codey_visual_worker" => Some(VISUAL_WORKER_AGENT_CONFIG),
         "default" => Some(DEFAULT_AGENT_CONFIG),
+        "codey_luna" => Some(LUNA_AGENT_CONFIG),
+        "codey_terra" => Some(TERRA_AGENT_CONFIG),
+        "codey_sol" => Some(SOL_AGENT_CONFIG),
         _ => None,
     }
 }
@@ -557,25 +742,31 @@ fn dynamic_codey_fastctx_guidance_at(
     current[start..].starts_with(&guidance).then_some(guidance)
 }
 
-pub(crate) fn append_subagent_guidance(existing: &str) -> String {
-    let current_is_present = existing.contains(SUBAGENT_GUIDANCE);
+pub(crate) fn append_subagent_guidance(existing: &str, configured: &str) -> String {
     let mut updated = existing.to_string();
+    while let Some(without_guidance) = remove_owned_subagent_guidance_block(&updated) {
+        updated = without_guidance;
+    }
     for &guidance in SUBAGENT_GUIDANCE_VERSIONS {
-        if current_is_present && guidance == SUBAGENT_GUIDANCE {
-            continue;
-        }
         while let Some(without_guidance) = remove_owned_guidance_block(&updated, guidance) {
             updated = without_guidance;
         }
     }
-    if current_is_present {
-        return updated;
-    }
+    let configured = configured.trim();
+    let configured = if configured.is_empty() {
+        SUBAGENT_GUIDANCE
+    } else {
+        configured
+    };
     let mut updated = updated.trim_end().to_string();
     if !updated.is_empty() {
         updated.push_str("\n\n");
     }
-    updated.push_str(SUBAGENT_GUIDANCE);
+    updated.push_str(SUBAGENT_GUIDANCE_BLOCK_START);
+    updated.push('\n');
+    updated.push_str(configured);
+    updated.push('\n');
+    updated.push_str(SUBAGENT_GUIDANCE_BLOCK_END);
     updated.push('\n');
     updated
 }
@@ -614,6 +805,10 @@ pub(crate) fn root_agent_collaboration_usage_hint_blocks(current: &str) -> Vec<&
 pub(crate) fn remove_subagent_guidance(current: &str) -> Option<String> {
     let mut restored = current.to_string();
     let mut changed = false;
+    while let Some(without_guidance) = remove_owned_subagent_guidance_block(&restored) {
+        restored = without_guidance;
+        changed = true;
+    }
     for &guidance in SUBAGENT_GUIDANCE_VERSIONS {
         while let Some(without_guidance) = remove_owned_guidance_block(&restored, guidance) {
             restored = without_guidance;
@@ -621,6 +816,18 @@ pub(crate) fn remove_subagent_guidance(current: &str) -> Option<String> {
         }
     }
     changed.then_some(restored)
+}
+
+fn remove_owned_subagent_guidance_block(current: &str) -> Option<String> {
+    let guidance_start = current.find(SUBAGENT_GUIDANCE_BLOCK_START)?;
+    let content_start = guidance_start + SUBAGENT_GUIDANCE_BLOCK_START.len();
+    let relative_end = current[content_start..].find(SUBAGENT_GUIDANCE_BLOCK_END)?;
+    let guidance_end = content_start + relative_end + SUBAGENT_GUIDANCE_BLOCK_END.len();
+    Some(remove_guidance_at(
+        current,
+        guidance_start,
+        guidance_end - guidance_start,
+    ))
 }
 
 pub(crate) fn remove_codey_fastctx_guidance(current: &str) -> Option<String> {
@@ -786,6 +993,9 @@ mod tests {
         assert!(combined.contains("`FINAL_ANSWER`"));
         assert!(combined.contains("`task_complete`"));
         assert!(combined.contains("`functions.exec` tool world is a separate route"));
+        assert!(combined.contains("not in the `functions` namespace"));
+        assert!(combined.contains("`functions.spawn_agent`"));
+        assert!(combined.contains("Correcting agent tool usage"));
         assert!(!combined.contains("Write-Output"));
         assert!(!combined.contains("Write-Error"));
         assert_eq!(
@@ -830,23 +1040,46 @@ mod tests {
     #[test]
     fn subagent_guidance_migrates_the_previous_owned_block() {
         for previous in [
+            PREVIOUS_SUBAGENT_GUIDANCE_V6,
+            PREVIOUS_SUBAGENT_GUIDANCE_V5,
+            PREVIOUS_SUBAGENT_GUIDANCE_V4,
             PREVIOUS_SUBAGENT_GUIDANCE_V3,
             PREVIOUS_SUBAGENT_GUIDANCE_V2,
             PREVIOUS_SUBAGENT_GUIDANCE,
         ] {
             let configured = format!("User guidance.\n\n{previous}\n\nConcurrent guidance.");
-            let migrated = append_subagent_guidance(&configured);
+            let migrated = append_subagent_guidance(&configured, SUBAGENT_GUIDANCE);
 
             assert!(migrated.contains("User guidance."));
             assert!(migrated.contains("Concurrent guidance."));
+            assert!(migrated.contains(SUBAGENT_GUIDANCE_BLOCK_START));
             assert!(migrated.contains(SUBAGENT_GUIDANCE));
             assert!(!migrated.contains(previous));
-            assert_eq!(append_subagent_guidance(&migrated), migrated);
+            assert_eq!(
+                append_subagent_guidance(&migrated, SUBAGENT_GUIDANCE),
+                migrated
+            );
             assert_eq!(
                 remove_subagent_guidance(&migrated).as_deref(),
                 Some("User guidance.\n\nConcurrent guidance.\n")
             );
         }
+    }
+
+    #[test]
+    fn custom_subagent_guidance_replaces_only_the_owned_block() {
+        let first = append_subagent_guidance("User guidance.\n", "Custom policy one.");
+        let second = append_subagent_guidance(&first, "Custom policy two.");
+
+        assert!(second.starts_with("User guidance.\n\n"));
+        assert!(!second.contains("Custom policy one."));
+        assert!(second.contains("Custom policy two."));
+        assert_eq!(second.matches(SUBAGENT_GUIDANCE_BLOCK_START).count(), 1);
+        assert_eq!(second.matches(SUBAGENT_GUIDANCE_BLOCK_END).count(), 1);
+        assert_eq!(
+            remove_subagent_guidance(&second).as_deref(),
+            Some("User guidance.\n")
+        );
     }
 
     #[test]
@@ -858,11 +1091,22 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("若任务只命中这些例外，不要为了满足数量而形式化派发"));
         assert!(SUBAGENT_GUIDANCE.contains("先完成同一批次的全部派发，再进入等待"));
         assert!(SUBAGENT_GUIDANCE.contains("只可使用 `agents.*` 协作工具"));
+        assert!(SUBAGENT_GUIDANCE.contains("初始任务字段"));
+        assert!(
+            SUBAGENT_GUIDANCE.contains("`task_name`、角色名、模型名和 `fork_turns` 都只是元数据")
+        );
+        assert!(
+            SUBAGENT_GUIDANCE.contains("`agents.followup_task` 补发同一份完整、自包含的任务正文")
+        );
         assert!(SUBAGENT_GUIDANCE.contains("实际权限仍受父任务当前权限模式约束"));
+        assert!(SUBAGENT_GUIDANCE.contains("codey_luna"));
+        assert!(SUBAGENT_GUIDANCE.contains("codey_terra"));
+        assert!(SUBAGENT_GUIDANCE.contains("codey_sol"));
+        assert!(!SUBAGENT_GUIDANCE.contains("10 分钟"));
     }
 
     #[test]
-    fn every_task_role_has_a_named_editable_source_template() {
+    fn every_runtime_role_has_a_named_source_template() {
         for (role, writable) in [
             ("codey_quick_scan", false),
             ("codey_deep_research", false),
@@ -870,6 +1114,9 @@ mod tests {
             ("codey_worker", true),
             ("codey_visual_worker", true),
             ("default", false),
+            ("codey_luna", false),
+            ("codey_terra", false),
+            ("codey_sol", false),
         ] {
             let source = subagent_source_config(role).unwrap();
             assert!(source.contains(&format!("name = \"{role}\"")));

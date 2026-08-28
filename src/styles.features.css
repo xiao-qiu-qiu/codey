@@ -281,6 +281,82 @@
   border-radius: 10px;
 }
 
+.subagent-fixed-value {
+  min-width: 0;
+  overflow: hidden;
+  color: #5f6368;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-guidance-editor {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 7px;
+  padding-top: 2px;
+}
+
+.subagent-guidance-toolbar,
+.subagent-guidance-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.subagent-guidance-toolbar label {
+  color: #3a3a3c;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.subagent-guidance-toolbar .codey-button {
+  flex: 0 0 auto;
+}
+
+.subagent-guidance-textarea {
+  width: 100%;
+  min-height: 190px;
+  max-height: 430px;
+  box-sizing: border-box;
+  resize: vertical;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 7px;
+  outline: 0;
+  background: #ffffff;
+  color: #1d1d1f;
+  padding: 10px 11px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  letter-spacing: 0;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.subagent-guidance-textarea:hover:not(:disabled) {
+  border-color: rgba(0, 0, 0, 0.22);
+}
+
+.subagent-guidance-textarea:focus {
+  border-color: rgba(0, 122, 255, 0.65);
+  box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.12);
+}
+
+.subagent-guidance-textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.subagent-guidance-meta small:last-child {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 660px) {
   .subagent-policy-columns {
     display: none;
@@ -297,6 +373,12 @@
     color: #8e8e93;
     font-size: 10px;
     font-weight: 600;
+  }
+
+  .subagent-guidance-meta {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
   }
 }
 

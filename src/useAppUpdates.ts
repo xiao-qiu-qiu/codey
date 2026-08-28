@@ -43,6 +43,9 @@ const updateAvailable = (
 ): check is UpdateCheck => check?.updateAvailable === true;
 
 function updateCheckText(result: UpdateCheck) {
+  if (!result.selfUpdateEnabled) {
+    return "本地定制构建已锁定在线安装包；请同步源码后重新构建并安装。";
+  }
   return result.updateAvailable
     ? result.selectedAsset
       ? `发现 v${result.latestVersion} 更新（当前 v${result.currentVersion}）`
@@ -51,6 +54,7 @@ function updateCheckText(result: UpdateCheck) {
 }
 
 function updateResultTone(result: UpdateCheck): InlineResult["tone"] {
+  if (!result.selfUpdateEnabled) return "idle";
   return result.updateAvailable && !result.selectedAsset
     ? "error"
     : "success";
@@ -136,8 +140,10 @@ export function useAppUpdates({
     if (embedded || !configLoaded) return;
     let cancelled = false;
     let timer = 0;
+    let updatesLocked = false;
 
     const shouldPause = () =>
+      updatesLocked ||
       updateAvailable(updateCheckRef.current) ||
       updateAvailable(window.__codeyUpdateAvailability);
 
@@ -155,6 +161,15 @@ export function useAppUpdates({
       try {
         const result = await requestUpdateCheck();
         if (cancelled) return;
+        if (!result.selfUpdateEnabled) {
+          updatesLocked = true;
+          setUpdateCheck(result);
+          setUpdateResult({
+            tone: updateResultTone(result),
+            text: updateCheckText(result),
+          });
+          return;
+        }
         if (result.updateAvailable) {
           setUpdateCheck(result);
           setDownloadedUpdate(null);
@@ -200,8 +215,9 @@ export function useAppUpdates({
         text,
       });
       setNotice({
-        tone:
-          result.updateAvailable && result.selectedAsset
+        tone: !result.selfUpdateEnabled
+          ? "info"
+          : result.updateAvailable && result.selectedAsset
             ? "info"
             : result.updateAvailable
               ? "error"

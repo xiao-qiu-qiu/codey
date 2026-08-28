@@ -125,3 +125,16 @@ test("Windows release publishes the installer without a portable zip", () => {
   assert.doesNotMatch(workflow, /windows-x64-portable\.zip/);
   assert.doesNotMatch(workflow, /codey-windows-x64-portable/);
 });
+
+test("Windows installer releases FastCtx sidecars before replacing them", () => {
+  const stopSidecars = windowsInstallerScript.indexOf(
+    'taskkill.exe" /F /IM codey-fastctx.exe',
+  );
+  const installSidecar = windowsInstallerScript.indexOf(
+    'File "${PROJECT_ROOT}\\target\\release\\codey-fastctx.exe"',
+  );
+
+  assert.notEqual(stopSidecars, -1);
+  assert.notEqual(installSidecar, -1);
+  assert.ok(stopSidecars < installSidecar);
+});

@@ -83,7 +83,7 @@ use crate::codex_config::{
 };
 use crate::config::{
     CodeyConfig, ConfigStore, PromptOptimizationConfig, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
-    SubagentRoleConfig,
+    SubagentRoleConfig, default_subagent_guidance, validate_subagent_guidance,
 };
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
@@ -609,6 +609,7 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
         "ccSwitch": cc_switch,
         "modelState": model_state,
         "fastContextToolsStatus": fast_context_tools_status,
+        "defaultSubagentGuidance": default_subagent_guidance(),
     }))
 }
 
@@ -719,6 +720,7 @@ pub async fn save_codey_config(
 
 struct CodeyConfigSaveInput {
     config: CodeyConfig,
+    subagent_guidance_present: bool,
     subagent_roles_present: bool,
     subagent_model_present: bool,
     subagent_reasoning_effort_present: bool,
@@ -729,6 +731,7 @@ impl CodeyConfigSaveInput {
     fn complete(config: CodeyConfig) -> Self {
         Self {
             config,
+            subagent_guidance_present: true,
             subagent_roles_present: true,
             subagent_model_present: true,
             subagent_reasoning_effort_present: true,
@@ -744,6 +747,7 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
     let fields = config_value
         .as_object()
         .ok_or_else(|| "参数 config 无效：必须是 object".to_string())?;
+    let subagent_guidance_present = fields.contains_key("subagentGuidance");
     let subagent_roles_present = fields.contains_key("subagentRoles");
     let subagent_model_present = fields.contains_key("subagentModel");
     let subagent_reasoning_effort_present = fields.contains_key("subagentReasoningEffort");
@@ -751,6 +755,7 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
         .map_err(|error| format!("参数 config 无效：{error}"))?;
     Ok(CodeyConfigSaveInput {
         config,
+        subagent_guidance_present,
         subagent_roles_present,
         subagent_model_present,
         subagent_reasoning_effort_present,
@@ -781,6 +786,7 @@ async fn save_codey_config_locked(
 ) -> Result<SavedCodeyConfig, String> {
     let CodeyConfigSaveInput {
         config: mut config_input,
+        subagent_guidance_present,
         subagent_roles_present,
         subagent_model_present,
         subagent_reasoning_effort_present,
@@ -815,6 +821,10 @@ async fn save_codey_config_locked(
     );
     config.fast_codex_startup = config_input.fast_codex_startup;
     config.subagent_optimization = config_input.subagent_optimization;
+    if subagent_guidance_present {
+        validate_subagent_guidance(&config_input.subagent_guidance)?;
+        config.subagent_guidance = config_input.subagent_guidance;
+    }
     let default_role_supplied = subagent_roles_present
         && !config_input.subagent_roles.is_empty()
         && config_input
@@ -1225,6 +1235,8 @@ fn config_requires_restart(
         || applied.fast_codex_startup != current.fast_codex_startup
         || applied.subagent_optimization != current.subagent_optimization
         || applied_models != &RuntimeModelConfig::from_config(current)
+        || ((applied.subagent_optimization || current.subagent_optimization)
+            && applied.subagent_guidance != current.subagent_guidance)
         || ((applied.subagent_optimization || current.subagent_optimization)
             && applied_subagent != &RuntimeSubagentConfig::from_config(current))
 }

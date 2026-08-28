@@ -78,6 +78,9 @@ impl StartupUpdateBackend for LiveBackend<'_> {
 }
 
 pub async fn run(state: &Arc<AppState>, ui: &NativeUpdateUi) -> StartupUpdateOutcome {
+    if !crate::config::self_update_enabled() {
+        return StartupUpdateOutcome::Continue;
+    }
     run_with(&LiveBackend { state }, ui).await
 }
 
@@ -253,6 +256,7 @@ mod tests {
                 },
                 update_available,
                 selected_asset: installable.then(asset),
+                self_update_enabled: true,
             },
         }
     }

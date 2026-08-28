@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::codex_config::current_model_provider;
 use crate::fs_util::timestamp_millis;
+use crate::session_delete_tombstone;
 use crate::sqlite_util::table_columns;
 
 const SESSION_BUNDLE_FORMAT: &str = "codey.session";
@@ -453,6 +454,11 @@ fn import_session_bundle(
     if let Err(error) = insert_result {
         let _ = fs::remove_file(&rollout_path);
         return Err(error);
+    }
+    // Reusing an ID through the explicit Codey import flow is intentional;
+    // unlike an external sync, it is allowed to cancel that deletion marker.
+    if !duplicated {
+        session_delete_tombstone::clear(home, &session_id)?;
     }
 
     let message = if duplicated {

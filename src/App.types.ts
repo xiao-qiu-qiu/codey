@@ -55,6 +55,7 @@ export type Config = {
   fastContextTools: boolean;
   fastCodexStartup: boolean;
   subagentOptimization: boolean;
+  subagentGuidance: string;
   subagentModel: string;
   subagentReasoningEffort: string;
   subagentRoles: Record<SubagentRoleId, SubagentRoleConfig>;
@@ -66,6 +67,7 @@ export type OfficialModelState = {
   slug: string;
   displayName: string;
   supported: boolean;
+  supportsSubagent: boolean;
   supportedReasoningEfforts: string[];
   defaultReasoningEffort: string;
 };
@@ -193,6 +195,7 @@ export type UpdateCheck = {
   latestVersion: string;
   updateAvailable: boolean;
   selectedAsset?: UpdateAsset;
+  selfUpdateEnabled: boolean;
 };
 
 export type UpdateAsset = {

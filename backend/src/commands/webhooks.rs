@@ -1467,6 +1467,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            socket.shutdown().await.unwrap();
         });
         let mut config = CodeyConfig::default();
         config.webhook.channels = vec![NotificationChannelConfig {

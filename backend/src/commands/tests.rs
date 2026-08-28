@@ -290,6 +290,7 @@ async fn legacy_save_without_subagent_roles_preserves_differentiated_roles() {
         .get_mut("codey_deep_research")
         .unwrap()
         .reasoning_effort = "ultra".to_string();
+    initial.subagent_guidance = "Keep the existing custom policy.".to_string();
     let expected_roles = initial.subagent_roles.clone();
     let state = Arc::new(AppState {
         store: ConfigStore::new(directory.path().join("config.json")),
@@ -298,6 +299,7 @@ async fn legacy_save_without_subagent_roles_preserves_differentiated_roles() {
     });
     let mut payload = serde_json::to_value(initial).unwrap();
     payload.as_object_mut().unwrap().remove("subagentRoles");
+    payload.as_object_mut().unwrap().remove("subagentGuidance");
     payload["slimCodexPet"] = json!(false);
 
     let result = invoke_api(&state, "save_codey_config", json!({ "config": payload })).await;
@@ -305,7 +307,33 @@ async fn legacy_save_without_subagent_roles_preserves_differentiated_roles() {
     assert_eq!(result["status"], "ok");
     let saved = state.config.read().await;
     assert_eq!(saved.subagent_roles, expected_roles);
+    assert_eq!(saved.subagent_guidance, "Keep the existing custom policy.");
     assert!(!saved.slim_codex_pet);
+}
+
+#[tokio::test]
+async fn save_persists_custom_subagent_guidance() {
+    let directory = tempfile::tempdir().unwrap();
+    let initial = CodeyConfig::default();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(initial.clone()),
+        ..AppState::default()
+    });
+    let mut payload = serde_json::to_value(initial).unwrap();
+    payload["subagentGuidance"] = json!("  Custom root policy.\n\nKeep this paragraph.  ");
+
+    let result = invoke_api(&state, "save_codey_config", json!({ "config": payload })).await;
+
+    assert_eq!(result["status"], "ok");
+    assert_eq!(
+        state.config.read().await.subagent_guidance,
+        "Custom root policy.\n\nKeep this paragraph."
+    );
+    assert_eq!(
+        state.store.load().unwrap().subagent_guidance,
+        "Custom root policy.\n\nKeep this paragraph."
+    );
 }
 
 #[tokio::test]

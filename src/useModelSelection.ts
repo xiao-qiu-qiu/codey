@@ -23,7 +23,6 @@ import {
   withoutModelId,
 } from "./modelIds";
 
-const THIRD_PARTY_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"];
 const MAX_MODEL_ID_BYTES = 512;
 const MAX_MODEL_COUNT = 10_000;
 const modelIdEncoder = new TextEncoder();
@@ -135,7 +134,7 @@ export function useModelSelection({
   const subagentModelOptions = useMemo<SubagentModelOption[]>(
     () => [
       ...modelState.officialModels
-        .filter((model) => model.supported)
+        .filter((model) => model.supported && model.supportsSubagent)
         .map((model) => ({
           value: model.slug,
           label: model.displayName,
@@ -145,15 +144,8 @@ export function useModelSelection({
               : ["low"],
           defaultReasoningEffort: model.defaultReasoningEffort || "low",
         })),
-      ...modelState.thirdPartyModels
-        .map((model) => ({
-          value: model,
-          label: model,
-          supportedReasoningEfforts: THIRD_PARTY_REASONING_EFFORTS,
-          defaultReasoningEffort: "low",
-        })),
     ],
-    [modelState.officialModels, modelState.thirdPartyModels],
+    [modelState.officialModels],
   );
 
   const openModelPicker = useCallback((state: ModelState, warning = "") => {

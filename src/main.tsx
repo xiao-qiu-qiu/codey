@@ -35,6 +35,8 @@ if (import.meta.env.DEV) {
       feishu: "https://webhook.example.invalid/feishu/preview-only",
     } as const;
     const previewApiKey = "preview-only-not-a-secret";
+    const previewSubagentGuidance =
+      "## 子代理使用\n\n根据任务范围主动选择并派发合适的 Codey 子代理角色。";
     let previewConfig = {
       settingsRevision: 0,
       activeProfileId: "primary",
@@ -110,6 +112,7 @@ if (import.meta.env.DEV) {
       fastContextTools: false,
       fastCodexStartup: true,
       subagentOptimization: false,
+      subagentGuidance: previewSubagentGuidance,
       subagentModel: "gpt-5.6-terra",
       subagentReasoningEffort: "medium",
       subagentRoles: {
@@ -164,6 +167,7 @@ if (import.meta.env.DEV) {
             userConfigured: false,
             detectionFailed: false,
           },
+          defaultSubagentGuidance: previewSubagentGuidance,
         };
       }
       if (command === "runtime_status") {
@@ -504,6 +508,7 @@ if (import.meta.env.DEV) {
           currentVersion: "0.1.0",
           latestVersion: "0.2.0",
           updateAvailable: true,
+          selfUpdateEnabled: true,
           selectedAsset: {
             platform: "macos",
             arch: "arm64",

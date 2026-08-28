@@ -44,6 +44,7 @@ pub(crate) struct UpdateCheck {
     pub(crate) latest_version: String,
     pub(crate) update_available: bool,
     pub(crate) selected_asset: Option<UpdateAssetInfo>,
+    pub(crate) self_update_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -107,6 +108,10 @@ async fn update_candidate_with_ttl(
     state: &Arc<AppState>,
     cache_ttl: Duration,
 ) -> Result<UpdateCandidate, String> {
+    if !crate::config::self_update_enabled() {
+        *state.available_update.write().await = None;
+        return Ok(local_build_update_lock());
+    }
     let manifest_url = configured_update_manifest_url(state).await?;
     let mut cache = state.update_candidate_cache.lock().await;
     let now = Instant::now();
@@ -144,6 +149,7 @@ pub(crate) async fn download_update_candidate(
     state: &Arc<AppState>,
     candidate: &UpdateCandidate,
 ) -> Result<UpdateDownload, String> {
+    ensure_self_update_enabled()?;
     if !candidate.check.update_available {
         return Err(format!(
             "当前已是最新版本 v{}",
@@ -191,6 +197,7 @@ pub(crate) async fn start_downloaded_update(
     state: &AppState,
     file_path: &str,
 ) -> Result<(), String> {
+    ensure_self_update_enabled()?;
     let expected_update = state
         .available_update
         .read()
@@ -199,6 +206,32 @@ pub(crate) async fn start_downloaded_update(
         .ok_or_else(|| "无法确认更新包来源，请重新检查并下载更新".to_string())?;
     let verified = verify_downloaded_update(&state.store, file_path, &expected_update).await?;
     spawn_update_installer(&verified.path, &verified.asset)
+}
+
+const LOCAL_BUILD_UPDATE_LOCK_MESSAGE: &str =
+    "本地定制构建已锁定在线安装包；请同步源码后重新构建并安装。";
+
+fn ensure_self_update_enabled() -> Result<(), String> {
+    ensure_self_update_enabled_for(crate::config::self_update_enabled())
+}
+
+fn ensure_self_update_enabled_for(enabled: bool) -> Result<(), String> {
+    enabled
+        .then_some(())
+        .ok_or_else(|| LOCAL_BUILD_UPDATE_LOCK_MESSAGE.to_string())
+}
+
+fn local_build_update_lock() -> UpdateCandidate {
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    UpdateCandidate {
+        check: UpdateCheck {
+            current_version: version.clone(),
+            latest_version: version,
+            update_available: false,
+            selected_asset: None,
+            self_update_enabled: false,
+        },
+    }
 }
 
 async fn configured_update_manifest_url(state: &AppState) -> Result<String, String> {
@@ -275,6 +308,7 @@ pub(super) fn assess_update_manifest(
         latest_version: latest.to_string(),
         update_available: latest > current,
         selected_asset: selected_update_asset(&manifest.assets).map(|asset| asset_info(&asset)),
+        self_update_enabled: true,
     })
 }
 
@@ -733,7 +767,23 @@ mod tests {
             latest_version: version.to_string(),
             update_available: true,
             selected_asset: Some(asset),
+            self_update_enabled: true,
         }
+    }
+
+    #[test]
+    fn locked_local_builds_never_accept_online_installers() {
+        assert!(ensure_self_update_enabled_for(true).is_ok());
+        assert_eq!(
+            ensure_self_update_enabled_for(false).unwrap_err(),
+            LOCAL_BUILD_UPDATE_LOCK_MESSAGE
+        );
+
+        let locked = local_build_update_lock().check;
+        assert!(!locked.self_update_enabled);
+        assert!(!locked.update_available);
+        assert_eq!(locked.current_version, locked.latest_version);
+        assert!(locked.selected_asset.is_none());
     }
 
     #[test]

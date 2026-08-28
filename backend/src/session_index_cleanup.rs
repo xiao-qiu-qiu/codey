@@ -163,8 +163,8 @@ pub fn remove_thread(home: &Path, thread_id: &str) -> Result<SessionIndexCleanup
         return Ok(SessionIndexCleanupReport::default());
     }
     let _lock = CleanupLock::acquire(home)?;
-    let Some(plan) = plan_cleanup_matching(&home.join("session_index.jsonl"), |candidate| {
-        candidate.id == thread_id
+    let Some(plan) = plan_explicit_remove_matching(&home.join("session_index.jsonl"), |id| {
+        crate::session_metadata::normalize_session_id(id) == thread_id
     })?
     else {
         return Ok(SessionIndexCleanupReport::default());
@@ -492,6 +492,62 @@ fn plan_cleanup_matching(
     }))
 }
 
+/// Explicit deletion must remove an entry even when another Codex client has
+/// added metadata fields or used a `local:`-prefixed ID. Automatic orphan
+/// cleanup intentionally remains strict and keeps unknown index shapes.
+fn plan_explicit_remove_matching(
+    path: &Path,
+    mut should_remove: impl FnMut(&str) -> bool,
+) -> Result<Option<CleanupPlan>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let original_bytes =
+        fs::read(path).with_context(|| format!("读取会话索引失败：{}", path.display()))?;
+    let original_text = String::from_utf8(original_bytes.clone())
+        .with_context(|| format!("会话索引不是 UTF-8：{}", path.display()))?;
+    let mut candidates = Vec::new();
+    let mut scanned_entries = 0;
+    for (source_line_index, segment) in original_text.split_inclusive('\n').enumerate() {
+        let (line, _) = split_line_ending(segment);
+        let Some(id) = explicit_thread_id(line) else {
+            continue;
+        };
+        scanned_entries += 1;
+        if should_remove(&id) {
+            candidates.push(CleanupCandidate {
+                id: id.to_string(),
+                thread_name: String::new(),
+                updated_at: String::new(),
+                source_line_index,
+            });
+        }
+    }
+    Ok(Some(CleanupPlan {
+        path: path.to_path_buf(),
+        snapshot_sha256: sha256_hex(&original_bytes),
+        original_bytes,
+        original_text,
+        scanned_entries,
+        candidates,
+    }))
+}
+
+fn explicit_thread_id(line: &str) -> Option<String> {
+    let record = serde_json::from_str::<Value>(line).ok()?;
+    let object = record.as_object()?;
+    ["id", "thread_id", "threadId", "session_id", "sessionId"]
+        .into_iter()
+        .find_map(|key| {
+            object
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
 fn known_candidate(line: &str, source_line_index: usize) -> Option<CleanupCandidate> {
     let record = serde_json::from_str::<Value>(line).ok()?;
     let object = record.as_object()?;
@@ -729,6 +785,38 @@ mod tests {
         assert!(updated.contains("\"id\":\"kept-thread\""));
         assert!(report.backup_dir.is_none());
         assert!(!home.join("backups_state").exists());
+    }
+
+    #[test]
+    fn explicit_delete_removes_synced_index_shapes_and_prefixed_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let original = [
+            serde_json::to_string(&json!({
+                "id": "local:deleted-thread",
+                "thread_name": "deleted",
+                "updated_at": "2026-07-20T00:00:00Z",
+                "source": "ccswitch",
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "threadId": "deleted-thread",
+                "title": "duplicate from codex-x",
+                "updatedAt": "2026-07-20T00:00:00Z",
+            }))
+            .unwrap(),
+            index_line("kept-thread", "kept"),
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(home.join("session_index.jsonl"), original).unwrap();
+
+        let report = remove_thread(home, "local:deleted-thread").unwrap();
+
+        assert_eq!(report.pruned_entries, 2);
+        let updated = fs::read_to_string(home.join("session_index.jsonl")).unwrap();
+        assert!(!updated.contains("deleted-thread"));
+        assert!(updated.contains("kept-thread"));
     }
 
     #[test]

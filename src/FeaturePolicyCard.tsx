@@ -1,12 +1,12 @@
 import { memo, type CSSProperties } from "react";
-import { IconInfoCircle } from "@tabler/icons-react";
+import { IconInfoCircle, IconRestore } from "@tabler/icons-react";
 
 import type {
   Config,
   FastContextToolsStatus,
   SubagentRoleId,
 } from "./App.types";
-import { Badge, Card, Select, Switch, Tooltip } from "./components/semi";
+import { Badge, Button, Card, Select, Switch, Tooltip } from "./components/semi";
 import { SETTINGS_OVERLAY_Z_INDEX } from "./overlay.constants";
 import type { SubagentModelOption } from "./useModelSelection";
 
@@ -62,6 +62,29 @@ const SUBAGENT_TASK_TYPES = [
   name: string;
   description: string;
 }>;
+const SUBAGENT_FIXED_ROLE_TYPES = [
+  {
+    id: "codey_luna",
+    name: "Luna",
+    model: "gpt-5.6-luna",
+    reasoningEffort: "max",
+    description: "固定使用 GPT-5.6-Luna 与最大思考强度，适合最复杂的推理任务。",
+  },
+  {
+    id: "codey_terra",
+    name: "Terra",
+    model: "gpt-5.6-terra",
+    reasoningEffort: "max",
+    description: "固定使用 GPT-5.6-Terra 与最大思考强度，适合最复杂的推理任务。",
+  },
+  {
+    id: "codey_sol",
+    name: "Sol",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "xhigh",
+    description: "固定使用 GPT-5.6-Sol 与极高思考强度，适合高质量、较快的任务处理。",
+  },
+] as const;
 
 type FeaturePolicyCardProps = {
   config: Config;
@@ -71,6 +94,7 @@ type FeaturePolicyCardProps = {
   tooltipContainer: HTMLElement | null;
   isBusy: boolean;
   subagentModelOptions: SubagentModelOption[];
+  defaultSubagentGuidance: string;
   onConfigChange: (config: Config) => void;
   onSubagentOptimizationChange: (checked: boolean) => void;
 };
@@ -83,6 +107,7 @@ function FeaturePolicyCardComponent({
   tooltipContainer,
   isBusy,
   subagentModelOptions,
+  defaultSubagentGuidance,
   onConfigChange,
   onSubagentOptimizationChange,
 }: FeaturePolicyCardProps) {
@@ -101,6 +126,9 @@ function FeaturePolicyCardComponent({
     label: option.label,
     value: option.value,
   }));
+  const subagentGuidanceBytes = new TextEncoder().encode(
+    config.subagentGuidance,
+  ).byteLength;
   const fastctxStatusBlocksEmbedded =
     fastContextToolsStatus.userConfigured ||
     fastContextToolsStatus.detectionFailed;
@@ -349,6 +377,82 @@ function FeaturePolicyCardComponent({
                         </div>
                       );
                     })}
+                    {SUBAGENT_FIXED_ROLE_TYPES.map((task) => (
+                      <div className="subagent-policy-row subagent-fixed-policy-row" key={task.id}>
+                        <div className="subagent-task-name">
+                          <span>{task.name}</span>
+                          <Badge variant="secondary">固定</Badge>
+                          <Tooltip
+                            content={task.description}
+                            getPopupContainer={() =>
+                              popupContainer ?? tooltipContainer ?? document.body
+                            }
+                            position="top"
+                            zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                          >
+                            <button
+                              type="button"
+                              className="subagent-task-help"
+                              aria-label={`${task.name}：${task.description}`}
+                            >
+                              <IconInfoCircle size={15} aria-hidden="true" />
+                            </button>
+                          </Tooltip>
+                        </div>
+                        <div className="subagent-fixed-value" aria-label={`${task.name}模型`}>
+                          <span className="subagent-mobile-field-label">模型</span>
+                          {task.model}
+                        </div>
+                        <div
+                          className="subagent-fixed-value"
+                          aria-label={`${task.name}思考深度`}
+                        >
+                          <span className="subagent-mobile-field-label">思考深度</span>
+                          {REASONING_EFFORT_LABELS[task.reasoningEffort]}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="subagent-guidance-editor">
+                    <div className="subagent-guidance-toolbar">
+                      <label htmlFor="subagent-guidance">主代理委派策略</label>
+                      <Button
+                        variant="ghost"
+                        size="xs"
+                        disabled={
+                          isBusy ||
+                          !defaultSubagentGuidance ||
+                          config.subagentGuidance === defaultSubagentGuidance
+                        }
+                        onClick={() =>
+                          onConfigChange({
+                            ...config,
+                            subagentGuidance: defaultSubagentGuidance,
+                          })
+                        }
+                      >
+                        <IconRestore size={14} aria-hidden="true" />
+                        恢复默认
+                      </Button>
+                    </div>
+                    <textarea
+                      id="subagent-guidance"
+                      className="subagent-guidance-textarea"
+                      value={config.subagentGuidance}
+                      disabled={isBusy}
+                      maxLength={32768}
+                      spellCheck={false}
+                      onChange={(event) =>
+                        onConfigChange({
+                          ...config,
+                          subagentGuidance: event.currentTarget.value,
+                        })
+                      }
+                    />
+                    <div className="subagent-guidance-meta">
+                      <small>保存后需重启 Codex 生效</small>
+                      <small>{subagentGuidanceBytes.toLocaleString()} / 32,768 字节</small>
+                    </div>
                   </div>
                   <small>
                     {subagentModelOptions.length === 0

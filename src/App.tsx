@@ -95,6 +95,7 @@ export function App({
   );
   const [fastContextToolsStatus, setFastContextToolsStatus] =
     useState<FastContextToolsStatus>(UNKNOWN_FAST_CONTEXT_TOOLS_STATUS);
+  const [defaultSubagentGuidance, setDefaultSubagentGuidance] = useState("");
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [portalContainer, setPortalContainer] = useState<HTMLElement | null>(
@@ -217,8 +218,12 @@ export function App({
         startupError?: string;
         ccSwitch?: CcSwitchStatus;
         fastContextToolsStatus?: FastContextToolsStatus;
+        defaultSubagentGuidance?: string;
       }>("load_codey_config");
       setPersistedConfig(result.config);
+      setDefaultSubagentGuidance(
+        result.defaultSubagentGuidance ?? result.config.subagentGuidance,
+      );
       setCcSwitchStatus(result.ccSwitch ?? null);
       setFastContextToolsStatus(
         result.fastContextToolsStatus ?? UNKNOWN_FAST_CONTEXT_TOOLS_STATUS,
@@ -888,6 +893,7 @@ export function App({
               tooltipContainer={portalContainer}
               isBusy={isBusy}
               subagentModelOptions={subagentModelOptions}
+              defaultSubagentGuidance={defaultSubagentGuidance}
               onConfigChange={handleConfigChange}
               onSubagentOptimizationChange={handleSubagentOptimizationChange}
             />

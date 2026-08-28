@@ -52,6 +52,8 @@
   let watcherWakeTimer = 0;
   let deletePopoverCleanup = null;
   let codexSignalDispatcherPromise = null;
+  let activeWorkRefreshInFlight = false;
+  let lastActiveWorkRefreshAt = 0;
   let sidebarActionTooltipTimer = 0;
   let sidebarActionTooltipAnchor = null;
   let threadUpdatedAtFetchTimer = 0;
@@ -68,7 +70,9 @@
   const threadUpdatedAtRequestedAt = new Map();
   const pendingThreadUpdatedAtRefs = new Map();
   const threadUpdatedAtRows = new Set();
-  const deletedSidebarSessionIds = new Map();
+  // A permanently deleted thread ID stays hidden for this renderer lifetime.
+  // Only an explicit Codey import can make the same ID valid again.
+  const deletedSidebarSessionIds = new Set();
   const pendingSidebarSessionDeleteIds = new Set();
   const hardDeletedMessageKeys = new Set();
   const messageSelectButtons = typeof WeakMap === "function" ? new WeakMap() : null;
@@ -100,9 +104,9 @@
   const sidebarProjectListSelector = "[data-app-action-sidebar-project-list-id]";
   const sidebarProjectShowAllAttribute = "data-app-action-sidebar-project-show-all";
   const taskListSectionHeadings = new Set(["task", "tasks", "recent", "recents", "任务", "最近"]);
-  const deletedSidebarSessionTtlMs = 10 * 60 * 1000;
   const threadRunningLossGraceMs = 2_000;
   const threadTimestampRefreshIntervalMs = 60_000;
+  const activeWorkRefreshIntervalMs = 3_000;
   const threadTimestampListPageSize = 100;
   const maxThreadTimestampListPages = 5;
   const threadTimestampReadBatchSize = 32;
@@ -127,11 +131,6 @@
     while (set.size > limit) {
       set.delete(set.values().next().value);
     }
-  };
-  const pruneExpiredDeletedSidebarSessions = (now = Date.now()) => {
-    deletedSidebarSessionIds.forEach((expiresAt, sessionId) => {
-      if (expiresAt <= now) deletedSidebarSessionIds.delete(sessionId);
-    });
   };
   const queryWithin = (root, selector) => {
     const matches = [];
@@ -755,10 +754,10 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return "";
     pendingSidebarSessionDeleteIds.delete(normalizedSessionId);
-    rememberBoundedMapValue(
+    rememberBoundedSetValue(
       deletedSidebarSessionIds,
       normalizedSessionId,
-      Date.now() + deletedSidebarSessionTtlMs,
+      maxSessionCacheEntries,
     );
     sidebarTitleCache.delete(normalizedSessionId);
     [...threadUpdatedAtCache.keys()].forEach((key) => {
@@ -785,13 +784,7 @@
 
   const isDeletedSidebarSession = (sessionId) => {
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
-    const expiresAt = deletedSidebarSessionIds.get(normalizedSessionId);
-    if (!expiresAt) return false;
-    if (expiresAt <= Date.now()) {
-      deletedSidebarSessionIds.delete(normalizedSessionId);
-      return false;
-    }
-    return true;
+    return deletedSidebarSessionIds.has(normalizedSessionId);
   };
 
   const isDeletedSidebarThread = (row) => {
@@ -1783,6 +1776,28 @@
     }
   };
 
+  const refreshRecentLocalSessionsForActiveWork = () => {
+    if (document.visibilityState === "hidden") return false;
+    if (!threadRunningStateByCacheKey.size && !isTaskRunning()) return false;
+    const now = Date.now();
+    if (
+      activeWorkRefreshInFlight
+      || now - lastActiveWorkRefreshAt < activeWorkRefreshIntervalMs
+    ) return false;
+    lastActiveWorkRefreshAt = now;
+    activeWorkRefreshInFlight = true;
+    void refreshRecentLocalSessions().finally(() => {
+      activeWorkRefreshInFlight = false;
+    });
+    return true;
+  };
+
+  const handleSubagentStateChanged = (event) => {
+    const hostId = String(event?.detail?.hostId || "local").trim() || "local";
+    if (hostId !== "local") return Promise.resolve(false);
+    return refreshRecentLocalSessions();
+  };
+
   const unsubscribeNativeSidebarSession = async (sessionId) => {
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return false;
@@ -2507,7 +2522,6 @@
   };
 
   const scan = (root = document, syncTitles = true) => {
-    pruneExpiredDeletedSidebarSessions();
     if (shouldIgnoreDeletedSidebarSessionRoot(root)) return;
     // Streaming output makes conversation turns by far the most frequent scan
     // root. Sidebar controls can never live inside a turn, so running their
@@ -2544,6 +2558,7 @@
   window.__codeyUpdateThreadRunningPriority = updateThreadRunningPriority;
   window.__codeyRecoverHiddenRunningThreads = recoverHiddenRunningThreads;
   window.__codeyRefreshRecentLocalSessions = refreshRecentLocalSessions;
+  window.__codeyNotifySubagentStateChanged = handleSubagentStateChanged;
   window.__codeyExportSession = exportSession;
   window.__codeyImportSessionFile = importSessionFile;
   window.__codeyInstallSessionDeleteButtons = installSessionDeleteButtons;
@@ -2750,6 +2765,7 @@
     if (now - lastForcedThreadTimeRefresh < forcedThreadTimeRefreshIntervalMs) return;
     lastForcedThreadTimeRefresh = now;
     refreshThreadUpdatedTimes(true);
+    refreshRecentLocalSessionsForActiveWork();
   };
   if (typeof document.addEventListener === "function") {
     document.addEventListener("visibilitychange", wakeSessionWatcher);
@@ -2760,6 +2776,7 @@
     document.addEventListener("keydown", wakeSessionWatcherFromKey, true);
   }
   if (typeof window.addEventListener === "function") {
+    window.addEventListener("codey-subagent-state-changed", handleSubagentStateChanged);
     window.addEventListener("focus", wakeSessionWatcher);
     window.addEventListener("focus", refreshThreadUpdatedTimesOnReturn);
     window.addEventListener("pageshow", wakeSessionWatcher);
@@ -2770,5 +2787,8 @@
       if (document.visibilityState === "hidden") return;
       refreshThreadUpdatedTimes(false);
     }, threadTimestampRefreshIntervalMs);
+    window.setInterval(() => {
+      refreshRecentLocalSessionsForActiveWork();
+    }, activeWorkRefreshIntervalMs);
   }
 })();

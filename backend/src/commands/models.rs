@@ -1247,7 +1247,7 @@ mod tests {
             home.path(),
         );
 
-        assert!(synced.subagent_optimization);
+        assert!(!synced.subagent_optimization);
         assert_eq!(synced.subagent_model, "gpt-5.6-sol");
         assert_eq!(synced.subagent_reasoning_effort, "high");
     }

@@ -42,7 +42,9 @@ opt-level = 3
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+# rustc 1.97 on Windows can crash in the LTO backend (STATUS_ACCESS_VIOLATION).
+# Keep release optimization enabled while using a stable code-generation path.
+lto = false
+codegen-units = 16
 panic = "abort"
 strip = "symbols"

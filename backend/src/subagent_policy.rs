@@ -34,14 +34,28 @@ pub(crate) fn reconcile_with_model_state(
         sync_legacy_default(config);
         return;
     };
+
+    // Codex publishes V1 and V2 native subagent protocols. Both receive the
+    // spawned task; only models explicitly marked otherwise are excluded.
+    if config.subagent_optimization && state.first_available_subagent_model().is_none() {
+        config.subagent_optimization = false;
+    }
     for selection in config.subagent_roles.values_mut() {
         let requested = selection.model.trim();
-        let Some(model) = state
-            .available_model(requested)
-            .or_else(|| state.available_model(&state.default_model))
-            .or_else(|| state.available_model(DEFAULT_SUBAGENT_MODEL))
-            .or_else(|| state.first_available_model())
-        else {
+        let model = if config.subagent_optimization {
+            state
+                .available_subagent_model(requested)
+                .or_else(|| state.available_subagent_model(DEFAULT_SUBAGENT_MODEL))
+                .or_else(|| state.available_subagent_model(&state.default_model))
+                .or_else(|| state.first_available_subagent_model())
+        } else {
+            state
+                .available_model(requested)
+                .or_else(|| state.available_model(&state.default_model))
+                .or_else(|| state.available_model(DEFAULT_SUBAGENT_MODEL))
+                .or_else(|| state.first_available_model())
+        };
+        let Some(model) = model else {
             continue;
         };
         let model = model.to_string();
@@ -148,6 +162,7 @@ mod tests {
                     slug: slug.to_string(),
                     display_name: slug.to_string(),
                     supported: true,
+                    supports_subagent: true,
                     supported_reasoning_efforts: vec!["low".into(), "high".into()],
                     default_reasoning_effort: "low".into(),
                 })
@@ -197,10 +212,10 @@ mod tests {
                 optimization_enabled: true,
             },
             Case {
-                upstream_models: &["gpt-5.4"],
-                saved_effort: "ultra",
-                expected_model: "gpt-5.4",
-                expected_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                upstream_models: &["gpt-5.6-luna"],
+                saved_effort: "max",
+                expected_model: "gpt-5.6-luna",
+                expected_effort: "max",
                 optimization_enabled: true,
             },
             Case {
@@ -208,7 +223,7 @@ mod tests {
                 saved_effort: "high",
                 expected_model: "provider-old-model",
                 expected_effort: "high",
-                optimization_enabled: true,
+                optimization_enabled: false,
             },
         ];
 
@@ -237,20 +252,30 @@ mod tests {
     }
 
     #[test]
-    fn model_state_falls_back_from_luna_to_terra() {
+    fn model_state_keeps_luna_when_its_native_subagent_protocol_is_available() {
         let mut config = route_config("route-a");
         config.subagent_model = "gpt-5.6-luna".into();
         config.subagent_reasoning_effort = "high".into();
+        reconcile_with_model_state(&mut config, Some(&model_state()));
+
+        assert!(config.subagent_optimization);
+        assert_eq!(config.subagent_model, "gpt-5.6-luna");
+        assert_eq!(config.subagent_reasoning_effort, "high");
+    }
+
+    #[test]
+    fn no_declared_subagent_model_disables_the_enhancement() {
+        let mut config = route_config("route-a");
+        config.subagent_model = "gpt-5.6-luna".into();
         let mut state = model_state();
-        state
-            .official_models
-            .retain(|model| model.slug == DEFAULT_SUBAGENT_MODEL);
+        for model in &mut state.official_models {
+            model.supports_subagent = false;
+        }
 
         reconcile_with_model_state(&mut config, Some(&state));
 
-        assert!(config.subagent_optimization);
-        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
-        assert_eq!(config.subagent_reasoning_effort, "high");
+        assert!(!config.subagent_optimization);
+        assert_eq!(config.subagent_model, "gpt-5.6-luna");
     }
 
     #[test]
@@ -280,7 +305,7 @@ mod tests {
 
         reconcile_for_current_provider(&mut config, home.path(), false);
 
-        assert!(config.subagent_optimization);
+        assert!(!config.subagent_optimization);
         assert_eq!(config.subagent_model, "provider-custom-model");
         assert_eq!(config.subagent_reasoning_effort, "high");
     }
@@ -326,7 +351,7 @@ mod tests {
 
         reconcile_for_current_provider(&mut unavailable, unavailable_home.path(), false);
 
-        assert!(unavailable.subagent_optimization);
+        assert!(!unavailable.subagent_optimization);
         assert_eq!(unavailable.subagent_model, DEFAULT_SUBAGENT_MODEL);
         assert_eq!(unavailable.subagent_reasoning_effort, "high");
     }

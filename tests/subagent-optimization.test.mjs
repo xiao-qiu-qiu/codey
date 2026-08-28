@@ -57,15 +57,58 @@ test("subagent optimization exposes per-task model and reasoning controls", asyn
   );
   assert.match(
     modelHookSource,
-    /modelState\.officialModels\s*\.filter\(\(model\) => model\.supported\)/,
+    /model\.supported\s*&&\s*model\.supportsSubagent/,
   );
-  assert.match(modelHookSource, /\.\.\.modelState\.thirdPartyModels\s*\.map/);
+  assert.match(uiSource, /label:\s*option\.label/);
+  assert.doesNotMatch(modelHookSource, /roleSchedulingSupported|supportsSubagentV2/);
+  assert.doesNotMatch(uiSource, /原生 V1，角色调度不可用/);
+  assert.doesNotMatch(modelHookSource, /\.\.\.modelState\.thirdPartyModels\s*\.map/);
   assert.doesNotMatch(modelHookSource, /subagentModelIds|subagentModelKeys/);
   assert.doesNotMatch(
     uiSource,
     /check-subagent-model|当前线路没有 Codex 子代理工具可用的模型/,
   );
   assert.doesNotMatch(uiSource, /仅接受 Sol \/ Terra/);
+  for (const [role, name, model, effort] of [
+    ["codey_luna", "Luna", "gpt-5.6-luna", "max"],
+    ["codey_terra", "Terra", "gpt-5.6-terra", "max"],
+    ["codey_sol", "Sol", "gpt-5.6-sol", "xhigh"],
+  ]) {
+    assert.match(uiSource, new RegExp(`id: "${role}"`));
+    assert.match(uiSource, new RegExp(`name: "${name}"`));
+    assert.match(uiSource, new RegExp(`model: "${model.replaceAll(".", "\\.")}"`));
+    assert.match(uiSource, new RegExp(`reasoningEffort: "${effort}"`));
+  }
+  assert.match(uiSource, /SUBAGENT_FIXED_ROLE_TYPES\.map/);
+  assert.match(uiSource, /<Badge variant="secondary">固定<\/Badge>/);
+  assert.doesNotMatch(uiSource, /subagentRoles:\s*\{[^}]*codey_luna/s);
+});
+
+test("subagent dispatch guidance is editable in settings and applied at startup", async () => {
+  const [typesSource, appSource, featureSource, stylesSource, commandSource, configSource] =
+    await Promise.all([
+      readFile(new URL("src/App.types.ts", root), "utf8"),
+      readFile(new URL("src/App.tsx", root), "utf8"),
+      readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
+      readFile(new URL("src/styles.features.css", root), "utf8"),
+      readFile(new URL("backend/src/commands.rs", root), "utf8"),
+      readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
+    ]);
+
+  assert.match(typesSource, /subagentGuidance: string/);
+  assert.match(appSource, /defaultSubagentGuidance=\{defaultSubagentGuidance\}/);
+  assert.match(featureSource, /id="subagent-guidance"/);
+  assert.match(featureSource, /value=\{config\.subagentGuidance\}/);
+  assert.match(featureSource, /subagentGuidance: event\.currentTarget\.value/);
+  assert.match(featureSource, /subagentGuidance: defaultSubagentGuidance/);
+  assert.match(featureSource, /maxLength=\{32768\}/);
+  assert.match(featureSource, /恢复默认/);
+  assert.match(stylesSource, /\.subagent-guidance-textarea/);
+  assert.match(commandSource, /"defaultSubagentGuidance": default_subagent_guidance\(\)/);
+  assert.match(commandSource, /validate_subagent_guidance/);
+  assert.match(configSource, /subagent_guidance: options\.subagent_guidance/);
+  assert.match(configSource, /append_subagent_guidance\(\s*existing_agents_md,\s*subagent_guidance/);
+  assert.match(configSource, /write_managed_constraint_file\(&root_path, subagent_guidance\)/);
 });
 
 test("leaf subagent models do not inherit coordinator capability markers", async () => {
@@ -84,6 +127,24 @@ test("leaf subagent models do not inherit coordinator capability markers", async
     catalogSource,
     /generated_catalog_keeps_leaf_models_without_v2_coordinator_markers/,
   );
+});
+
+test("subagent guidance puts the complete assignment in the spawn request", async () => {
+  const guidanceSource = await readFile(
+    new URL("backend/src/codex_config_guidance.rs", root),
+    "utf8",
+  );
+
+  assert.match(guidanceSource, /初始任务字段/);
+  assert.match(guidanceSource, /`message` 或 `task`/);
+  assert.match(guidanceSource, /`task_name`、角色名、模型名和 `fork_turns` 都只是元数据/);
+  assert.match(guidanceSource, /角色参数只有在当前工具 schema 明确声明时才传入/);
+  assert.match(guidanceSource, /These agent tools are not in the/);
+  assert.match(guidanceSource, /`functions` namespace/);
+  assert.match(guidanceSource, /`functions\.spawn_agent`/);
+  assert.match(guidanceSource, /The canonical dispatch/);
+  assert.match(guidanceSource, /Correcting agent tool usage/);
+  assert.match(guidanceSource, /`agents\.followup_task` 补发同一份完整、自包含的任务正文/);
 });
 
 test("per-task subagent files are composed at startup and hot-refreshed after save", async () => {
@@ -109,6 +170,8 @@ test("per-task subagent files are composed at startup and hot-refreshed after sa
   assert.match(configSource, /pub fn refresh_runtime_subagent_roles/);
   assert.match(configSource, /verify_runtime_agent_files/);
   assert.match(configSource, /restore_runtime_agent_files_and_lease/);
+  assert.match(configSource, /SUBAGENT_RUNTIME_ROLE_IDS/);
+  assert.match(configSource, /fixed_subagent_role_config/);
   assert.match(launcherSource, /subagent_roles: Some\(&subagent_roles\)/);
   assert.match(launcherSource, /supports_subagent_config_hot_reload/);
   assert.doesNotMatch(rendererSource, /__codeyApplySubagentDefaults/);
@@ -116,7 +179,7 @@ test("per-task subagent files are composed at startup and hot-refreshed after sa
   assert.doesNotMatch(vendorRendererSource, /patchAppServerSubagentRequestParams/);
 });
 
-test("subagent optimization installs root waiting and nested-spawn runtime gates", async () => {
+test("subagent optimization keeps native agents and removes legacy gate hooks", async () => {
   const [gateSource, configSource, mainSource] = await Promise.all([
     readFile(new URL("backend/src/subagent_gate.rs", root), "utf8"),
     readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
@@ -124,20 +187,12 @@ test("subagent optimization installs root waiting and nested-spawn runtime gates
   ]);
 
   assert.match(mainSource, /run_subagent_gate_hook_if_requested/);
-  assert.match(configSource, /enable_subagent_gate_hooks\(doc, config_path\)/);
-  assert.match(configSource, /toml_event: "PreToolUse"/);
-  assert.match(configSource, /toml_event: "PostToolUse"/);
-  assert.match(
-    configSource,
-    /matcher: Some\(crate::subagent_gate::WAIT_AGENT_HOOK_MATCHER\)/,
-  );
-  assert.match(
-    gateSource,
-    /WAIT_AGENT_HOOK_MATCHER: &str = "\.\*wait_agent\$\|\^functions\(__\|\[\.\/:_\]\)wait\$"/,
-  );
-  assert.match(configSource, /toml_event: "SubagentStart"/);
-  assert.match(configSource, /toml_event: "SubagentStop"/);
-  assert.match(configSource, /toml_event: "Stop"/);
+  assert.match(configSource, /remove_subagent_gate_hooks\(doc, config_path\)/);
+  assert.doesNotMatch(configSource, /enable_subagent_gate_hooks\(/);
+  assert.match(configSource, /json_contains_subagent_gate_hooks/);
+  assert.match(configSource, /FASTCTX_ROUTE_HOOKS/);
+  assert.match(gateSource, /cleanup_stale_state/);
+  assert.match(gateSource, /STATE_DIRECTORY/);
   assert.match(configSource, /trusted_hash/);
   assert.match(gateSource, /nonempty\(input\.agent_id\.as_deref\(\)\)\.is_some\(\)/);
   assert.match(gateSource, /permissionDecision": "deny"/);

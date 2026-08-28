@@ -640,6 +640,25 @@ test("refreshes Codex recent sessions after importing instead of reloading", asy
   assert.equal(button.disabled, false);
 });
 
+test("refreshes the native sidebar when a subagent state change is reported", async () => {
+  const signalCalls = [];
+  const runtime = loadInjection({
+    initialRunning: false,
+    codexSignalDispatcher: async (name, payload) => {
+      signalCalls.push({ name, payload });
+    },
+  });
+
+  await runtime.window.__codeyNotifySubagentStateChanged({
+    detail: { hostId: "local", agentId: "agent-1", status: "completed" },
+  });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(signalCalls)), [{
+    name: "refresh-recent-conversations-for-host",
+    payload: { hostId: "local" },
+  }]);
+});
+
 test("imports from the tasks header using the project stored in the file", async () => {
   const runtime = loadInjection({
     bridgeHandler: async (path, payload) => {

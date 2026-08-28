@@ -56,7 +56,12 @@ fn default_agent_source_exactly_migrates_to_read_only() {
     )
     .unwrap();
 
-    let roles = crate::config::default_subagent_roles();
+    let configured = crate::config::default_subagent_roles();
+    let roles = runtime_subagent_roles(
+        Some(&configured),
+        DEFAULT_SUBAGENT_MODEL,
+        DEFAULT_SUBAGENT_REASONING_EFFORT,
+    );
     prepare_runtime_agent_files(&constraints_dir, &roles, None).unwrap();
 
     assert_eq!(
@@ -1365,7 +1370,6 @@ command = "echo preserve-user-hook"
         Some(120_000)
     );
     assert_eq!(multi_agent["custom_setting"].as_str(), Some("preserved"));
-    assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
     assert_eq!(
         multi_agent["subagent_developer_instructions"].as_str(),
         Some("Preserve my subagent guidance.")
@@ -1377,7 +1381,7 @@ command = "echo preserve-user-hook"
     let pre_tool_use = document["hooks"]["PreToolUse"]
         .as_array_of_tables()
         .unwrap();
-    assert_eq!(pre_tool_use.len(), 2);
+    assert_eq!(pre_tool_use.len(), 1);
     let preserved_handler = pre_tool_use.get(0).unwrap()["hooks"]
         .as_array_of_tables()
         .unwrap()
@@ -1387,48 +1391,83 @@ command = "echo preserve-user-hook"
         preserved_handler["command"].as_str(),
         Some("echo preserve-user-hook")
     );
-    let gate_handler = pre_tool_use.get(1).unwrap()["hooks"]
-        .as_array_of_tables()
-        .unwrap()
-        .get(0)
-        .unwrap();
-    assert_eq!(gate_handler["type"].as_str(), Some("command"));
-    assert!(
-        gate_handler["command"]
-            .as_str()
-            .unwrap()
-            .contains(crate::subagent_gate::HOOK_ARGUMENT)
-    );
-    let windows_command = gate_handler["commandWindows"].as_str().unwrap();
-    assert!(windows_command.starts_with("& '"), "{windows_command}");
-    assert!(windows_command.contains(crate::subagent_gate::HOOK_ARGUMENT));
-    assert_eq!(
-        gate_handler["timeout"].as_integer(),
-        Some(crate::subagent_gate::HOOK_TIMEOUT_SECONDS as i64)
-    );
-    let post_tool_use = document["hooks"]["PostToolUse"]
-        .as_array_of_tables()
-        .unwrap();
-    assert_eq!(post_tool_use.len(), 1);
-    assert_eq!(
-        post_tool_use.get(0).unwrap()["matcher"].as_str(),
-        Some(crate::subagent_gate::WAIT_AGENT_HOOK_MATCHER)
-    );
+    assert!(document["hooks"].get("PostToolUse").is_none());
     for event in ["SubagentStart", "SubagentStop", "Stop", "SessionEnd"] {
-        assert_eq!(
-            document["hooks"][event].as_array_of_tables().unwrap().len(),
-            1,
-            "{event}"
-        );
+        assert!(document["hooks"].get(event).is_none(), "{event}");
     }
-    let hook_state = document["hooks"]["state"].as_table().unwrap();
-    assert_eq!(hook_state.len(), 6);
-    let pre_tool_key = "/tmp/codey-codex/config.toml:pre_tool_use:1:0";
-    assert!(
-        hook_state[pre_tool_key]["trusted_hash"]
-            .as_str()
-            .is_some_and(|hash| hash.starts_with("sha256:"))
+    assert!(document["hooks"].get("state").is_none());
+}
+
+#[test]
+fn subagent_optimization_removes_legacy_gate_hooks_but_keeps_user_hooks() {
+    let existing = format!(
+        r#"
+[[hooks.PreToolUse]]
+matcher = "Bash"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "echo preserve-user-hook"
+
+[[hooks.PreToolUse]]
+matcher = "*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "'/tmp/codey' {hook_argument}"
+commandWindows = "C:\\Codey\\codey.exe {hook_argument}"
+timeout = 5
+
+[[hooks.SubagentStart]]
+
+[[hooks.SubagentStart.hooks]]
+type = "command"
+command = "'/tmp/codey' {hook_argument}"
+commandWindows = "C:\\Codey\\codey.exe {hook_argument}"
+timeout = 5
+
+[hooks.state."/tmp/codey-codex/config.toml:pre_tool_use:1:0"]
+trusted_hash = "sha256:pre"
+
+[hooks.state."/tmp/codey-codex/config.toml:subagent_start:0:0"]
+trusted_hash = "sha256:start"
+"#,
+        hook_argument = crate::subagent_gate::HOOK_ARGUMENT,
     );
+    let result = patch_config_with_fastctx_mode_and_proxy(
+        &existing,
+        &official_profile(),
+        GLOBAL_PROVIDER_ID,
+        ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
+            model_catalog_path: relative_model_catalog_path(),
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: true,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            preserve_provider_route: false,
+            protocol_proxy_base_url: None,
+        },
+    )
+    .unwrap();
+    let document = result.parse::<DocumentMut>().unwrap();
+    let pre_tool = document["hooks"]["PreToolUse"]
+        .as_array_of_tables()
+        .unwrap();
+    assert_eq!(pre_tool.len(), 1);
+    assert_eq!(
+        pre_tool.get(0).unwrap()["hooks"]
+            .as_array_of_tables()
+            .unwrap()
+            .get(0)
+            .unwrap()["command"]
+            .as_str(),
+        Some("echo preserve-user-hook")
+    );
+    assert!(document["hooks"].get("SubagentStart").is_none());
+    assert!(document["hooks"].get("state").is_none());
+    assert!(!result.contains(crate::subagent_gate::HOOK_ARGUMENT));
 }
 
 #[test]
@@ -1562,6 +1601,7 @@ fn subagent_lease_applies_and_restores_all_owned_files() {
         crate::config::SUBAGENT_ROLE_QUICK_SCAN.to_string(),
         SubagentRoleConfig::new("provider-fast", "medium"),
     );
+    let custom_guidance = "## 自定义子代理策略\n\n并行处理互不依赖的任务。";
 
     apply_runtime_provider_config_at_mode(
         &home,
@@ -1569,6 +1609,7 @@ fn subagent_lease_applies_and_restores_all_owned_files() {
         GLOBAL_PROVIDER_ID,
         ProviderApplyOptions {
             subagent_optimization: true,
+            subagent_guidance: custom_guidance,
             subagent_roles: Some(&role_selections),
             ..ProviderApplyOptions::for_test(&marker, &backup_root)
         },
@@ -1605,8 +1646,8 @@ fn subagent_lease_applies_and_restores_all_owned_files() {
         document["features"]["multi_agent_v2"]["root_agent_usage_hint_text"].as_str(),
         Some(ROOT_AGENT_COLLABORATION_USAGE_HINT)
     );
-    assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
-    for role in SUBAGENT_ROLE_IDS {
+    assert!(document["features"].get("hooks").is_none());
+    for role in SUBAGENT_RUNTIME_ROLE_IDS {
         assert!(
             document["agents"][role]["config_file"]
                 .as_str()
@@ -1633,19 +1674,12 @@ fn subagent_lease_applies_and_restores_all_owned_files() {
         quick_runtime["model_reasoning_effort"].as_str(),
         Some("medium")
     );
-    assert!(
-        temporary_config.contains(crate::subagent_gate::HOOK_ARGUMENT),
-        "runtime config should install the subagent gate hooks"
-    );
-    assert_eq!(
-        document["hooks"]["state"].as_table().unwrap().len(),
-        SUBAGENT_GATE_HOOKS.len()
-    );
-    assert!(
-        fs::read_to_string(home.join("AGENTS.md"))
-            .unwrap()
-            .contains(SUBAGENT_GUIDANCE)
-    );
+    assert!(!temporary_config.contains(crate::subagent_gate::HOOK_ARGUMENT));
+    assert!(document.get("hooks").is_none());
+    let applied_agents_md = fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(applied_agents_md.contains(SUBAGENT_GUIDANCE_BLOCK_START));
+    assert!(applied_agents_md.contains(custom_guidance));
+    assert!(!applied_agents_md.contains(SUBAGENT_GUIDANCE));
     assert_eq!(
         fs::read_to_string(home.join("agents/default.toml")).unwrap(),
         DEFAULT_AGENT_CONFIG
@@ -1916,7 +1950,27 @@ fn runtime_subagent_roles_refresh_in_place_for_the_next_spawn() {
     let refreshed =
         serde_json::from_str::<RuntimeConfigLease>(&fs::read_to_string(&marker).unwrap()).unwrap();
     assert!(refreshed.isolated_runtime_constraints);
-    assert_eq!(refreshed.subagent_roles, config.subagent_roles);
+    let expected_runtime_roles = runtime_subagent_roles(
+        Some(&config.subagent_roles),
+        &config.subagent_model,
+        &config.subagent_reasoning_effort,
+    );
+    assert_eq!(refreshed.subagent_roles, expected_runtime_roles);
+    for (role, expected) in [
+        ("codey_luna", ("gpt-5.6-luna", "max")),
+        ("codey_terra", ("gpt-5.6-terra", "max")),
+        ("codey_sol", ("gpt-5.6-sol", "xhigh")),
+    ] {
+        let document = fs::read_to_string(runtime_agent_path(&constraints_dir, role))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(document["model"].as_str(), Some(expected.0));
+        assert_eq!(
+            document["model_reasoning_effort"].as_str(),
+            Some(expected.1)
+        );
+    }
     assert_eq!(refreshed.subagent_model, config.subagent_model);
     assert_eq!(
         refreshed.subagent_reasoning_effort,
@@ -1924,7 +1978,7 @@ fn runtime_subagent_roles_refresh_in_place_for_the_next_spawn() {
     );
 
     let original_lease = fs::read(&marker).unwrap();
-    let original_runtime_files = SUBAGENT_ROLE_IDS
+    let original_runtime_files = SUBAGENT_RUNTIME_ROLE_IDS
         .into_iter()
         .map(|role| {
             let path = runtime_agent_path(&constraints_dir, role);
@@ -2324,6 +2378,7 @@ command = "cc-switch-tool"
             default_model: None,
             fastctx_command: Some(Path::new("/opt/codey")),
             subagent_optimization: false,
+            subagent_guidance: SUBAGENT_GUIDANCE,
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
@@ -2401,6 +2456,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             default_model: None,
             fastctx_command: None,
             subagent_optimization: false,
+            subagent_guidance: SUBAGENT_GUIDANCE,
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             subagent_roles: None,
@@ -3496,6 +3552,7 @@ wire_api = "responses"
         "relay",
         Some(Path::new("/opt/codey/codey-fastctx")),
         false,
+        SUBAGENT_GUIDANCE,
         DEFAULT_SUBAGENT_MODEL,
         DEFAULT_SUBAGENT_REASONING_EFFORT,
         None,
@@ -3602,6 +3659,7 @@ wire_api = "responses"
     )
     .unwrap();
     let profile = direct_profile(RelayProtocol::Responses);
+    let custom_guidance = "## GUI 子代理策略\n\n只派发边界清晰的任务。";
 
     let applied = apply_isolated_cc_switch_runtime_config(
         &home,
@@ -3609,6 +3667,7 @@ wire_api = "responses"
         "relay",
         Some(Path::new("/opt/codey/codey-fastctx")),
         true,
+        custom_guidance,
         "gpt-5.6-mini",
         "high",
         None,
@@ -3665,7 +3724,7 @@ wire_api = "responses"
             .iter()
             .any(|entry| entry.starts_with("agents.default.config_file="))
     );
-    for role in SUBAGENT_ROLE_IDS {
+    for role in SUBAGENT_RUNTIME_ROLE_IDS {
         for field in ["config_file", "description"] {
             let key = format!("agents.{role}.{field}");
             assert!(
@@ -3677,27 +3736,7 @@ wire_api = "responses"
             );
         }
     }
-    let pre_tool_state_key = format!("{}:pre_tool_use:1:0", home.join("hooks.json").display());
-    let pre_tool_prefix = format!(
-        "hooks.state.{}.trusted_hash=",
-        toml_string_literal(&pre_tool_state_key)
-    );
-    let hook_commands = crate::subagent_gate::hook_commands().unwrap();
-    let selected_command = if cfg!(windows) {
-        hook_commands.command_windows.as_str()
-    } else {
-        hook_commands.command.as_str()
-    };
-    let expected_pre_tool_hash = crate::subagent_gate::hook_trust_hash(
-        "pre_tool_use",
-        Some("*"),
-        selected_command,
-        crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
-    );
-    assert!(applied.runtime_config_overrides.iter().any(|entry| {
-        entry.starts_with(&pre_tool_prefix) && entry.contains(&expected_pre_tool_hash)
-    }));
-    let fastctx_state_key = format!("{}:pre_tool_use:2:0", home.join("hooks.json").display());
+    let fastctx_state_key = format!("{}:pre_tool_use:1:0", home.join("hooks.json").display());
     let fastctx_state_prefix = format!(
         "hooks.state.{}.trusted_hash=",
         toml_string_literal(&fastctx_state_key)
@@ -3767,7 +3806,7 @@ wire_api = "responses"
             .iter()
             .filter(|entry| entry.starts_with("hooks.state."))
             .count(),
-        SUBAGENT_GATE_HOOKS.len() + FASTCTX_ROUTE_HOOKS.len()
+        FASTCTX_ROUTE_HOOKS.len()
     );
     assert_eq!(
         applied
@@ -3776,7 +3815,7 @@ wire_api = "responses"
             .filter(|entry| entry.starts_with(CODEY_WSL_ONLY_OVERRIDE_PREFIX))
             .count(),
         if cfg!(windows) {
-            SUBAGENT_GATE_HOOKS.len() + FASTCTX_ROUTE_HOOKS.len()
+            FASTCTX_ROUTE_HOOKS.len()
         } else {
             0
         }
@@ -3794,25 +3833,22 @@ wire_api = "responses"
 
     let hooks: serde_json::Value =
         serde_json::from_slice(&fs::read(home.join("hooks.json")).unwrap()).unwrap();
-    assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
+    assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
     assert_eq!(
         hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str(),
         Some("/usr/bin/true")
     );
     assert_eq!(
-        hooks["hooks"]["PreToolUse"][2]["matcher"].as_str(),
+        hooks["hooks"]["PreToolUse"][1]["matcher"].as_str(),
         Some(crate::fastctx_route_gate::HOOK_MATCHER)
     );
     assert!(
-        hooks["hooks"]["PreToolUse"][2]["hooks"][0]["command"]
+        hooks["hooks"]["PreToolUse"][1]["hooks"][0]["command"]
             .as_str()
             .unwrap()
             .contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
     );
-    for (group_index, hook_argument) in [
-        (1, crate::subagent_gate::HOOK_ARGUMENT),
-        (2, crate::fastctx_route_gate::HOOK_ARGUMENT),
-    ] {
+    for (group_index, hook_argument) in [(1, crate::fastctx_route_gate::HOOK_ARGUMENT)] {
         let windows_command =
             hooks["hooks"]["PreToolUse"][group_index]["hooks"][0]["commandWindows"]
                 .as_str()
@@ -3820,27 +3856,14 @@ wire_api = "responses"
         assert!(windows_command.starts_with("& '"), "{windows_command}");
         assert!(windows_command.contains(hook_argument));
     }
-    for event in [
-        "PostToolUse",
-        "SubagentStart",
-        "SubagentStop",
-        "Stop",
-        "SessionEnd",
-    ] {
-        assert_eq!(
-            hooks["hooks"][event].as_array().unwrap().len(),
-            1,
-            "{event}"
-        );
+    assert!(hooks["hooks"].get("PostToolUse").is_none());
+    for event in ["SubagentStart", "SubagentStop", "Stop", "SessionEnd"] {
+        assert!(hooks["hooks"].get(event).is_none(), "{event}");
     }
-    assert_eq!(
-        hooks["hooks"]["PostToolUse"][0]["matcher"].as_str(),
-        Some(crate::subagent_gate::WAIT_AGENT_HOOK_MATCHER)
-    );
     let constraints_dir = state_dir.join(CODEY_CONSTRAINTS_DIR);
     assert_eq!(
         fs::read_to_string(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE)).unwrap(),
-        SUBAGENT_GUIDANCE
+        custom_guidance
     );
     assert!(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE).exists());
     assert!(
@@ -3855,7 +3878,7 @@ wire_api = "responses"
             .join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)
             .exists()
     );
-    for role in SUBAGENT_ROLE_IDS {
+    for role in SUBAGENT_RUNTIME_ROLE_IDS {
         let runtime_path = if role == SUBAGENT_ROLE_DEFAULT {
             constraints_dir.join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)
         } else {
@@ -3864,7 +3887,7 @@ wire_api = "responses"
                     .join(CODEY_SUBAGENT_SOURCES_DIR)
                     .join(format!("{role}.toml"))
                     .exists(),
-                "missing editable source for {role}"
+                "missing source for {role}"
             );
             constraints_dir
                 .join(CODEY_RUNTIME_AGENTS_DIR)
@@ -3875,8 +3898,13 @@ wire_api = "responses"
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(runtime["name"].as_str(), Some(role));
-        assert_eq!(runtime["model"].as_str(), Some("gpt-5.6-mini"));
-        assert_eq!(runtime["model_reasoning_effort"].as_str(), Some("high"));
+        let expected = fixed_subagent_role_config(role)
+            .unwrap_or_else(|| SubagentRoleConfig::new("gpt-5.6-mini", "high"));
+        assert_eq!(runtime["model"].as_str(), Some(expected.model.as_str()));
+        assert_eq!(
+            runtime["model_reasoning_effort"].as_str(),
+            Some(expected.reasoning_effort.as_str())
+        );
     }
 
     let switched_config = [
@@ -3915,12 +3943,14 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
     )
     .unwrap();
 
+    let reapplied_guidance = "## 更新后的 GUI 子代理策略\n\n优先并行处理独立任务。";
     let reapplied = apply_isolated_cc_switch_runtime_config(
         &home,
         &profile,
         "relay",
         Some(Path::new("/opt/codey/codey-fastctx")),
         true,
+        reapplied_guidance,
         "gpt-5.6-mini",
         "high",
         None,
@@ -3940,7 +3970,8 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
     let developer_instructions = developer_override["developer_instructions"]
         .as_str()
         .unwrap();
-    assert!(developer_instructions.contains("CUSTOM ROOT CONSTRAINT"));
+    assert!(developer_instructions.contains(reapplied_guidance));
+    assert!(!developer_instructions.contains("CUSTOM ROOT CONSTRAINT"));
     assert!(developer_instructions.contains("CUSTOM FASTCTX CONSTRAINT"));
     assert!(!developer_instructions.contains(SUBAGENT_GUIDANCE));
     assert!(!developer_instructions.contains(CODEY_FASTCTX_GUIDANCE));
@@ -3959,5 +3990,9 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
         fs::read_to_string(constraints_dir.join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)).unwrap();
     assert!(runtime_agent.contains("CUSTOM SUBAGENT CONSTRAINT"));
     assert!(runtime_agent.contains("CUSTOM FASTCTX CONSTRAINT"));
+    assert_eq!(
+        fs::read_to_string(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE)).unwrap(),
+        reapplied_guidance
+    );
     assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
 }

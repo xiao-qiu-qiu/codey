@@ -281,6 +281,8 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     #[cfg(windows)]
     ensure_windows_codex_app_path(state).await?;
     stop_waiting_webhook_watcher(state).await;
+    crate::subagent_gate::cleanup_stale_state()
+        .map_err(|error| format!("清理上一代 Codey 子代理状态失败：{error:#}"))?;
     restore_previous_runtime_state(&codex_home())
         .await
         .map_err(|error| format!("恢复上次 Codey 临时 Codex 配置失败：{error}"))?;
