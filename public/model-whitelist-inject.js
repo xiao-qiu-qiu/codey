@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "39";
+  const patchVersion = "40";
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
   const legacyOfficialRouteProviderIds = new Set([
@@ -1055,8 +1055,51 @@
         flex: 1 1 auto;
         border-top: 1px solid rgba(139, 148, 158, 0.24);
       }
+      /* Native Codex gives the selected model a short flex-basis. Keep the
+         route and model readable instead of allowing an ellipsis to hide the
+         actual selection. */
+      [class*="ModelPickerTriggerModelText"] {
+        display: inline-block !important;
+        max-width: min(52vw, 420px) !important;
+        min-width: max-content !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        white-space: nowrap !important;
+      }
+      [role="menu"].codey-model-route-menu,
+      [role="listbox"].codey-model-route-menu {
+        width: max-content !important;
+        min-width: 360px !important;
+        max-width: min(560px, calc(100vw - 24px)) !important;
+      }
+      .codey-model-route-menu [role="menuitem"],
+      .codey-model-route-menu [role="menuitemradio"],
+      .codey-model-route-menu [role="option"] {
+        white-space: nowrap !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+      }
     `;
     (document.head || document.documentElement || document.body)?.appendChild?.(style);
+  };
+
+  const enhanceNativeModelTrigger = () => {
+    if (!catalog.loaded || disposed || typeof document.querySelectorAll !== "function") return;
+    const triggers = document.querySelectorAll("[class*='ModelPickerTriggerModelText']");
+    for (const trigger of triggers) {
+      const label = cleanText(trigger.textContent);
+      if (!label) continue;
+      trigger.setAttribute?.("title", label);
+      trigger.setAttribute?.("aria-label", label);
+      trigger.style?.setProperty?.("max-width", "min(52vw, 420px)", "important");
+      trigger.style?.setProperty?.("min-width", "max-content", "important");
+      trigger.style?.setProperty?.("overflow", "visible", "important");
+      trigger.style?.setProperty?.("text-overflow", "clip", "important");
+      trigger.style?.setProperty?.("white-space", "nowrap", "important");
+      const button = trigger.closest?.("button");
+      button?.style?.setProperty?.("max-width", "min(56vw, 460px)", "important");
+      button?.style?.setProperty?.("width", "max-content", "important");
+    }
   };
 
   const replaceTextOnce = (element, from, to) => {
@@ -1137,6 +1180,7 @@
   const enhanceGroupedModelMenus = () => {
     if (!catalog.loaded || disposed || typeof document.querySelectorAll !== "function") return;
     ensureGroupedMenuStyles();
+    enhanceNativeModelTrigger();
     const byDisplayName = new Map();
     const addMenuAlias = (alias, entry) => {
       const key = modelMenuAliasKey(alias);
@@ -1168,6 +1212,7 @@
         || byDisplayName.has(modelMenuAliasKey(item.textContent))
       ));
       if (!looksLikeModelMenu) continue;
+      container.classList?.add?.("codey-model-route-menu");
       const itemParents = new Set(existingHeadings.length > 0 ? [container] : []);
       for (const item of items) {
         const itemText = cleanText(item.textContent);
