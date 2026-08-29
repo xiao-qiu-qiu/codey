@@ -662,7 +662,7 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
         );
     }
 
-    OFFICIAL_MODELS
+    let mut entries = OFFICIAL_MODELS
         .iter()
         .enumerate()
         .map(|(priority, (slug, display_name))| {
@@ -683,7 +683,34 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
             }
             Ok(model)
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    // New official model metadata is bundled without prompt-bearing fields.
+    // When an older Codex cache already has a valid runtime template, reuse
+    // that template for the new entries so route-qualified models can still
+    // be registered on the first Codey launch after an upstream model update.
+    // A truly cold start remains unavailable and keeps the existing fallback.
+    if let Some(template) = entries
+        .iter()
+        .find(|model| model_instruction_source(model).is_some())
+        .cloned()
+    {
+        for model in &mut entries {
+            hydrate_runtime_instructions(model, &template);
+        }
+    }
+    Ok(entries)
+}
+
+fn hydrate_runtime_instructions(model: &mut Value, template: &Value) {
+    if model_instruction_source(model).is_some() {
+        return;
+    }
+    if let Some(base_instructions) = template.get("base_instructions") {
+        model["base_instructions"] = base_instructions.clone();
+    } else if let Some(model_messages) = template.get("model_messages") {
+        model["model_messages"] = model_messages.clone();
+    }
 }
 
 fn complete_reasoning_metadata(model: &mut Value, fallbacks: &[&Value]) {
@@ -1414,6 +1441,26 @@ mod tests {
         fs::write(
             home.join("models_cache.json"),
             serde_json::to_vec(&official_cache()).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_cache_with_prompt_free_gpt56(home: &Path) {
+        let mut cache = official_cache();
+        for model in cache["models"].as_array_mut().unwrap() {
+            if !matches!(
+                model["slug"].as_str(),
+                Some("gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna")
+            ) {
+                continue;
+            }
+            let object = model.as_object_mut().unwrap();
+            object.remove("base_instructions");
+            object.remove("model_messages");
+        }
+        fs::write(
+            home.join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
         )
         .unwrap();
     }
@@ -2210,6 +2257,34 @@ mod tests {
         assert!(!is_available(home.path()));
         let state = selection_state(home.path(), true, None, &[], None).unwrap();
         assert_eq!(state.official_models.len(), OFFICIAL_MODELS.len());
+    }
+
+    #[test]
+    fn prompt_free_new_official_models_reuse_an_existing_runtime_template() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache_with_prompt_free_gpt56(home.path());
+
+        refresh_for_provider(home.path(), true, None, &[]).unwrap();
+
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        let gpt_56 = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(
+            gpt_56["base_instructions"],
+            official_cache()["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["slug"] == "gpt-5.5")
+                .unwrap()["base_instructions"]
+        );
+        assert!(is_available(home.path()));
     }
 
     #[test]
