@@ -591,6 +591,78 @@ async fn save_persists_custom_subagent_guidance() {
 }
 
 #[tokio::test]
+async fn save_round_trips_subagent_policy_matrix_for_a_third_party_route() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile = ProviderProfile::new("测试线路");
+    profile.id = "route-a".to_string();
+    profile.base_url = "https://relay.example/v1".to_string();
+    profile.api_key = "sk-test".to_string();
+    profile.normalize();
+    let initial = CodeyConfig {
+        active_profile_id: profile.id.clone(),
+        profiles: vec![profile],
+        selected_models_by_provider: std::collections::BTreeMap::from([(
+            "route-a".to_string(),
+            vec!["gpt-5.6-luna".to_string(), "gpt-5.6-terra".to_string()],
+        )]),
+        upstream_models_by_provider: std::collections::BTreeMap::from([(
+            "route-a".to_string(),
+            vec!["gpt-5.6-luna".to_string(), "gpt-5.6-terra".to_string()],
+        )]),
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(initial.clone()),
+        ..AppState::default()
+    });
+
+    let mut payload = serde_json::to_value(initial).unwrap();
+    payload["subagentOptimization"] = json!(true);
+    payload["subagentGuidance"] = json!("Custom root policy.");
+    payload["subagentRoles"] = json!({
+        "codey_quick_scan": {
+            "enabled": false,
+            "model": "route-a/gpt-5.6-luna",
+            "reasoningEffort": "xhigh"
+        },
+        "codey_worker": {
+            "enabled": true,
+            "model": "route-a/gpt-5.6-terra",
+            "reasoningEffort": "max"
+        },
+        "default": {
+            "enabled": true,
+            "model": "route-a/gpt-5.6-terra",
+            "reasoningEffort": "max"
+        }
+    });
+
+    let result = invoke_api(&state, "save_codey_config", json!({ "config": payload })).await;
+
+    assert_eq!(result["status"], "ok");
+    let saved = state.config.read().await.clone();
+    assert!(saved.subagent_optimization);
+    assert_eq!(saved.subagent_guidance, "Custom root policy.");
+    assert_eq!(
+        saved.subagent_roles[crate::config::SUBAGENT_ROLE_QUICK_SCAN],
+        SubagentRoleConfig {
+            enabled: false,
+            model: "route-a/gpt-5.6-luna".to_string(),
+            reasoning_effort: "xhigh".to_string(),
+        }
+    );
+    assert_eq!(
+        saved.subagent_roles[crate::config::SUBAGENT_ROLE_WORKER],
+        SubagentRoleConfig::new("route-a/gpt-5.6-terra", "max")
+    );
+    assert_eq!(saved.subagent_model, "route-a/gpt-5.6-terra");
+    assert_eq!(saved.subagent_reasoning_effort, "max");
+    assert_eq!(state.store.load().unwrap(), saved);
+}
+
+#[tokio::test]
 async fn legacy_subagent_scalars_update_only_the_default_role() {
     let directory = tempfile::tempdir().unwrap();
     let mut initial = CodeyConfig::default();
