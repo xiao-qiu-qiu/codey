@@ -19,6 +19,11 @@ const UPDATE_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
 const UPDATE_DOWNLOAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_UPDATE_MANIFEST_BYTES: usize = 1024 * 1024;
 
+enum UpdateManifestFetch {
+    Published(UpdateManifest),
+    NotPublished,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct UpdateManifest {
     schema_version: u32,
@@ -122,7 +127,22 @@ async fn update_candidate_with_ttl(
         return Ok(candidate);
     }
 
-    let manifest = fetch_configured_update_manifest(state, &manifest_url).await?;
+    let manifest = match fetch_configured_update_manifest(state, &manifest_url).await? {
+        UpdateManifestFetch::Published(manifest) => manifest,
+        UpdateManifestFetch::NotPublished => {
+            // A fork can have the updater configured before its first GitHub
+            // Release exists. Treat that expected 404 as an empty update feed
+            // instead of surfacing a startup error on every launch.
+            *state.available_update.write().await = None;
+            let candidate = unpublished_update_candidate();
+            *cache = Some(CachedUpdateCandidate {
+                manifest_url,
+                candidate: candidate.clone(),
+                checked_at: Instant::now(),
+            });
+            return Ok(candidate);
+        }
+    };
     let check = assess_update_manifest(env!("CARGO_PKG_VERSION"), &manifest)?;
     *state.available_update.write().await = check.update_available.then(|| check.clone());
     let candidate = UpdateCandidate { check };
@@ -223,6 +243,14 @@ fn ensure_self_update_enabled_for(enabled: bool) -> Result<(), String> {
 }
 
 fn local_build_update_lock() -> UpdateCandidate {
+    no_update_candidate(false)
+}
+
+fn unpublished_update_candidate() -> UpdateCandidate {
+    no_update_candidate(true)
+}
+
+fn no_update_candidate(self_update_enabled: bool) -> UpdateCandidate {
     let version = env!("CARGO_PKG_VERSION").to_string();
     UpdateCandidate {
         check: UpdateCheck {
@@ -230,7 +258,7 @@ fn local_build_update_lock() -> UpdateCandidate {
             latest_version: version,
             update_available: false,
             selected_asset: None,
-            self_update_enabled: false,
+            self_update_enabled,
         },
     }
 }
@@ -252,7 +280,7 @@ async fn configured_update_manifest_url(state: &AppState) -> Result<String, Stri
 async fn fetch_configured_update_manifest(
     state: &AppState,
     manifest_url: &str,
-) -> Result<UpdateManifest, String> {
+) -> Result<UpdateManifestFetch, String> {
     let url = reqwest::Url::parse(manifest_url)
         .map_err(|_| "更新地址必须是有效的 HTTPS URL".to_string())?;
     if url.scheme() != "https" {
@@ -269,13 +297,16 @@ async fn fetch_configured_update_manifest(
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .map_err(|error| format!("检查更新失败：{error}"))?
-        .error_for_status()
-        .map_err(|error| format!("更新地址返回异常：{error}"))?;
+        .map_err(|error| format!("检查更新失败：{error}"))?;
     if response.url().scheme() != "https" {
         return Err("更新地址重定向到了非 HTTPS 地址".to_string());
     }
-
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(UpdateManifestFetch::NotPublished);
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|error| format!("更新地址返回异常：{error}"))?;
     let body = crate::http_response::read_bounded_body(
         response,
         MAX_UPDATE_MANIFEST_BYTES,
@@ -285,7 +316,7 @@ async fn fetch_configured_update_manifest(
     .map_err(|error| format!("读取更新清单失败：{error:#}"))?;
     let manifest = serde_json::from_slice::<UpdateManifest>(&body)
         .map_err(|error| format!("更新清单格式无效：{error}"))?;
-    Ok(manifest)
+    Ok(UpdateManifestFetch::Published(manifest))
 }
 
 pub(super) fn assess_update_manifest(
