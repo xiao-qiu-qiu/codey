@@ -52,6 +52,8 @@
   let watcherWakeTimer = 0;
   let deletePopoverCleanup = null;
   let codexSessionControllerPromise = null;
+  let activeWorkRefreshInFlight = false;
+  let lastActiveWorkRefreshAt = 0;
   let completionRunningObservation = null;
   let completionProbeInFlight = false;
   let completionNextProbeAt = 0;
@@ -107,6 +109,7 @@
   const taskListSectionHeadings = new Set(["task", "tasks", "recent", "recents", "任务", "最近"]);
   const threadRunningLossGraceMs = 2_000;
   const threadTimestampRefreshIntervalMs = 60_000;
+  const activeWorkRefreshIntervalMs = 3_000;
   const stuckCompletionGraceMs = 30_000;
   const stuckCompletionProbeIntervalMs = 15_000;
   const stuckCompletionProbeTimeoutMs = 10_000;
