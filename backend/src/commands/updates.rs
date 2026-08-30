@@ -243,7 +243,16 @@ fn ensure_self_update_enabled_for(enabled: bool) -> Result<(), String> {
 }
 
 fn local_build_update_lock() -> UpdateCandidate {
-    no_update_candidate(false)
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    UpdateCandidate {
+        check: UpdateCheck {
+            current_version: version.clone(),
+            latest_version: version,
+            update_available: false,
+            selected_asset: None,
+            self_update_enabled: false,
+        },
+    }
 }
 
 fn unpublished_update_candidate() -> UpdateCandidate {
