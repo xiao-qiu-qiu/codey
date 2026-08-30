@@ -251,9 +251,10 @@ export function useAppUpdates({
         "下载更新超时，请稍后重试",
       );
       setDownloadedUpdate(result);
-      const text = `已下载 ${result.fileName}（${formatBytes(result.size)}），校验通过`;
-      setUpdateResult({ tone: "success", text });
-      setNotice({ tone: "success", text });
+      const text = `已下载并校验 ${result.fileName}（${formatBytes(result.size)}），正在自动安装`;
+      setUpdateResult({ tone: "pending", text });
+      setNotice({ tone: "info", text });
+      await installDownloadedUpdate(result);
     } catch (error) {
       const text = errorText(error);
       setUpdateResult({ tone: "error", text });
@@ -274,14 +275,14 @@ export function useAppUpdates({
     });
   }
 
-  async function installDownloadedUpdate() {
-    if (!downloadedUpdate || isBusy) return;
+  async function installDownloadedUpdate(download = downloadedUpdate) {
+    if (!download || isBusy) return;
     setBusy("install-update");
     setUpdateResult({ tone: "pending", text: "正在启动安装器…" });
     try {
       await beforeInstall();
       await invoke("install_downloaded_update", {
-        filePath: downloadedUpdate.filePath,
+        filePath: download.filePath,
       });
       const text = "正在退出 Codey 并启动安装器…";
       setUpdateResult({ tone: "pending", text });
