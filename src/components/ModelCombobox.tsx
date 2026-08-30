@@ -117,9 +117,9 @@ export function ModelCombobox({
     <Combobox
       classNames={{
         dropdown:
-          "w-[360px]! max-w-[calc(100vw-24px)]! overflow-hidden rounded-[10px]! border-black/10! p-0! shadow-[0_12px_32px_rgba(0,0,0,0.14)]!",
+          "w-max! min-w-[360px]! max-w-[calc(100vw-24px)]! overflow-x-auto overflow-y-hidden rounded-[10px]! border-black/10! p-0! shadow-[0_12px_32px_rgba(0,0,0,0.14)]!",
         option:
-          "mx-1! rounded-[7px]! px-2.5! py-2! text-xs data-[combobox-selected]:bg-blue-500/9! data-[combobox-selected]:text-[#1d1d1f]!",
+          "mx-1! min-w-max! rounded-[7px]! px-2.5! py-2! text-xs data-[combobox-selected]:bg-blue-500/9! data-[combobox-selected]:text-[#1d1d1f]!",
       }}
       middlewares={{ flip: true, shift: true }}
       onOptionSubmit={(nextValue) => {
@@ -158,10 +158,10 @@ export function ModelCombobox({
           <span
             className={
               unavailableValue
-                ? "block min-w-0 truncate text-[#9a6700]"
+                ? "block min-w-0 overflow-x-auto whitespace-nowrap text-[#9a6700]"
                 : selectedOption
-                  ? "block min-w-0 truncate text-[#3a3a3c]"
-                  : "block min-w-0 truncate text-[#8e8e93]"
+                  ? "block min-w-0 overflow-x-auto whitespace-nowrap text-[#3a3a3c]"
+                  : "block min-w-0 overflow-x-auto whitespace-nowrap text-[#8e8e93]"
             }
           >
             {triggerText}
@@ -187,8 +187,8 @@ export function ModelCombobox({
             <Combobox.Group
               key={group.key}
               label={
-                <span className="flex min-w-0 items-center justify-between gap-2 px-1 text-[10px] font-semibold text-[#8e8e93]">
-                  <span className="truncate">{group.routeName}</span>
+                <span className="flex min-w-max items-center justify-between gap-2 px-1 text-[10px] font-semibold text-[#8e8e93]">
+                  <span className="whitespace-nowrap">{group.routeName}</span>
                   <span className="shrink-0 font-mono font-normal text-[#aeaeb2]">
                     {group.providerId}
                   </span>
@@ -203,12 +203,12 @@ export function ModelCombobox({
                     key={option.value}
                     value={option.value}
                   >
-                    <span className="flex min-w-0 items-center gap-2">
-                      <span className="grid min-w-0 flex-1 gap-0.5">
-                        <span className="truncate font-semibold text-[#3a3a3c]">
+                    <span className="flex min-w-max items-center gap-2">
+                      <span className="grid min-w-max flex-none gap-0.5">
+                        <span className="whitespace-nowrap font-semibold text-[#3a3a3c]">
                           {option.label}
                         </span>
-                        <span className="truncate text-[10px] text-[#8e8e93]">
+                        <span className="whitespace-nowrap text-[10px] text-[#8e8e93]">
                           {option.routeName} · {option.modelId}
                         </span>
                       </span>

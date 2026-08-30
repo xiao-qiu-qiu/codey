@@ -151,24 +151,24 @@ export function ManualModelCombobox({
       </Combobox.Target>
 
       <Combobox.Dropdown
-        className="w-[var(--combobox-target-width)] min-w-[280px] max-w-[calc(100vw-32px)] overflow-hidden rounded-[10px]! border-black/10! p-1! shadow-[0_12px_32px_rgba(0,0,0,0.14)]!"
+        className="w-max min-w-[280px] max-w-[calc(100vw-32px)] overflow-x-auto overflow-y-hidden rounded-[10px]! border-black/10! p-1! shadow-[0_12px_32px_rgba(0,0,0,0.14)]!"
       >
-        <Combobox.Options className="max-h-[260px] overflow-y-auto py-0.5">
+        <Combobox.Options className="max-h-[260px] min-w-max overflow-y-auto py-0.5">
           {isCustomValue ? (
             <Combobox.Option
               active={trimmedValue === value}
               className="mx-0.5 mb-1 rounded-[7px] px-2.5 py-1.5 text-xs data-[combobox-selected]:bg-blue-500/9 data-[combobox-selected]:text-[#1d1d1f]"
               value={trimmedValue}
             >
-              <div className="flex min-w-0 items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-1.5 truncate">
+              <div className="flex min-w-max items-center justify-between gap-2">
+                <div className="flex min-w-max items-center gap-1.5">
                   <IconCirclePlus
                     aria-hidden="true"
                     className="shrink-0 text-blue-500"
                     size={14}
                   />
                   <span className="shrink-0 text-[#6e6e73]">使用自定义模型</span>
-                  <span className="truncate font-semibold text-[#1d1d1f]">
+                  <span className="whitespace-nowrap font-semibold text-[#1d1d1f]">
                     {trimmedValue}
                   </span>
                 </div>
@@ -189,8 +189,8 @@ export function ManualModelCombobox({
                     key={option}
                     value={option}
                   >
-                    <div className="flex min-w-0 items-center justify-between gap-2">
-                      <span className="truncate font-medium text-[#1d1d1f]">
+                    <div className="flex min-w-max items-center justify-between gap-2">
+                      <span className="whitespace-nowrap font-medium text-[#1d1d1f]">
                         {option}
                       </span>
                       <span className="grid w-4 shrink-0 place-items-center text-blue-600">
@@ -220,8 +220,8 @@ export function ManualModelCombobox({
                         key={option}
                         value={option}
                       >
-                        <div className="flex min-w-0 items-center justify-between gap-2">
-                          <span className="truncate font-medium text-[#1d1d1f]">
+                        <div className="flex min-w-max items-center justify-between gap-2">
+                          <span className="whitespace-nowrap font-medium text-[#1d1d1f]">
                             {option}
                           </span>
                           <span className="grid w-4 shrink-0 place-items-center text-blue-600">
