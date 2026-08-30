@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "40";
+  const patchVersion = "41";
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
   const legacyOfficialRouteProviderIds = new Set([
@@ -54,6 +54,7 @@
   const routeMetadataParam = "responsesapiClientMetadata";
   const routeMetadataKey = "codey_route";
   const persistedThreadRoutesKey = "codey.thread-route-bindings.v1";
+  const persistedModelReasoningEffortsKey = "codey.model-reasoning-efforts.v1";
   let catalog = {
     loaded: false,
     models: [],
@@ -85,6 +86,7 @@
   let groupedMenuTimer = 0;
   let groupedMenuObserver = null;
   const groupedMenuTextObservers = new Map();
+  const nativeModelTriggerObservers = new Map();
   const patchedProviderKey = Symbol("codeyPatchedModelProvider");
   const patchedRouteKey = Symbol("codeyPatchedRoute");
   const blockedProviderRequestKey = Symbol("codeyBlockedProviderRequest");
@@ -95,8 +97,10 @@
   const threadPersistedProviders = new Map();
   const threadRuntimeProviders = new Map();
   const threadRoutes = new Map();
+  const modelReasoningEfforts = new Map();
   const pendingThreadRequests = new Map();
   const maxTrackedThreadProviders = 2048;
+  const maxTrackedModelReasoningEfforts = 256;
   const maxPendingThreadRequests = 256;
   const pendingRouteIntentMaxAgeMs = 5 * 60 * 1000;
   let pendingRouteIntent = null;
@@ -690,14 +694,19 @@
         ? currentReasoningEfforts
         : fallbackReasoningEfforts();
     const supportedNames = resolvedReasoningEfforts.map(reasoningEffortName);
+    const rememberedEffort = rememberedModelReasoningEffort(modelName);
     const requestedDefault = [
+      rememberedEffort,
       metadata?.default_reasoning_effort,
       current?.defaultReasoningEffort,
       "medium",
       "low",
       supportedNames[0],
     ].find((effort) => (
-      typeof effort === "string" && supportedNames.includes(effort.trim())
+      typeof effort === "string"
+      && supportedNames.some((supported) => (
+        normalizeReasoningEffort(supported) === normalizeReasoningEffort(effort)
+      ))
     ));
     return {
       ...(current && typeof current === "object" ? current : {}),
@@ -718,7 +727,7 @@
         : presentation.routeName || "Custom model",
       hidden: false,
       isDefault: modelName === catalog.defaultModel,
-      defaultReasoningEffort: requestedDefault?.trim() || "medium",
+      defaultReasoningEffort: requestedDefault?.trim().toLowerCase() || "medium",
       supportedReasoningEfforts: resolvedReasoningEfforts,
       serviceTiers: nativeFastServiceTiers(current?.serviceTiers),
       additionalSpeedTiers: nativeFastSpeedTiers(current?.additionalSpeedTiers),
@@ -1055,22 +1064,31 @@
         flex: 1 1 auto;
         border-top: 1px solid rgba(139, 148, 158, 0.24);
       }
-      /* Native Codex gives the selected model a short flex-basis. Keep the
-         route and model readable instead of allowing an ellipsis to hide the
-         actual selection. */
+      /* Native Codex constrains both the selected-model label and its inner
+         text node. Clear both limits so the full configured model name remains
+         visible instead of being replaced by an ellipsis. */
+      [class*="ModelPickerTriggerModelLabel"],
       [class*="ModelPickerTriggerModelText"] {
         display: inline-block !important;
-        max-width: min(52vw, 420px) !important;
+        max-width: none !important;
         min-width: max-content !important;
+        flex-shrink: 0 !important;
         overflow: visible !important;
         text-overflow: clip !important;
         white-space: nowrap !important;
+      }
+      [data-codex-intelligence-trigger="true"] {
+        width: max-content !important;
+        max-width: min(78vw, 760px) !important;
+        min-width: max-content !important;
+        flex-shrink: 0 !important;
+        overflow: visible !important;
       }
       [role="menu"].codey-model-route-menu,
       [role="listbox"].codey-model-route-menu {
         width: max-content !important;
         min-width: 360px !important;
-        max-width: min(560px, calc(100vw - 24px)) !important;
+        max-width: min(760px, calc(100vw - 24px)) !important;
       }
       .codey-model-route-menu [role="menuitem"],
       .codey-model-route-menu [role="menuitemradio"],
@@ -1079,27 +1097,190 @@
         overflow: visible !important;
         text-overflow: clip !important;
       }
+      .codey-model-route-menu [class*="truncate"] {
+        max-width: none !important;
+        min-width: max-content !important;
+        flex-shrink: 0 !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        white-space: nowrap !important;
+      }
+      .codey-model-route-menu [role="menuitem"] > *,
+      .codey-model-route-menu [role="menuitemradio"] > *,
+      .codey-model-route-menu [role="option"] > * {
+        max-width: none !important;
+        min-width: max-content !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        white-space: nowrap !important;
+      }
     `;
     (document.head || document.documentElement || document.body)?.appendChild?.(style);
   };
 
+  const nativeModelTriggerSelector = [
+    "[class*='ModelPickerTriggerModelLabel']",
+    "[class*='ModelPickerTriggerModelText']",
+    "[data-codex-intelligence-trigger='true']",
+  ].join(",");
+
+  const stopNativeModelTriggerObserver = (target) => {
+    const observer = nativeModelTriggerObservers.get(target);
+    if (!observer) return;
+    observer.disconnect?.();
+    nativeModelTriggerObservers.delete(target);
+  };
+
+  const syncNativeModelTriggerObservers = (targets) => {
+    const MutationObserver = window.MutationObserver || globalThis.MutationObserver;
+    if (typeof MutationObserver !== "function") return;
+    const activeTargets = new Set(targets);
+    for (const target of targets) {
+      if (!target || nativeModelTriggerObservers.has(target)) continue;
+      const observer = new MutationObserver(scheduleGroupedModelMenuEnhancement);
+      observer.observe(target, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+      });
+      nativeModelTriggerObservers.set(target, observer);
+    }
+    for (const target of [...nativeModelTriggerObservers.keys()]) {
+      if (!activeTargets.has(target) || target.isConnected === false) {
+        stopNativeModelTriggerObserver(target);
+      }
+    }
+  };
+
   const enhanceNativeModelTrigger = () => {
     if (!catalog.loaded || disposed || typeof document.querySelectorAll !== "function") return;
-    const triggers = document.querySelectorAll("[class*='ModelPickerTriggerModelText']");
+    const triggers = document.querySelectorAll(nativeModelTriggerSelector);
+    const observerTargets = [];
     for (const trigger of triggers) {
       const label = cleanText(trigger.textContent);
       if (!label) continue;
       trigger.setAttribute?.("title", label);
       trigger.setAttribute?.("aria-label", label);
-      trigger.style?.setProperty?.("max-width", "min(52vw, 420px)", "important");
+      trigger.style?.setProperty?.("max-width", "none", "important");
       trigger.style?.setProperty?.("min-width", "max-content", "important");
+      trigger.style?.setProperty?.("flex-shrink", "0", "important");
       trigger.style?.setProperty?.("overflow", "visible", "important");
       trigger.style?.setProperty?.("text-overflow", "clip", "important");
       trigger.style?.setProperty?.("white-space", "nowrap", "important");
-      const button = trigger.closest?.("button");
-      button?.style?.setProperty?.("max-width", "min(56vw, 460px)", "important");
+      const button = trigger.matches?.("[data-codex-intelligence-trigger='true']")
+        ? trigger
+        : trigger.closest?.("button")
+          || trigger.closest?.("[data-codex-intelligence-trigger='true']");
+      button?.style?.setProperty?.("max-width", "calc(100vw - 24px)", "important");
       button?.style?.setProperty?.("width", "max-content", "important");
+      button?.style?.setProperty?.("min-width", "max-content", "important");
+      button?.style?.setProperty?.("flex-shrink", "0", "important");
+      button?.style?.setProperty?.("overflow", "visible", "important");
+      button?.setAttribute?.("title", label);
+      button?.setAttribute?.("aria-label", label);
+      if (button) observerTargets.push(button);
     }
+    syncNativeModelTriggerObservers(observerTargets);
+  };
+
+  const normalizeReasoningEffort = (value) => (
+    typeof value === "string" ? value.trim().toLowerCase() : ""
+  );
+  const reasoningEffortFromParams = (params) => {
+    if (!params || typeof params !== "object") return "";
+    const directValues = [
+      params.effort,
+      params.reasoningEffort,
+      params.reasoning_effort,
+      params.reasoning,
+      params.modelReasoningEffort,
+      params.model_reasoning_effort,
+    ];
+    for (const value of directValues) {
+      const effort = normalizeReasoningEffort(value);
+      if (effort) return effort;
+    }
+    for (const container of [
+      params.reasoning,
+      params.reasoningConfig,
+      params.reasoning_config,
+      params.settings,
+      params.modelSettings,
+      params.model_settings,
+    ]) {
+      if (!container || typeof container !== "object") continue;
+      for (const value of [
+        container.effort,
+        container.reasoningEffort,
+        container.reasoning_effort,
+        container.reasoning,
+        container.modelReasoningEffort,
+        container.model_reasoning_effort,
+      ]) {
+        const effort = normalizeReasoningEffort(value);
+        if (effort) return effort;
+      }
+    }
+    return "";
+  };
+  const persistModelReasoningEfforts = () => {
+    try {
+      window.localStorage?.setItem(
+        persistedModelReasoningEffortsKey,
+        JSON.stringify(Array.from(modelReasoningEfforts.entries())),
+      );
+    } catch {
+      // The current renderer session still retains the preference in memory.
+    }
+  };
+  const restoreModelReasoningEfforts = () => {
+    try {
+      const stored = JSON.parse(
+        window.localStorage?.getItem(persistedModelReasoningEffortsKey) || "[]",
+      );
+      if (!Array.isArray(stored)) return;
+      for (const entry of stored.slice(-maxTrackedModelReasoningEfforts)) {
+        if (!Array.isArray(entry) || entry.length !== 2) continue;
+        const model = typeof entry[0] === "string" ? entry[0].trim() : "";
+        const effort = normalizeReasoningEffort(
+          typeof entry[1] === "object" ? entry[1]?.effort : entry[1],
+        );
+        if (model && effort) modelReasoningEfforts.set(modelKey(model), {
+          model,
+          effort,
+        });
+      }
+    } catch {
+      // Ignore stale or user-cleared renderer storage.
+    }
+  };
+  const rememberModelReasoningEffort = (model, effort) => {
+    const modelName = typeof model === "string" ? model.trim() : "";
+    const normalizedEffort = normalizeReasoningEffort(effort);
+    if (!modelName || !normalizedEffort) return;
+    const canonicalModel = catalog.modelNamesByKey.get(modelKey(modelName)) || modelName;
+    const key = modelKey(canonicalModel);
+    if (!key) return;
+    modelReasoningEfforts.delete(key);
+    modelReasoningEfforts.set(key, {
+      model: canonicalModel,
+      effort: normalizedEffort,
+    });
+    while (modelReasoningEfforts.size > maxTrackedModelReasoningEfforts) {
+      modelReasoningEfforts.delete(modelReasoningEfforts.keys().next().value);
+    }
+    persistModelReasoningEfforts();
+  };
+  const rememberedModelReasoningEffort = (model) => {
+    const remembered = modelReasoningEfforts.get(modelKey(model));
+    return remembered?.effort || "";
+  };
+
+  const rememberRequestReasoningEffort = (params, model) => {
+    const effort = reasoningEffortFromParams(params);
+    const modelName = typeof model === "string" ? model.trim() : "";
+    if (modelName && effort) rememberModelReasoningEffort(modelName, effort);
+    return effort;
   };
 
   const replaceTextOnce = (element, from, to) => {
@@ -1258,6 +1439,10 @@
         item.classList?.add?.("codey-model-route-item");
         item.setAttribute?.(
           "aria-label",
+          `${matched.presentation.routeName} / ${matched.presentation.modelName}`,
+        );
+        item.setAttribute?.(
+          "title",
           `${matched.presentation.routeName} / ${matched.presentation.modelName}`,
         );
         replaceTextOnce(item, itemText, matched.presentation.modelName);
@@ -1952,6 +2137,12 @@
     const requestedModel = typeof source.model === "string"
       ? source.model.trim()
       : "";
+    const requestedThreadId = threadIdFromParams(source);
+    const requestedEffort = reasoningEffortFromParams(source);
+    if (requestedEffort) {
+      const boundModel = threadRoutes.get(requestedThreadId)?.sourceModel;
+      rememberRequestReasoningEffort(source, requestedModel || boundModel);
+    }
     if (method === "thread/settings/update") {
       if (!hasModelOverride) return params;
       if (source.model === null) {
@@ -2081,6 +2272,10 @@
         route.selectorModel || route.sourceModel,
         requestProviderId(route.providerId),
         route,
+      );
+      rememberRequestReasoningEffort(
+        source,
+        route.selectorModel || route.sourceModel || requestedModel,
       );
       if (userIntentRoute) pendingRouteIntent = null;
       return routed;
@@ -2409,6 +2604,7 @@
   });
   installGroupedModelMenuObserver();
   restoreThreadRoutes();
+  restoreModelReasoningEfforts();
   window.addEventListener?.("focus", handleFocus);
   installModelRequestDispatchPatch();
   if (typeof window.addEventListener === "function") {
@@ -2459,6 +2655,10 @@
         observer.disconnect?.();
       }
       groupedMenuTextObservers.clear();
+      for (const observer of nativeModelTriggerObservers.values()) {
+        observer.disconnect?.();
+      }
+      nativeModelTriggerObservers.clear();
       interactionEvents.forEach((eventName) => {
         document.removeEventListener(eventName, handleInteraction, true);
       });
@@ -2476,6 +2676,7 @@
       threadPersistedProviders.clear();
       threadRuntimeProviders.clear();
       threadRoutes.clear();
+      modelReasoningEfforts.clear();
       pendingRouteIntent = null;
     },
   };

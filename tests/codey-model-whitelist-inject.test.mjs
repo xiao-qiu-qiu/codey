@@ -379,7 +379,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "40");
+  assert.equal(patch.version, "41");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -3113,6 +3113,50 @@ test("a refresh applies changed reasoning metadata when model ids stay unchanged
   );
   assert.equal(refreshed.defaultReasoningEffort, "high");
   patch.dispose();
+});
+
+test("remembered reasoning effort follows a model across renderer reloads", async () => {
+  const storage = memoryStorage();
+  const catalog = {
+    status: "ok",
+    models: ["route-a/gpt-5.6-sol"],
+    default_model: "route-a/gpt-5.6-sol",
+    model_metadata: [{
+      model: "route-a/gpt-5.6-sol",
+      route_name: "线路 A",
+      provider_id: "codey_router",
+      route_provider_id: "route-a",
+      source_model: "gpt-5.6-sol",
+      supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
+      default_reasoning_effort: "low",
+    }],
+  };
+  const firstRuntime = await loadPatch(catalog, [statsigClient()], { storage });
+  firstRuntime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "remember-reasoning",
+      method: "thread/settings/update",
+      params: {
+        threadId: "reasoning-thread",
+        model: "route-a/gpt-5.6-sol",
+        reasoning: { effort: "max" },
+      },
+    },
+  });
+  assert.match(storage.getItem("codey.model-reasoning-efforts.v1"), /"max"/);
+  firstRuntime.patch.dispose();
+
+  const queryClient = activeModelQueryClient(["route-a/gpt-5.6-sol"]);
+  const restoredRuntime = await loadPatch(catalog, [statsigClient()], {
+    storage,
+    queryClient,
+  });
+  assert.equal(
+    queryClient.model("route-a/gpt-5.6-sol").defaultReasoningEffort,
+    "max",
+  );
+  restoredRuntime.patch.dispose();
 });
 
 test("a stale bridge response cannot overwrite a backend-pushed catalog", async () => {
