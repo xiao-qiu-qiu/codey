@@ -16,7 +16,9 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::codex_config::BUILTIN_OPENAI_PROVIDER_ID;
-use crate::config::{CodeyConfig, DERIVED_OFFICIAL_PROFILE_ID, ProviderProfile};
+use crate::config::{
+    CodeyConfig, DERIVED_OFFICIAL_PROFILE_ID, ProviderProfile, is_codeq_compat_base_url,
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -373,7 +375,7 @@ fn local_provider_with_auth_policy(
         .and_then(|provider| provider.get("wire_api"))
         .and_then(Item::as_str)
         .unwrap_or("responses");
-    let upstream_protocol = upstream_protocol_from_wire_api(wire_api)?;
+    let upstream_protocol = upstream_protocol_from_wire_api_for_base_url(wire_api, &base_url)?;
     let auth_path = codex_home.join("auth.json");
     let auth_store = document
         .get("cli_auth_credentials_store")
@@ -893,6 +895,19 @@ fn upstream_protocol_from_wire_api(value: &str) -> Result<&'static str> {
     bail!("Codex Provider 使用了 Codey 不支持的 wire_api：{value}")
 }
 
+fn upstream_protocol_from_wire_api_for_base_url(
+    wire_api: &str,
+    base_url: &str,
+) -> Result<&'static str> {
+    let protocol = upstream_protocol_from_wire_api(wire_api)?;
+    if protocol == crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+        && is_codeq_compat_base_url(base_url)
+    {
+        return Ok(crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS);
+    }
+    Ok(protocol)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,6 +980,31 @@ experimental_bearer_token = "sk-relay"
             assert_eq!(config.profiles[0].upstream_protocol, expected);
             assert_eq!(status.provider.id, "relay");
         }
+    }
+
+    #[test]
+    fn imports_codeq_responses_as_chat_completions() {
+        let home = TempDir::new().unwrap();
+        write_config(
+            home.path(),
+            r#"model_provider = "codeq"
+
+[model_providers.codeq]
+name = "CodeQ"
+base_url = "https://www.codeq.top/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-codeq"
+"#,
+        );
+        let (config, status) =
+            sync_current_third_party_provider(&CodeyConfig::default(), home.path()).unwrap();
+        assert_eq!(
+            config.profiles[0].upstream_protocol,
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS
+        );
+        assert_eq!(status.provider.id, "codeq");
+        assert!(!config.profiles[0].supports_websockets);
+        assert!(!config.profiles[0].supports_remote_compaction);
     }
 
     #[test]

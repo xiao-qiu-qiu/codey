@@ -196,6 +196,17 @@ impl ProviderProfile {
             if self.upstream_protocol == UPSTREAM_PROTOCOL_OFFICIAL {
                 self.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string();
             }
+            // CodeQ currently accepts the OpenAI Chat Completions contract
+            // reliably, while its Responses endpoint can stall. Migrate old
+            // imported CodeQ routes on load so existing Grok configurations
+            // start using the bridge without requiring a manual re-save.
+            if is_codeq_compat_base_url(&self.base_url)
+                && self.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+            {
+                self.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string();
+                self.supports_remote_compaction = false;
+                self.supports_websockets = false;
+            }
         }
         self.api_key_configured = !self.api_key.is_empty();
         self.clear_api_key = false;
@@ -406,6 +417,18 @@ pub(crate) fn validate_outbound_api_url(value: &str, label: &str) -> Result<reqw
         ));
     }
     Ok(url)
+}
+
+/// CodeQ's public OpenAI-compatible endpoint currently serves Chat
+/// Completions more reliably than Responses. Keep this host check narrow so
+/// unrelated providers configured with a similar path are not rewritten.
+pub(crate) fn is_codeq_compat_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    url.host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .is_some_and(|host| host == "codeq.top" || host == "www.codeq.top")
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -2169,6 +2192,24 @@ mod tests {
         assert!(official.supports_auto_review);
         assert_eq!(official.upstream_protocol, UPSTREAM_PROTOCOL_OFFICIAL);
         assert!(official.validate().is_ok());
+    }
+
+    #[test]
+    fn normalizes_legacy_codeq_responses_routes_to_chat_completions() {
+        let mut profile = ProviderProfile::new("CodeQ Grok");
+        profile.base_url = "https://www.codeq.top/v1".into();
+        profile.api_key = "sk-codeq".into();
+        profile.supports_remote_compaction = true;
+        profile.supports_websockets = true;
+        profile.normalize();
+
+        assert_eq!(
+            profile.upstream_protocol,
+            UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS
+        );
+        assert!(!profile.supports_remote_compaction);
+        assert!(!profile.supports_websockets);
+        assert!(profile.validate().is_ok());
     }
 
     #[test]
