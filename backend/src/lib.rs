@@ -153,6 +153,15 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
         );
         eprintln!("Codey 启动前恢复上次临时配置失败：{error:#}");
     }
+    if let Err(error) = subagent_gate::cleanup_stale_state() {
+        error_log::record_failure(
+            "restore_failed",
+            "cleanup_stale_subagent_gate_state",
+            format!("{error:#}"),
+            serde_json::json!({}),
+        );
+        eprintln!("Codey 启动前清理陈旧子代理门禁状态失败：{error:#}");
+    }
     if let Err(error) = launcher::prepare_persistent_router_resume_shim(codex_home).await {
         error_log::record_failure_with_metadata(
             "patch_failed",

@@ -27,7 +27,8 @@ use crate::codex_config_guidance::{
 };
 use crate::config::{
     CodeyConfig, SUBAGENT_FIXED_ROLE_IDS, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT,
-    SUBAGENT_ROLE_IDS, SubagentRoleConfig, default_config_path, fixed_subagent_role_config,
+    SUBAGENT_ROLE_IDS, SUBAGENT_RUNTIME_ROLE_IDS, SubagentRoleConfig, default_config_path,
+    fixed_subagent_role_config,
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
@@ -347,6 +348,7 @@ fn fastctx_server_command() -> Result<PathBuf> {
         })
 }
 
+#[cfg(test)]
 fn apply_isolated_runtime_router_config(
     home: &Path,
     options: RouterApplyOptions<'_>,
@@ -716,7 +718,7 @@ fn remove_unplanned_runtime_agent_files(
         .iter()
         .map(|registration| registration.role.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    for role in SUBAGENT_ROLE_IDS {
+    for role in SUBAGENT_RUNTIME_ROLE_IDS {
         if active_roles.contains(role) {
             continue;
         }

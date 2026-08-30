@@ -1302,6 +1302,7 @@ fn dynamic_codey_fastctx_guidance_at(
     current[start..].starts_with(&guidance).then_some(guidance)
 }
 
+#[cfg(test)]
 pub(crate) fn append_subagent_guidance(existing: &str, configured: &str) -> String {
     let mut updated = existing.to_string();
     while let Some(without_guidance) = remove_owned_subagent_guidance_block(&updated) {

@@ -71,8 +71,8 @@ pub(crate) fn reconcile_with_model_state(
             continue;
         }
         let Some(model) = state
-            .available_model(requested)
-            .or_else(|| state.available_model(&state.default_model))
+            .available_subagent_model(requested)
+            .or_else(|| state.available_subagent_model(&state.default_model))
             .or_else(|| state.available_model(DEFAULT_SUBAGENT_MODEL))
             .or_else(|| state.first_available_model())
         else {

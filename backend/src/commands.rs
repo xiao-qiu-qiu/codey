@@ -44,7 +44,7 @@ use models::{
     sync_provider_models_for_launch, websocket_transport_requires_restart,
 };
 pub use models::{
-    delete_route, fetch_route_models, save_default_model, save_official_route_models,
+    delete_route, fetch_route_models, save_default_model,
     save_official_route_models_with_options, save_selected_models, sync_current_provider_command,
 };
 use plugins::{plugin_marketplace_status, repair_plugin_marketplace};

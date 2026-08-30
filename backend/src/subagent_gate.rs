@@ -1710,54 +1710,6 @@ fn remove_completed_agents_from_wait_response(
     Ok(())
 }
 
-fn remove_completed_agents_from_status_response(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    tool_response: Option<&Value>,
-) -> Result<()> {
-    let Some(tool_response) = tool_response else {
-        return Ok(());
-    };
-    let mut completed_agent_ids = Vec::new();
-    let parsed_response = parse_json_string(tool_response);
-    collect_completed_agent_ids(&parsed_response, &mut completed_agent_ids);
-    completed_agent_ids.sort();
-    completed_agent_ids.dedup();
-    for agent_id in completed_agent_ids {
-        remove_active_marker(state_root, runtime_id, session_id, &agent_id)?;
-    }
-    Ok(())
-}
-
-fn list_agents_snapshot_is_terminal(value: &Value) -> bool {
-    match value {
-        Value::Array(values) => {
-            !values.is_empty()
-                && values.iter().all(|value| {
-                    value
-                        .as_object()
-                        .is_some_and(object_reports_agent_completion)
-                })
-        }
-        Value::Object(values) => {
-            values.iter().any(|(key, value)| {
-                let normalized_key = normalized_ascii_identifier(key);
-                if normalized_key == "agents" || normalized_key == "agentsstates" {
-                    return list_agents_snapshot_is_terminal(value);
-                }
-                false
-            }) || (!values.is_empty()
-                && values.values().all(|value| {
-                    value
-                        .as_object()
-                        .is_some_and(object_reports_agent_completion)
-                }))
-        }
-        _ => false,
-    }
-}
-
 fn collect_completed_agent_ids(value: &Value, completed_agent_ids: &mut Vec<String>) {
     protocol::collect_terminal_agent_ids(value, completed_agent_ids);
 }

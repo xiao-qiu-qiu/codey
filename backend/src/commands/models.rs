@@ -1026,14 +1026,6 @@ pub async fn save_default_model(
     })))
 }
 
-pub async fn save_official_route_models(
-    state: &Arc<AppState>,
-    route_id: String,
-    requested_models: Vec<String>,
-) -> Result<Value, String> {
-    save_official_route_models_with_options(state, route_id, requested_models, None, None).await
-}
-
 pub async fn save_official_route_models_with_options(
     state: &Arc<AppState>,
     route_id: String,
@@ -1082,6 +1074,9 @@ pub async fn save_official_route_models_with_options(
     config
         .selected_models_by_provider
         .insert(provider_id, selected_models);
+    if let Some(show_account_usage_in_header) = show_account_usage_in_header {
+        config.show_account_usage_in_header = show_account_usage_in_header;
+    }
     config = config.normalize();
     let (catalog_refresh, model_state) = refreshed_model_state_async(&config, false).await?;
     subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
