@@ -58,7 +58,14 @@ pub(crate) fn reconcile_with_model_state(
 
     // Codex publishes V1 and V2 native subagent protocols. Both receive the
     // spawned task; only models explicitly marked otherwise are excluded.
-    if config.subagent_optimization && state.first_available_subagent_model().is_none() {
+    // An official catalog can explicitly declare that every model lacks the
+    // native subagent protocol. Third-party routes do not expose that
+    // capability marker, so an empty/stale route catalog must not reset a
+    // user-saved enhancement configuration.
+    if config.subagent_optimization
+        && !state.official_models.is_empty()
+        && state.first_available_subagent_model().is_none()
+    {
         config.subagent_optimization = false;
     }
     for selection in config.subagent_roles.values_mut() {
@@ -71,8 +78,8 @@ pub(crate) fn reconcile_with_model_state(
             continue;
         }
         let Some(model) = state
-            .available_subagent_model(requested)
-            .or_else(|| state.available_subagent_model(&state.default_model))
+            .available_model(requested)
+            .or_else(|| state.available_model(&state.default_model))
             .or_else(|| state.available_model(DEFAULT_SUBAGENT_MODEL))
             .or_else(|| state.first_available_model())
         else {

@@ -745,7 +745,7 @@ fn plan_runtime_agent_files(
     fastctx_instructions: Option<&str>,
 ) -> Result<Vec<RuntimeAgentPlan>> {
     let mut plans = Vec::with_capacity(roles.len());
-    for role in SUBAGENT_ROLE_IDS {
+    for role in SUBAGENT_RUNTIME_ROLE_IDS {
         let Some(selection) = roles.get(role) else {
             continue;
         };

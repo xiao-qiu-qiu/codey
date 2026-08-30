@@ -117,6 +117,7 @@ impl ModelSelectionState {
             .or_else(|| self.third_party_models.first().map(String::as_str))
     }
 
+    #[allow(dead_code)]
     pub fn available_subagent_model(&self, requested: &str) -> Option<&str> {
         let requested = requested.trim();
         if requested.is_empty() {
