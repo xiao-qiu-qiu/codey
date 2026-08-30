@@ -235,6 +235,9 @@ fn config_with_current_provider_model_sync(
     let Some(provider_id) = config.current_provider_id().map(ToString::to_string) else {
         return config.clone();
     };
+    let previous_upstream_models = config
+        .upstream_models_snapshot()
+        .map(<[String]>::to_vec);
     let supports_auto_review = models_support_auto_review(&provider_models);
     let provider_models = regular_route_models(provider_models);
     let manual_models = if synced {
@@ -263,6 +266,10 @@ fn config_with_current_provider_model_sync(
     }
     next = next.normalize();
     subagent_policy::reconcile_for_current_provider(&mut next, codex_home, false);
+    disable_subagent_optimization_for_removed_model(
+        &mut next,
+        previous_upstream_models.as_deref(),
+    );
     next
 }
 
@@ -332,6 +339,32 @@ fn preserve_declared_official_models(
             continue;
         }
         upstream_models.push(official_model.clone());
+    }
+}
+
+fn disable_subagent_optimization_for_removed_model(
+    config: &mut CodeyConfig,
+    previous_upstream_models: Option<&[String]>,
+) {
+    if !config.subagent_optimization {
+        return;
+    }
+    let saved_model = config.subagent_model.trim();
+    if saved_model.is_empty() {
+        return;
+    }
+    let was_advertised = previous_upstream_models.is_some_and(|models| {
+        models
+            .iter()
+            .any(|model| model_id::equal(model, saved_model))
+    });
+    let remains_advertised = config.upstream_models_snapshot().is_some_and(|models| {
+        models
+            .iter()
+            .any(|model| model_id::equal(model, saved_model))
+    });
+    if was_advertised && !remains_advertised {
+        config.subagent_optimization = false;
     }
 }
 
@@ -627,6 +660,9 @@ fn config_with_provider_model_sync(
     provider_models: Vec<String>,
     codex_home: &std::path::Path,
 ) -> CodeyConfig {
+    let previous_upstream_models = config
+        .upstream_models_snapshot()
+        .map(<[String]>::to_vec);
     let supports_auto_review = models_support_auto_review(&provider_models);
     let provider_models = regular_route_models(provider_models);
     let selected_models = config
@@ -659,6 +695,10 @@ fn config_with_provider_model_sync(
     if next.current_provider_id() == Some(provider_id) {
         subagent_policy::reconcile_for_current_provider(&mut next, codex_home, false);
     }
+    disable_subagent_optimization_for_removed_model(
+        &mut next,
+        previous_upstream_models.as_deref(),
+    );
     next
 }
 
